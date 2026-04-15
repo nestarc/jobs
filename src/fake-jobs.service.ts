@@ -41,6 +41,7 @@ export class FakeJobsService {
       backend: this.backend,
       registry: this.registry,
       schedulers: this.schedulers,
+      jobTypes: opts.jobTypes,
       contextExtractor: opts.contextExtractor,
       contextRunner: opts.contextRunner,
     });

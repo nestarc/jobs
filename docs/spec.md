@@ -20,7 +20,11 @@ FairWorker (nestarc 관리)
 Handler invocation (ALS 복원 후 실행)
 ```
 
-FairWorker는 BullMQ의 `Worker`를 내부에서 사용하되, `autorun: false` + `getNextJob()` 수동 호출로 **어떤 job을 다음에 처리할지**를 dispatcher가 선택한다.
+**v0.1 구현 경로 (A안 확정)**: 두 backend path가 분리된다.
+- **InMemory backend + FairWorker**: scheduler가 다음 job을 완전히 선택. 이 경로에서 tenant fairness가 100% 보장됨.
+- **BullMQ backend**: 표준 `Worker`(autorun: true)가 FIFO로 job을 소비. scheduler는 **개입하지 않음**. `Worker.getNextJob()`이 임의 job 선택을 지원하지 않는 BullMQ 내부 구조상, OSS BullMQ에서 fairness를 동시 달성하려면 Redis Lua 스크립트가 필요하며 이는 v0.2로 연기.
+
+두 경로 모두 ALS context 전파, `@JobHandler` discovery, outbox bridge는 동일하게 작동. 모듈 API(`JobsModule.forInMemory` / `forBullMQ`)는 이 tradeoff를 import 시점에 명시적으로 드러낸다.
 
 ## 2. 키 포맷 및 명명
 

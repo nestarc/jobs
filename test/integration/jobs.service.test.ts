@@ -46,4 +46,31 @@ describe('JobsService', () => {
       code: 'jobs_queue_not_found',
     });
   });
+
+  it('can enqueue without scheduler state when the job type is registered', async () => {
+    const backend = new InMemoryBackend();
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['doThing'],
+    });
+
+    await service.enqueue('doThing', { msg: 'hi' }, { context: { tenantId: 't1' } });
+
+    const waiting = await backend.peekWaiting('doThing');
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0].context).toEqual({ tenantId: 't1' });
+  });
+
+  it('rejects fairness controls when scheduler state is unavailable', () => {
+    const service = new JobsService({
+      backend: new InMemoryBackend(),
+      registry: new HandlerRegistry(),
+      jobTypes: ['doThing'],
+    });
+
+    expect(() => service.setTenantWeight('doThing', 't1', 2)).toThrow(
+      'jobs_fairness_misconfig',
+    );
+  });
 });

@@ -22,9 +22,9 @@ export interface PickedJob {
 
 export class Scheduler {
   private readonly shards = new Map<string, Shard>();
+  private readonly activeJobs = new Map<string, string>();
   private orderedTenants: string[] = [];
   private cursor = 0;
-  private cyclesCompleted = 0;
 
   constructor(private readonly opts: SchedulerOptions) {
     if (opts.defaultWeight <= 0) {
@@ -46,34 +46,39 @@ export class Scheduler {
   }
 
   onAck(jobId: string): void {
-    for (const shard of this.shards.values()) {
-      if (shard.inflight > 0) {
-        shard.inflight -= 1;
-      }
-    }
-    void jobId;
+    const tenantId = this.activeJobs.get(jobId);
+    if (!tenantId) return;
+    this.activeJobs.delete(jobId);
+
+    const shard = this.shards.get(tenantId);
+    if (!shard || shard.inflight === 0) return;
+    shard.inflight -= 1;
   }
 
   pickNext(): PickedJob | null {
     if (this.orderedTenants.length === 0) return null;
 
-    // lap 1 (min-share boost) runs first so starved tenants preempt weight credits.
-    // lap 0 (weight-credit WRR) runs second for normal scheduling.
-    for (const lap of [1, 0]) {
-      for (let i = 0; i < this.orderedTenants.length; i++) {
-        const tenantId = this.orderedTenants[(this.cursor + i) % this.orderedTenants.length];
-        const shard = this.shards.get(tenantId)!;
-        if (!this.canPickFromShard(shard, lap)) continue;
-        const jobId = shard.waiting.shift();
-        if (!jobId) continue;
-        shard.inflight += 1;
-        shard.creditsLeftInCycle = Math.max(0, shard.creditsLeftInCycle - 1);
-        this.markPicked(tenantId);
-        this.cursor = (this.cursor + i + 1) % this.orderedTenants.length;
-        this.advanceCycleIfNeeded();
-        return { jobId, tenantId };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // lap 1 (min-share boost) runs first so starved tenants preempt weight credits.
+      // lap 0 (weight-credit WRR) runs second for normal scheduling.
+      for (const lap of [1, 0]) {
+        for (let i = 0; i < this.orderedTenants.length; i++) {
+          const tenantId = this.orderedTenants[(this.cursor + i) % this.orderedTenants.length];
+          const shard = this.shards.get(tenantId)!;
+          if (!this.canPickFromShard(shard, lap)) continue;
+          const jobId = shard.waiting.shift();
+          if (!jobId) continue;
+          shard.inflight += 1;
+          shard.creditsLeftInCycle = Math.max(0, shard.creditsLeftInCycle - 1);
+          this.activeJobs.set(jobId, tenantId);
+          this.markPicked(tenantId);
+          this.cursor = (this.cursor + i + 1) % this.orderedTenants.length;
+          return { jobId, tenantId };
+        }
       }
+      if (!this.resetCreditsForSchedulableShards()) return null;
     }
+
     return null;
   }
 
@@ -126,12 +131,17 @@ export class Scheduler {
     return shard;
   }
 
-  private advanceCycleIfNeeded(): void {
-    const allExhausted = [...this.shards.values()].every((s) => s.creditsLeftInCycle === 0);
-    if (!allExhausted) return;
+  private resetCreditsForSchedulableShards(): boolean {
+    const schedulable = [...this.shards.values()].filter(
+      (s) => s.waiting.length > 0 && s.inflight < this.opts.tenantCap,
+    );
+    if (schedulable.length === 0) return false;
+    if (schedulable.some((s) => s.creditsLeftInCycle > 0)) return false;
+    if (!schedulable.some((s) => s.weight > 0)) return false;
+
     for (const shard of this.shards.values()) {
       shard.creditsLeftInCycle = shard.weight;
     }
-    this.cyclesCompleted += 1;
+    return true;
   }
 }

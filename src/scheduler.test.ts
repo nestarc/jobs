@@ -8,8 +8,9 @@ describe('Scheduler', () => {
     s.onEnqueue('j2', 't2');
     s.onEnqueue('j3', 't1');
     s.onEnqueue('j4', 't2');
-    const picks = [s.pickNext(), s.pickNext(), s.pickNext(), s.pickNext()]
-      .map((p) => p?.tenantId);
+    const picks = [s.pickNext(), s.pickNext(), s.pickNext(), s.pickNext()].map(
+      (p) => p?.tenantId,
+    );
     expect(picks).toEqual(['t1', 't2', 't1', 't2']);
   });
 
@@ -17,7 +18,8 @@ describe('Scheduler', () => {
     const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 100 });
     s.setWeight('t1', 3);
     s.setWeight('t2', 1);
-    for (let i = 0; i < 40; i++) s.onEnqueue(`j-${i}`, i % 2 === 0 ? 't1' : 't2');
+    for (let i = 0; i < 30; i++) s.onEnqueue(`t1-${i}`, 't1');
+    for (let i = 0; i < 10; i++) s.onEnqueue(`t2-${i}`, 't2');
     const picks: string[] = [];
     for (;;) {
       const p = s.pickNext();
@@ -52,7 +54,44 @@ describe('Scheduler', () => {
     expect(s.pickNext()?.jobId).toBe('b');
   });
 
-  it('enforces minimum share — a tenant with 0 weight still runs under min share', () => {
+  it('ack only releases the acknowledged tenant inflight slot', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
+    s.onEnqueue('a1', 't1');
+    s.onEnqueue('b1', 't2');
+    s.onEnqueue('a2', 't1');
+
+    const first = s.pickNext();
+    const second = s.pickNext();
+    expect(first?.tenantId).toBe('t1');
+    expect(second?.tenantId).toBe('t2');
+
+    s.onAck(first!.jobId);
+
+    expect(s.snapshot()).toEqual([
+      { tenantId: 't1', waiting: 1, inflight: 0, weight: 1, starvationTokens: 1 },
+      { tenantId: 't2', waiting: 0, inflight: 1, weight: 1, starvationTokens: 0 },
+    ]);
+    expect(s.pickNext()?.jobId).toBe('a2');
+  });
+
+  it('resets credits when only waiting tenants are exhausted', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    s.setWeight('t1', 1);
+    s.setWeight('t2', 3);
+    for (let i = 0; i < 5; i++) s.onEnqueue(`a${i}`, 't1');
+    s.onEnqueue('b0', 't2');
+
+    const picks: Array<string | null> = [];
+    for (let i = 0; i < 6; i++) {
+      const picked = s.pickNext();
+      picks.push(picked?.tenantId ?? null);
+      if (picked) s.onAck(picked.jobId);
+    }
+
+    expect(picks).toEqual(['t1', 't2', 't1', 't1', 't1', 't1']);
+  });
+
+  it('enforces minimum share for zero-weight tenants', () => {
     const s = new Scheduler({ defaultWeight: 1, minSharePct: 0.2, tenantCap: 100 });
     s.setWeight('big', 100);
     s.setWeight('tiny', 0);

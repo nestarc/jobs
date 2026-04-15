@@ -1,4 +1,12 @@
-import { DynamicModule, Module, Provider } from '@nestjs/common';
+import {
+  DynamicModule,
+  Inject,
+  Injectable,
+  Module,
+  OnModuleDestroy,
+  OnModuleInit,
+  Provider,
+} from '@nestjs/common';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { JobsService } from './jobs.service';
 import { HandlerRegistry } from './handler-registry';
@@ -12,6 +20,40 @@ import type { JobContext, JobEvent } from './types';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
+
+const IN_MEMORY_WORKER_IDLE_MS = 10;
+
+@Injectable()
+class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
+  private running = false;
+  private loop: Promise<void> | null = null;
+
+  constructor(@Inject(JOBS_WORKERS) private readonly workers: FairWorker[]) {}
+
+  onModuleInit(): void {
+    if (this.running) return;
+    this.running = true;
+    this.loop = this.run();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    this.running = false;
+    await this.loop;
+  }
+
+  private async run(): Promise<void> {
+    while (this.running) {
+      let anyPicked = false;
+      for (const worker of this.workers) {
+        if (!this.running) break;
+        if (await worker.tick()) anyPicked = true;
+      }
+      if (!anyPicked) {
+        await sleep(IN_MEMORY_WORKER_IDLE_MS);
+      }
+    }
+  }
+}
 
 export interface InMemoryOptions {
   jobTypes: string[];
@@ -54,6 +96,10 @@ function registerHandlers(
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 @Module({})
 export class JobsModule {
   static forInMemory(options: InMemoryOptions): DynamicModule {
@@ -72,11 +118,14 @@ export class JobsModule {
         provide: JobsService,
         useFactory: (registry: HandlerRegistry) => {
           const schedulers = new Map<string, Scheduler>();
-          for (const jobType of options.jobTypes) schedulers.set(jobType, new Scheduler(schedOpts));
+          for (const jobType of options.jobTypes) {
+            schedulers.set(jobType, new Scheduler(schedOpts));
+          }
           return new JobsService({
             backend,
             registry,
             schedulers,
+            jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
           });
@@ -108,6 +157,7 @@ export class JobsModule {
         },
         inject: [JobsService, HandlerRegistry, DiscoveryService, MetadataScanner],
       },
+      InMemoryWorkersHost,
     ];
 
     return {
@@ -130,15 +180,7 @@ export class JobsModule {
           new JobsService({
             backend: options.backend,
             registry,
-            // No schedulers on BullMQ path in v0.1. enqueue() looks up jobType
-            // via this map, so we populate stubs to allow enqueue to succeed —
-            // these are never pickNext'd because BullMQ's Worker handles delivery.
-            schedulers: new Map(
-              options.jobTypes.map((t) => [
-                t,
-                new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 }),
-              ]),
-            ),
+            jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
           }),
