@@ -5,16 +5,22 @@
   "license": "MIT",
   "author": "nestarc",
   "repository": "github:nestarc/jobs",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "jest",
     "test:watch": "jest --watch",
-    "lint": "eslint 'src/**/*.ts' 'test/**/*.ts'",
-    "format": "prettier --write 'src/**/*.ts' 'test/**/*.ts'",
+    "lint": "eslint src test --ext .ts",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
@@ -25,7 +31,9 @@
     "rxjs": "^7.0.0"
   },
   "peerDependenciesMeta": {
-    "bullmq": { "optional": true }
+    "bullmq": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@nestjs/common": "^10.3.0",
@@ -42,6 +50,7 @@
     "reflect-metadata": "^0.2.1",
     "rxjs": "^7.8.1",
     "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.4.0"
   }
 }

@@ -19,7 +19,7 @@ describe('Scheduler', () => {
     s.setWeight('t2', 1);
     for (let i = 0; i < 40; i++) s.onEnqueue(`j-${i}`, i % 2 === 0 ? 't1' : 't2');
     const picks: string[] = [];
-    while (true) {
+    for (;;) {
       const p = s.pickNext();
       if (!p) break;
       picks.push(p.tenantId);
