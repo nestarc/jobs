@@ -14,14 +14,14 @@ describe('Scheduler', () => {
     expect(picks).toEqual(['t1', 't2', 't1', 't2']);
   });
 
-  it('respects tenant weight ratio over many picks', () => {
+  it('applies the tenant weight ratio under balanced supply', () => {
     const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 100 });
     s.setWeight('t1', 3);
     s.setWeight('t2', 1);
-    for (let i = 0; i < 30; i++) s.onEnqueue(`t1-${i}`, 't1');
-    for (let i = 0; i < 10; i++) s.onEnqueue(`t2-${i}`, 't2');
+    for (let i = 0; i < 100; i++) s.onEnqueue(`t1-${i}`, 't1');
+    for (let i = 0; i < 100; i++) s.onEnqueue(`t2-${i}`, 't2');
     const picks: string[] = [];
-    for (;;) {
+    for (let i = 0; i < 40; i++) {
       const p = s.pickNext();
       if (!p) break;
       picks.push(p.tenantId);
@@ -29,6 +29,7 @@ describe('Scheduler', () => {
     }
     const t1 = picks.filter((p) => p === 't1').length;
     const t2 = picks.filter((p) => p === 't2').length;
+    expect(picks).toHaveLength(40);
     expect(t1 / t2).toBeGreaterThanOrEqual(2.5);
     expect(t1 / t2).toBeLessThanOrEqual(3.5);
   });

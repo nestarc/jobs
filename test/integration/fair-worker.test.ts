@@ -8,17 +8,20 @@ function setup() {
   const backend = new InMemoryBackend();
   const registry = new HandlerRegistry();
   const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+  const onStart = jest.fn();
+  const onFinish = jest.fn();
+  const onFail = jest.fn();
   const worker = new FairWorker({
     jobType: 'doThing',
     backend,
     scheduler,
     registry,
     contextRunner: async (_ctx, fn) => fn(),
-    onStart: jest.fn(),
-    onFinish: jest.fn(),
-    onFail: jest.fn(),
+    onStart,
+    onFinish,
+    onFail,
   });
-  return { backend, registry, scheduler, worker };
+  return { backend, registry, scheduler, worker, onStart, onFinish, onFail };
 }
 
 describe('FairWorker', () => {
@@ -49,7 +52,7 @@ describe('FairWorker', () => {
   });
 
   it('routes failure through onFail and marks job failed', async () => {
-    const { backend, registry, scheduler, worker } = setup();
+    const { backend, registry, scheduler, worker, onStart, onFinish, onFail } = setup();
     registry.register('doThing', async () => {
       throw new Error('boom');
     });
@@ -57,6 +60,13 @@ describe('FairWorker', () => {
     scheduler.onEnqueue(id, 't1');
     await worker.tick();
     const waiting = await backend.peekWaiting('doThing');
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onFinish).not.toHaveBeenCalled();
+    expect(onFail).toHaveBeenCalledTimes(1);
+    const [event, err] = onFail.mock.calls[0] as [Record<string, unknown>, Error];
+    expect(event).toMatchObject({ jobId: id, jobType: 'doThing', tenantId: 't1' });
+    expect(event.startedAt).toBeInstanceOf(Date);
+    expect(err.message).toBe('boom');
     expect(waiting.length).toBe(0);
   });
 

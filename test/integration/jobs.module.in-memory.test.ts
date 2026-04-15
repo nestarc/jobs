@@ -26,20 +26,21 @@ describe('JobsModule.forInMemory', () => {
     }).compile();
 
     await moduleRef.init();
+    try {
+      const jobs = moduleRef.get(JobsService);
+      const handler = moduleRef.get(ReportHandler);
+      const backend = moduleRef.get<InMemoryBackend>(JOBS_BACKEND);
 
-    const jobs = moduleRef.get(JobsService);
-    const handler = moduleRef.get(ReportHandler);
-    const backend = moduleRef.get<InMemoryBackend>(JOBS_BACKEND);
+      await jobs.enqueue('sendReport', { userId: 'u1' }, { context: { tenantId: 't1' } });
 
-    await jobs.enqueue('sendReport', { userId: 'u1' }, { context: { tenantId: 't1' } });
+      for (let i = 0; i < 20 && handler.calls.length === 0; i++) {
+        await sleep(10);
+      }
 
-    for (let i = 0; i < 20 && handler.calls.length === 0; i++) {
-      await sleep(10);
+      expect(handler.calls).toEqual([{ payload: { userId: 'u1' }, tenantId: 't1' }]);
+      expect(await backend.peekWaiting('sendReport')).toEqual([]);
+    } finally {
+      await moduleRef.close();
     }
-
-    expect(handler.calls).toEqual([{ payload: { userId: 'u1' }, tenantId: 't1' }]);
-    expect(await backend.peekWaiting('sendReport')).toEqual([]);
-
-    await moduleRef.close();
   });
 });
