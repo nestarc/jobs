@@ -4,9 +4,11 @@ import { InMemoryBackend } from './backend/in-memory-backend';
 import { FairWorker } from './fair-worker';
 import { JobsService } from './jobs.service';
 import type { JobContext } from './types';
+import { FakeClock } from './fake-clock';
 
 export interface FakeJobsOptions extends Partial<SchedulerOptions> {
   jobTypes: string[];
+  now?: Date | string | number;
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
 }
@@ -14,11 +16,14 @@ export interface FakeJobsOptions extends Partial<SchedulerOptions> {
 export class FakeJobsService {
   readonly service: JobsService;
   readonly registry = new HandlerRegistry();
-  readonly backend = new InMemoryBackend();
+  readonly clock: FakeClock;
+  readonly backend: InMemoryBackend;
   readonly schedulers = new Map<string, Scheduler>();
   private readonly workers: FairWorker[] = [];
 
   constructor(opts: FakeJobsOptions) {
+    this.clock = new FakeClock(opts.now);
+    this.backend = new InMemoryBackend({ now: () => this.clock.now() });
     const schedOpts: SchedulerOptions = {
       defaultWeight: opts.defaultWeight ?? 1,
       minSharePct: opts.minSharePct ?? 0.1,
@@ -48,6 +53,10 @@ export class FakeJobsService {
   }
 
   async drain(maxIterations = 1000): Promise<void> {
+    await this.drainUntilIdle(maxIterations);
+  }
+
+  async drainUntilIdle(maxIterations = 1000): Promise<void> {
     for (let i = 0; i < maxIterations; i++) {
       let anyPicked = false;
       for (const worker of this.workers) {
@@ -56,4 +65,8 @@ export class FakeJobsService {
       if (!anyPicked) return;
     }
   }
+}
+
+export function createFakeJobs(opts: FakeJobsOptions): FakeJobsService {
+  return new FakeJobsService(opts);
 }

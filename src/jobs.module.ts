@@ -17,6 +17,9 @@ import { defaultContextExtractor, defaultContextRunner } from './tenancy-default
 import { InMemoryBackend } from './backend/in-memory-backend';
 import { BullMQBackend } from './backend/bullmq-backend';
 import type { JobContext, JobEvent } from './types';
+import { JOBS_SERVICE } from './contracts';
+import type { JobDefinitions } from './contracts';
+import type { JobEventsOptions } from './lifecycle';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
@@ -57,6 +60,10 @@ class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
 
 export interface InMemoryOptions {
   jobTypes: string[];
+  jobs?: JobDefinitions;
+  global?: boolean;
+  strictCapabilities?: boolean;
+  events?: JobEventsOptions;
   concurrency?: { tenantCap?: number };
   fairness?: { minSharePct?: number; defaultWeight?: number };
   contextExtractor?: () => JobContext;
@@ -69,6 +76,10 @@ export interface InMemoryOptions {
 export interface BullMQOptions {
   backend: BullMQBackend;
   jobTypes: string[];
+  jobs?: JobDefinitions;
+  global?: boolean;
+  strictCapabilities?: boolean;
+  events?: JobEventsOptions;
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
   onJobStart?: (e: JobEvent) => void;
@@ -128,10 +139,12 @@ export class JobsModule {
             jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
+            events: options.events,
           });
         },
         inject: [HandlerRegistry],
       },
+      { provide: JOBS_SERVICE, useExisting: JobsService },
       {
         provide: JOBS_WORKERS,
         useFactory: (
@@ -152,6 +165,7 @@ export class JobsModule {
                 onStart: options.onJobStart,
                 onFinish: options.onJobFinish,
                 onFail: options.onJobFail,
+                events: options.events,
               }),
           );
         },
@@ -164,8 +178,8 @@ export class JobsModule {
       module: JobsModule,
       imports: [DiscoveryModule],
       providers,
-      exports: [JobsService, HandlerRegistry, JOBS_BACKEND, JOBS_WORKERS],
-      global: true,
+      exports: [JobsService, JOBS_SERVICE, HandlerRegistry, JOBS_BACKEND, JOBS_WORKERS],
+      global: options.global ?? true,
     };
   }
 
@@ -183,9 +197,11 @@ export class JobsModule {
             jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
+            events: options.events,
           }),
         inject: [HandlerRegistry],
       },
+      { provide: JOBS_SERVICE, useExisting: JobsService },
       {
         provide: JOBS_WORKERS,
         useFactory: (
@@ -200,6 +216,7 @@ export class JobsModule {
             onStart: options.onJobStart,
             onFinish: options.onJobFinish,
             onFail: options.onJobFail,
+            events: options.events,
           });
           return [];
         },
@@ -211,8 +228,8 @@ export class JobsModule {
       module: JobsModule,
       imports: [DiscoveryModule],
       providers,
-      exports: [JobsService, HandlerRegistry, JOBS_BACKEND],
-      global: true,
+      exports: [JobsService, JOBS_SERVICE, HandlerRegistry, JOBS_BACKEND],
+      global: options.global ?? true,
     };
   }
 }

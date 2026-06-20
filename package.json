@@ -1,6 +1,6 @@
 {
   "name": "@nestarc/jobs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "BullMQ Pro Groups, open-source. Tenant-fair background jobs for NestJS + Prisma with ALS propagation and outbox bridge.",
   "license": "MIT",
   "author": "nestarc",

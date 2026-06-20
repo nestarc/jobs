@@ -11,6 +11,32 @@ This project is currently pre-release. The changelog below starts from the curre
 - Rewrote `README.md` so the published documentation matches the current codebase and backend limitations.
 - Strengthened tests around scheduler weighting, module cleanup, failure callbacks, and outbox tenant propagation.
 
+## [0.2.0]
+
+### Added
+
+- Added typed job contracts with `defineJobs()`, `job()`, `TypedJobsService`, `TypedJobHandler`, `JobInstance`, and `InjectJobs()`.
+- Added backend capability reporting through `JobsService.capabilities()`.
+- Added status and history APIs with normalized `JobRecord` and `JobHistoryEntry` models.
+- Added retry/backoff/timeout support to the in-memory worker path, including cooperative cancellation via `ctx.signal`.
+- Added `enqueueDetailed()` for created-vs-deduped enqueue results while preserving `enqueue(): Promise<string>`.
+- Added in-memory idempotency keys, tenant/global dedupe, dead-letter listing, replay, and discard helpers.
+- Added lifecycle event hooks through module `events.onEvent`.
+- Added `createFakeJobs()` and `FakeClock` for deterministic delayed-job tests.
+- Added `docs/spec-v0.2.md` and an implementation plan under `docs/superpowers/plans/`.
+
+### Changed
+
+- Extended the in-memory backend from legacy waiting/active/done state to the v0.2 lifecycle model.
+- Kept BullMQ on standard FIFO workers and exposed its v0.2 capability matrix as `fairness: "none"`.
+- Preserved v0.1 module APIs, handler decorators, and string-based `JobsService.enqueue()` usage.
+
+### Limitations
+
+- BullMQ distributed tenant fairness remains out of scope.
+- BullMQ DLQ service helpers are not yet implemented beyond normalized status/history lookup.
+- Timeout is cooperative and cannot forcibly stop synchronous CPU-bound handler code.
+
 ## [0.1.0]
 
 ### Added

@@ -1,4 +1,8 @@
 export * from './types';
+export * from './contracts';
+export * from './lifecycle';
+export * from './retry';
+export * from './fake-clock';
 export * from './errors';
 export * from './decorators';
 export { JobsService } from './jobs.service';
@@ -15,7 +19,7 @@ export type { JobsBackend } from './backend/jobs-backend.interface';
 export { InMemoryBackend } from './backend/in-memory-backend';
 export { BullMQBackend } from './backend/bullmq-backend';
 export type { BullMQBackendOptions } from './backend/bullmq-backend';
-export { FakeJobsService } from './fake-jobs.service';
+export { FakeJobsService, createFakeJobs } from './fake-jobs.service';
 export type { FakeJobsOptions } from './fake-jobs.service';
 export {
   JobsOutboxBridge,

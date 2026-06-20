@@ -1,5 +1,8 @@
+import type { BackoffPolicy } from './retry';
+
 export interface JobContext {
   tenantId?: string;
+  signal?: AbortSignal;
   [key: string]: unknown;
 }
 
@@ -10,6 +13,13 @@ export interface JobEnvelope<T = unknown> {
   context: JobContext;
   enqueuedAt: Date;
   attempts: number;
+  maxAttempts: number;
+  scheduledFor?: Date;
+  timeoutMs?: number;
+  backoff?: BackoffPolicy;
+  metadata: Record<string, unknown>;
+  idempotencyKey?: string;
+  dedupeKey?: string;
 }
 
 export interface ShardSnapshot {
@@ -24,14 +34,29 @@ export interface JobEvent {
   jobId: string;
   jobType: string;
   tenantId: string | undefined;
+  attempt?: number;
   startedAt?: Date;
   finishedAt?: Date;
   durationMs?: number;
 }
 
-export interface EnqueueOptions {
+export interface DedupeOptions {
+  key: string;
+  scope?: 'global' | 'tenant';
+  ttlMs?: number;
+  mode?: 'while_active' | 'until_completed';
+}
+
+export interface EnqueueOptions<TContext = JobContext> {
   jobId?: string;
-  context?: JobContext;
+  context?: TContext;
   delay?: number;
+  delayMs?: number;
+  scheduledFor?: Date;
   attempts?: number;
+  backoff?: BackoffPolicy;
+  timeoutMs?: number;
+  idempotencyKey?: string;
+  dedupe?: DedupeOptions;
+  metadata?: Record<string, unknown>;
 }
