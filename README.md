@@ -453,7 +453,15 @@ Release flow:
 1. Update the package version and changelog.
 2. Push the version commit.
 3. Create and push a matching tag such as `v0.2.0`.
-4. GitHub Actions will run the release workflow, validate the tag against `package.json`, publish to npm, and create a GitHub release.
+4. GitHub Actions will run `.github/workflows/release.yml` in the `npm` environment, validate the tag against `package.json`, publish to npm through trusted publishing, and create a GitHub release.
+
+The npm trusted publisher is configured for:
+
+- Publisher: GitHub Actions
+- Repository: `nestarc/jobs`
+- Workflow filename: `release.yml`
+- Environment: `npm`
+- Allowed action: `npm publish`
 
 ## Docs
 
