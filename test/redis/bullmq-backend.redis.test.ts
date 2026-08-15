@@ -154,10 +154,7 @@ describe('BullMQBackend with Redis', () => {
     );
     await waitFor(async () => (await instance.getJob(failedJobId))?.status === 'failed');
     expect(await instance.getJob(failedJobId)).toMatchObject({ status: 'failed' });
-    expect(events.slice(-2).map((event) => event.type)).toEqual([
-      'job.started',
-      'job.failed',
-    ]);
+    expect(events.slice(-2).map((event) => event.type)).toEqual(['job.started', 'job.failed']);
   });
 
   it('reports an unrecoverable error as terminal instead of scheduling a retry', async () => {
@@ -180,7 +177,7 @@ describe('BullMQBackend with Redis', () => {
     expect(await instance.getJob(jobId)).toMatchObject({ status: 'failed', attempt: 1 });
   });
 
-  it('uses globally unique generated IDs across registered job type queues', async () => {
+  it('uses globally unique generated and persistent identity IDs across job type queues', async () => {
     const namespace = `nestarc-multi-queue-${randomUUID()}`;
     const jobTypes = ['type.a', 'type.b'];
     const instance = new BullMQBackend({ namespace, connection });
@@ -206,6 +203,74 @@ describe('BullMQBackend with Redis', () => {
       id: secondId,
       type: 'type.b',
       payload: { marker: 'b' },
+    });
+
+    const firstIdempotent = await jobs.enqueueDetailed(
+      'type.a',
+      { marker: 'id-a' },
+      { idempotencyKey: 'shared-key' },
+    );
+    const secondIdempotent = await jobs.enqueueDetailed(
+      'type.b',
+      { marker: 'id-b' },
+      { idempotencyKey: 'shared-key' },
+    );
+    expect(firstIdempotent.status).toBe('created');
+    expect(secondIdempotent.status).toBe('created');
+    expect(firstIdempotent.jobId).not.toBe(secondIdempotent.jobId);
+    expect(await instance.getJob(secondIdempotent.jobId)).toMatchObject({
+      type: 'type.b',
+      payload: { marker: 'id-b' },
+    });
+
+    const firstDedupe = await jobs.enqueueDetailed(
+      'type.a',
+      { marker: 'dedupe-a' },
+      { dedupe: { key: 'shared-key', mode: 'until_completed' } },
+    );
+    const secondDedupe = await jobs.enqueueDetailed(
+      'type.b',
+      { marker: 'dedupe-b' },
+      { dedupe: { key: 'shared-key', mode: 'until_completed' } },
+    );
+    expect(firstDedupe.status).toBe('created');
+    expect(secondDedupe.status).toBe('created');
+    expect(firstDedupe.jobId).not.toBe(secondDedupe.jobId);
+  });
+
+  it('isolates lifecycle observer failures from BullMQ handler outcomes', async () => {
+    const { namespace, jobType } = testIdentity('observer-failure');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    let executions = 0;
+    registry.register(jobType, async () => {
+      executions += 1;
+      return null;
+    });
+    const observerFailure = () => {
+      throw new Error('observer unavailable');
+    };
+    instance.startConsumer([jobType], {
+      registry,
+      contextRunner: async (_context, fn) => fn(),
+      onStart: observerFailure,
+      onFinish: observerFailure,
+      onFail: observerFailure,
+      events: {
+        onEvent: async () => {
+          throw new Error('async observer unavailable');
+        },
+      },
+    });
+
+    const jobId = await service(instance, jobType).enqueue(jobType, {});
+    await waitFor(async () => (await instance.getJob(jobId))?.status === 'succeeded');
+
+    expect(executions).toBe(1);
+    expect(await instance.getJob(jobId)).toMatchObject({
+      status: 'succeeded',
+      failedAt: undefined,
+      error: undefined,
     });
   });
 
@@ -340,11 +405,47 @@ describe('BullMQBackend with Redis', () => {
       ),
     ).rejects.toThrow('tenantId');
 
+    const explicitFirst = await jobs.enqueueDetailed(
+      jobType,
+      { sequence: 'explicit-1' },
+      {
+        jobId: 'explicit-1',
+        dedupe: { key: 'explicit-business-key', mode: 'until_completed' },
+      },
+    );
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        { sequence: 'explicit-2' },
+        {
+          jobId: 'explicit-2',
+          dedupe: { key: 'explicit-business-key', mode: 'until_completed' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: explicitFirst.jobId });
+
     const registry = new HandlerRegistry();
     registry.register(jobType, async () => null);
     instance.startConsumer([jobType], consumer(registry));
     await waitFor(async () => (await instance.getJob(first.jobId))?.status === 'succeeded');
     await expect(jobs.enqueueDetailed(jobType, { sequence: 3 }, global)).resolves.toMatchObject({
+      status: 'created',
+    });
+
+    const delayedWhileActive = {
+      delayMs: 250,
+      dedupe: { key: 'active-with-ttl', mode: 'while_active' as const, ttlMs: 25 },
+    };
+    const delayedActiveJob = await jobs.enqueueDetailed(jobType, {}, delayedWhileActive);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    await expect(jobs.enqueueDetailed(jobType, {}, delayedWhileActive)).resolves.toMatchObject({
+      status: 'deduped',
+      jobId: delayedActiveJob.jobId,
+    });
+    await waitFor(
+      async () => (await instance.getJob(delayedActiveJob.jobId))?.status === 'succeeded',
+    );
+    await expect(jobs.enqueueDetailed(jobType, {}, delayedWhileActive)).resolves.toMatchObject({
       status: 'created',
     });
 
@@ -358,9 +459,16 @@ describe('BullMQBackend with Redis', () => {
       jobId: retainedJob.jobId,
     });
     await new Promise((resolve) => setTimeout(resolve, 125));
-    await expect(jobs.enqueueDetailed(jobType, {}, retained)).resolves.toMatchObject({
-      status: 'created',
-      jobId: retainedJob.jobId,
+    const peer = backend(namespace, jobType);
+    const renewed = await Promise.all([
+      jobs.enqueueDetailed(jobType, { producer: 'a' }, retained),
+      service(peer, jobType).enqueueDetailed(jobType, { producer: 'b' }, retained),
+    ]);
+    expect(renewed.map((result) => result.status).sort()).toEqual(['created', 'deduped']);
+    expect(new Set(renewed.map((result) => result.jobId)).size).toBe(1);
+    expect(renewed[0].jobId).not.toBe(retainedJob.jobId);
+    expect(await instance.getJob(renewed[0].jobId)).toMatchObject({
+      payload: expect.objectContaining({ producer: expect.stringMatching(/^[ab]$/) }),
     });
   });
 

@@ -21,10 +21,11 @@ This project is currently pre-release. The changelog below starts from the curre
 - Persisted BullMQ context, metadata, scheduling, idempotency, and dedupe lineage in a versioned Redis job envelope with backward reads for v0.2 jobs.
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
-- Added Redis-backed idempotency and global/tenant dedupe with atomic created-vs-deduped results.
+- Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
 - Made Nest application shutdown wait for active BullMQ work and close workers and queues idempotently.
-- Applied typed job defaults at runtime and made explicit enqueue options take precedence.
+- Applied typed job defaults at runtime and in `FakeJobsService`, with explicit enqueue options taking precedence.
 - Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler restoration.
+- Isolated lifecycle observer failures so telemetry callbacks cannot reject committed enqueue operations or corrupt handler state.
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
 
 ### Compatibility notes

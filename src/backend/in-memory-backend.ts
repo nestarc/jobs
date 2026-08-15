@@ -28,7 +28,6 @@ interface Slot {
 interface DedupeEntry {
   jobId: string;
   mode: 'while_active' | 'until_completed';
-  activeExpiresAt?: number;
   ttlMs?: number;
 }
 
@@ -78,8 +77,12 @@ export class InMemoryBackend implements JobsBackend {
   ): Promise<EnqueueResult> {
     const { payload, context } = detachContext(envelope);
     const idempotencyKey = opts.idempotencyKey;
+    const idempotencyMapKey = idempotencyKey
+      ? this.scopedIdentityKey(jobType, idempotencyKey)
+      : undefined;
     const dedupeKey = this.resolveDedupeKey(context.tenantId, opts);
-    const existingJobId = this.findExistingJobId(idempotencyKey, dedupeKey);
+    const dedupeMapKey = dedupeKey ? this.scopedIdentityKey(jobType, dedupeKey) : undefined;
+    const existingJobId = this.findExistingJobId(idempotencyMapKey, dedupeMapKey);
     if (existingJobId) {
       return { status: 'deduped', jobId: existingJobId, existingJobId };
     }
@@ -110,15 +113,11 @@ export class InMemoryBackend implements JobsBackend {
     });
 
     this.jobTypesById.set(id, jobType);
-    if (idempotencyKey) this.idempotency.set(idempotencyKey, id);
-    if (dedupeKey) {
-      this.dedupe.set(dedupeKey, {
+    if (idempotencyMapKey) this.idempotency.set(idempotencyMapKey, id);
+    if (dedupeMapKey) {
+      this.dedupe.set(dedupeMapKey, {
         jobId: id,
         mode: opts.dedupe?.mode ?? 'until_completed',
-        activeExpiresAt:
-          opts.dedupe?.ttlMs === undefined
-            ? undefined
-            : enqueuedAt.getTime() + Math.max(0, opts.dedupe.ttlMs),
         ttlMs: opts.dedupe?.ttlMs,
       });
     }
@@ -273,15 +272,15 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   private findExistingJobId(
-    idempotencyKey: string | undefined,
-    dedupeKey: string | undefined,
+    idempotencyMapKey: string | undefined,
+    dedupeMapKey: string | undefined,
   ): string | undefined {
-    if (idempotencyKey) {
-      const existing = this.idempotency.get(idempotencyKey);
+    if (idempotencyMapKey) {
+      const existing = this.idempotency.get(idempotencyMapKey);
       if (existing && this.slotById(existing)?.state !== 'cancelled') return existing;
     }
-    if (dedupeKey) {
-      const entry = this.dedupe.get(dedupeKey);
+    if (dedupeMapKey) {
+      const entry = this.dedupe.get(dedupeMapKey);
       if (entry) {
         const slot = this.slotById(entry.jobId);
         const terminal =
@@ -291,8 +290,6 @@ export class InMemoryBackend implements JobsBackend {
           slot.state === 'dead_letter' ||
           slot.state === 'cancelled';
         const now = this.now().getTime();
-        const activeExpired =
-          entry.activeExpiresAt !== undefined && entry.activeExpiresAt <= now;
         const terminalExpired =
           terminal &&
           entry.ttlMs !== undefined &&
@@ -300,10 +297,10 @@ export class InMemoryBackend implements JobsBackend {
           slot.terminalAt.getTime() + Math.max(0, entry.ttlMs) <= now;
         if (
           !slot ||
-          (entry.mode === 'while_active' && (terminal || activeExpired)) ||
+          (entry.mode === 'while_active' && terminal) ||
           (entry.mode === 'until_completed' && terminalExpired)
         ) {
-          this.dedupe.delete(dedupeKey);
+          this.dedupe.delete(dedupeMapKey);
         } else {
           return entry.jobId;
         }
@@ -322,6 +319,10 @@ export class InMemoryBackend implements JobsBackend {
       return `tenant:${tenantId}:${opts.dedupe.key}`;
     }
     return `global:${opts.dedupe.key}`;
+  }
+
+  private scopedIdentityKey(jobType: string, value: string): string {
+    return JSON.stringify([jobType, value]);
   }
 
   private resolveScheduledFor(now: Date, opts: EnqueueOptions): Date | undefined {

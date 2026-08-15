@@ -5,6 +5,7 @@ import type { HandlerRegistry } from './handler-registry';
 import type { Scheduler } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
+import { notifyLifecycleObserver } from './lifecycle-observer';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -69,15 +70,17 @@ export class JobsService {
     if (result.status === 'created') {
       const tenantId = (context.tenantId as string | undefined) ?? '__default__';
       this.schedulers.get(jobType)?.onEnqueue(result.jobId, tenantId);
-      this.deps.events?.onEvent?.({
-        type: 'job.enqueued',
-        jobId: result.jobId,
-        jobType,
-        tenantId: context.tenantId as string | undefined,
-        attempt: 0,
-        at: new Date(),
-        metadata: effectiveOpts.metadata,
-      });
+      notifyLifecycleObserver(() =>
+        this.deps.events?.onEvent?.({
+          type: 'job.enqueued',
+          jobId: result.jobId,
+          jobType,
+          tenantId: context.tenantId as string | undefined,
+          attempt: 0,
+          at: new Date(),
+          metadata: effectiveOpts.metadata,
+        }),
+      );
     }
     return result;
   }
@@ -113,15 +116,17 @@ export class JobsService {
     if (record) {
       const tenantId = (record.context as JobContext | undefined)?.tenantId ?? '__default__';
       this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);
-      this.deps.events?.onEvent?.({
-        type: 'job.replayed',
-        jobId: replayedJobId,
-        jobType: record.type,
-        tenantId: tenantId === '__default__' ? undefined : tenantId,
-        attempt: record.attempt,
-        at: new Date(),
-        metadata: record.metadata,
-      });
+      notifyLifecycleObserver(() =>
+        this.deps.events?.onEvent?.({
+          type: 'job.replayed',
+          jobId: replayedJobId,
+          jobType: record.type,
+          tenantId: tenantId === '__default__' ? undefined : tenantId,
+          attempt: record.attempt,
+          at: new Date(),
+          metadata: record.metadata,
+        }),
+      );
     }
     return replayedJobId;
   }

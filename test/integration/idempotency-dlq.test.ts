@@ -87,16 +87,21 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       jobTypes: ['report.generate'],
     });
     const whileActive = {
-      dedupe: { key: 'active', mode: 'while_active' as const },
+      dedupe: { key: 'active', mode: 'while_active' as const, ttlMs: 1_000 },
     };
     const activeId = await service.enqueue('report.generate', {}, whileActive);
     await backend.moveToActive('report.generate', activeId);
-    await backend.ack('report.generate', activeId);
+    now = new Date(now.getTime() + 5_000);
     await expect(
       service.enqueueDetailed('report.generate', {}, whileActive),
     ).resolves.toMatchObject({
-      status: 'created',
+      status: 'deduped',
+      jobId: activeId,
     });
+    await backend.ack('report.generate', activeId);
+    await expect(
+      service.enqueueDetailed('report.generate', {}, whileActive),
+    ).resolves.toMatchObject({ status: 'created' });
 
     const untilCompleted = {
       dedupe: { key: 'retained', mode: 'until_completed' as const, ttlMs: 1_000 },
@@ -113,6 +118,43 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     await expect(
       service.enqueueDetailed('report.generate', {}, untilCompleted),
     ).resolves.toMatchObject({ status: 'created' });
+  });
+
+  it('scopes idempotency and dedupe identities to each job type', async () => {
+    const backend = new InMemoryBackend();
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['type.a', 'type.b'],
+    });
+
+    const firstIdempotent = await service.enqueueDetailed(
+      'type.a',
+      {},
+      { idempotencyKey: 'shared' },
+    );
+    const secondIdempotent = await service.enqueueDetailed(
+      'type.b',
+      {},
+      { idempotencyKey: 'shared' },
+    );
+    expect(firstIdempotent.status).toBe('created');
+    expect(secondIdempotent.status).toBe('created');
+    expect(firstIdempotent.jobId).not.toBe(secondIdempotent.jobId);
+
+    const firstDedupe = await service.enqueueDetailed(
+      'type.a',
+      {},
+      { dedupe: { key: 'shared', mode: 'until_completed' } },
+    );
+    const secondDedupe = await service.enqueueDetailed(
+      'type.b',
+      {},
+      { dedupe: { key: 'shared', mode: 'until_completed' } },
+    );
+    expect(firstDedupe.status).toBe('created');
+    expect(secondDedupe.status).toBe('created');
+    expect(firstDedupe.jobId).not.toBe(secondDedupe.jobId);
   });
 
   it('lists, replays, and discards dead-lettered jobs', async () => {

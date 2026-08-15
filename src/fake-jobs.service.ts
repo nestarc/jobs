@@ -5,9 +5,11 @@ import { FairWorker } from './fair-worker';
 import { JobsService } from './jobs.service';
 import type { JobContext } from './types';
 import { FakeClock } from './fake-clock';
+import type { JobDefinitions } from './contracts';
 
 export interface FakeJobsOptions extends Partial<SchedulerOptions> {
   jobTypes: string[];
+  jobs?: JobDefinitions;
   now?: Date | string | number;
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
@@ -49,6 +51,7 @@ export class FakeJobsService {
       jobTypes: opts.jobTypes,
       contextExtractor: opts.contextExtractor,
       contextRunner: opts.contextRunner,
+      jobs: opts.jobs,
     });
   }
 

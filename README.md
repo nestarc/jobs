@@ -279,6 +279,7 @@ Behavior notes:
 - retries are opt-in; default `attempts` is `1`
 - handler timeout uses cooperative cancellation through `ctx.signal` on the in-memory backend
 - BullMQ rejects `timeoutMs`, history, DLQ helpers, and manual drain with `jobs_capability_unsupported`
+- lifecycle callbacks are observational; thrown errors and rejected promises do not alter enqueue or handler outcomes
 
 ## Status, retry, idempotency, and DLQ
 
@@ -311,7 +312,7 @@ await jobs.enqueueDetailed('generateReport', payload, {
 });
 ```
 
-`while_active` releases its dedupe key when the job reaches a terminal state. `until_completed` keeps the stable job identity while the terminal BullMQ record is retained; `ttlMs` permits reuse after an expired terminal record. These are duplicate-enqueue controls, not exactly-once execution guarantees.
+Identity and dedupe keys are scoped to a job type; `scope: 'global'` means across tenants of that type. `while_active` always releases at a terminal state, and `ttlMs` does not shorten that active window. For `until_completed`, `ttlMs` permits a new identity only after the retained job is terminal and the TTL has elapsed. These are duplicate-enqueue controls, not exactly-once execution guarantees.
 
 ## Tenant fairness
 
@@ -443,6 +444,15 @@ await fake.drainUntilIdle();
 fake.clock.advanceBy(1_000);
 await fake.drainUntilIdle();
 expect(await fake.service.getJob(jobId)).toMatchObject({ status: 'succeeded' });
+```
+
+When production uses typed runtime defaults, pass the same definitions as `jobs` so the fake applies identical attempts, backoff, and timeout values.
+
+```ts
+const fake = createFakeJobs({
+  jobs: appJobs,
+  jobTypes: Object.keys(appJobs),
+});
 ```
 
 ## Low-level exports

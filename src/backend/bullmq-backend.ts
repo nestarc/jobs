@@ -4,6 +4,7 @@ import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } f
 import { detachContext } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
 import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
+import { notifyLifecycleObserver } from '../lifecycle-observer';
 import type { JobsBackend } from './jobs-backend.interface';
 import type { DedupeOptions, EnqueueOptions, JobContext, JobEnvelope, JobEvent } from '../types';
 import type { HandlerRegistry } from '../handler-registry';
@@ -19,6 +20,11 @@ import type {
 const INTERNAL_KEY = '__nestarcJob';
 const INTERNAL_VERSION = 1;
 const CUSTOM_BACKOFF_TYPE = 'nestarc';
+const IDENTITY_LOCK_TTL_MS = 60_000;
+const IDENTITY_LOCK_WAIT_MS = 30_000;
+const IDENTITY_LOCK_RETRY_MS = 10;
+const COMPARE_AND_DELETE_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 
 type BullMQModule = typeof import('bullmq');
 
@@ -36,6 +42,26 @@ interface DecodedEnvelope {
   payload: Record<string, unknown>;
   context: JobContext;
   internal?: PersistedJobMetadata;
+}
+
+interface PersistentIdentity {
+  kind: 'idempotency' | 'dedupe';
+  mapKey: string;
+  ttlMs?: number;
+}
+
+interface IdentityRedisClient {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<unknown>;
+  set(
+    key: string,
+    value: string,
+    expiryMode: 'PX',
+    ttlMs: number,
+    condition: 'NX',
+  ): Promise<'OK' | null>;
+  del(...keys: string[]): Promise<number>;
+  eval(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown>;
 }
 
 export interface BullMQBackendOptions {
@@ -122,28 +148,67 @@ export class BullMQBackend implements JobsBackend {
       backoff: opts.backoff,
     };
     const persistedEnvelope = { ...envelope, [INTERNAL_KEY]: internal };
-    const jobId = await this.resolveJobId(queue, opts, dedupeKey);
-    const addOptions: JobsOptions = {
-      jobId,
-      delay: scheduledFor ? Math.max(0, scheduledFor.getTime() - Date.now()) : undefined,
-      attempts: Math.max(1, opts.attempts ?? 1),
-      backoff: opts.backoff
-        ? { type: CUSTOM_BACKOFF_TYPE, delay: opts.backoff.delayMs }
-        : undefined,
-      deduplication:
-        opts.dedupe && (opts.dedupe.mode ?? 'until_completed') === 'while_active'
-          ? { id: this.hash(`dedupe:${dedupeKey}`), ttl: opts.dedupe.ttlMs }
+    const addJob = async (jobId: string): Promise<EnqueueResult> => {
+      const addOptions: JobsOptions = {
+        jobId,
+        delay: scheduledFor ? Math.max(0, scheduledFor.getTime() - Date.now()) : undefined,
+        attempts: Math.max(1, opts.attempts ?? 1),
+        backoff: opts.backoff
+          ? { type: CUSTOM_BACKOFF_TYPE, delay: opts.backoff.delayMs }
           : undefined,
+        deduplication:
+          opts.dedupe && (opts.dedupe.mode ?? 'until_completed') === 'while_active'
+            ? { id: this.hash(`dedupe:${dedupeKey}`) }
+            : undefined,
+      };
+      const added = await queue.add(jobType, persistedEnvelope, addOptions);
+      const addedJobId = String(added.id);
+      const stored = await queue.getJob(addedJobId);
+      const storedToken = stored
+        ? this.decode(stored.data as Record<string, unknown>).internal?.enqueueToken
+        : undefined;
+      if (storedToken !== enqueueToken) {
+        return { status: 'deduped', jobId: addedJobId, existingJobId: addedJobId };
+      }
+      return { status: 'created', jobId: addedJobId };
     };
-    const added = await queue.add(jobType, persistedEnvelope, addOptions);
-    const stored = await queue.getJob(String(added.id));
-    const storedToken = stored
-      ? this.decode(stored.data as Record<string, unknown>).internal?.enqueueToken
-      : undefined;
-    if (storedToken !== enqueueToken) {
-      return { status: 'deduped', jobId: String(added.id), existingJobId: String(added.id) };
+
+    const identities = this.persistentIdentities(queue, opts, dedupeKey);
+    if (identities.length === 0) {
+      return await addJob(this.resolveJobId(queue, opts));
     }
-    return { status: 'created', jobId: String(added.id) };
+
+    return await this.withIdentityLocks(queue, identities, async (client) => {
+      const existingJobId = await this.findExistingIdentityJob(queue, client, identities);
+      if (existingJobId) {
+        return {
+          status: 'deduped',
+          jobId: existingJobId,
+          existingJobId,
+        };
+      }
+
+      const reservedJobId = this.resolveJobId(queue, opts);
+      // Reserve before Queue.add so a producer crash cannot leave a job without
+      // a durable identity mapping. A later producer clears a stale reservation.
+      await Promise.all(identities.map((identity) => client.set(identity.mapKey, reservedJobId)));
+      try {
+        const result = await addJob(reservedJobId);
+        if (result.jobId !== reservedJobId) {
+          await Promise.all(
+            identities.map((identity) => client.set(identity.mapKey, result.jobId)),
+          );
+        }
+        return result;
+      } catch (error) {
+        await Promise.allSettled(
+          identities.map((identity) =>
+            client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, reservedJobId),
+          ),
+        );
+        throw error;
+      }
+    });
   }
 
   async getJob(jobId: string): Promise<JobRecord | null> {
@@ -169,14 +234,10 @@ export class BullMQBackend implements JobsBackend {
             ? new Date(job.timestamp + job.delay)
             : undefined,
         startedAt: job.processedOn ? new Date(job.processedOn) : undefined,
-        failedAt:
-          status === 'failed' && job.finishedOn ? new Date(job.finishedOn) : undefined,
+        failedAt: status === 'failed' && job.finishedOn ? new Date(job.finishedOn) : undefined,
         completedAt:
           status === 'succeeded' && job.finishedOn ? new Date(job.finishedOn) : undefined,
-        error:
-          status === 'failed' && job.failedReason
-            ? { message: job.failedReason }
-            : undefined,
+        error: status === 'failed' && job.failedReason ? { message: job.failedReason } : undefined,
         idempotencyKey: decoded.internal?.idempotencyKey,
         dedupeKey: decoded.internal?.dedupeKey,
         metadata: { ...(decoded.internal?.metadata ?? {}), queueName },
@@ -257,36 +318,42 @@ export class BullMQBackend implements JobsBackend {
     const startedAt = new Date();
     const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt };
     const metadata = internal?.metadata;
-    consumer.onStart?.(event);
-    consumer.events?.onEvent?.({
-      type: 'job.started',
-      jobId: String(job.id),
-      jobType,
-      tenantId,
-      attempt: job.attemptsMade + 1,
-      at: startedAt,
-      metadata,
-    });
+    notifyLifecycleObserver(() => consumer.onStart?.(event));
+    notifyLifecycleObserver(() =>
+      consumer.events?.onEvent?.({
+        type: 'job.started',
+        jobId: String(job.id),
+        jobType,
+        tenantId,
+        attempt: job.attemptsMade + 1,
+        at: startedAt,
+        metadata,
+      }),
+    );
     try {
       const result = await consumer.contextRunner(context, () =>
         consumer.registry.invoke(jobType, payload, context),
       );
       const finishedAt = new Date();
-      consumer.onFinish?.({
-        ...event,
-        finishedAt,
-        durationMs: finishedAt.getTime() - startedAt.getTime(),
-      });
-      consumer.events?.onEvent?.({
-        type: 'job.succeeded',
-        jobId: String(job.id),
-        jobType,
-        tenantId,
-        attempt: job.attemptsMade + 1,
-        at: finishedAt,
-        durationMs: finishedAt.getTime() - startedAt.getTime(),
-        metadata,
-      });
+      notifyLifecycleObserver(() =>
+        consumer.onFinish?.({
+          ...event,
+          finishedAt,
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+        }),
+      );
+      notifyLifecycleObserver(() =>
+        consumer.events?.onEvent?.({
+          type: 'job.succeeded',
+          jobId: String(job.id),
+          jobType,
+          tenantId,
+          attempt: job.attemptsMade + 1,
+          at: finishedAt,
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+          metadata,
+        }),
+      );
       return result;
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -294,43 +361,126 @@ export class BullMQBackend implements JobsBackend {
       const { UnrecoverableError } = loadBullMQ();
       const willRetry =
         !(error instanceof UnrecoverableError) && attempt < (job.opts.attempts ?? 1);
-      consumer.onFail?.(event, error);
-      consumer.events?.onEvent?.({
-        type: willRetry ? 'job.retry_scheduled' : 'job.failed',
-        jobId: String(job.id),
-        jobType,
-        tenantId,
-        attempt,
-        at: new Date(),
-        error: { message: error.message, name: error.name },
-        metadata,
-      });
+      notifyLifecycleObserver(() => consumer.onFail?.(event, error));
+      notifyLifecycleObserver(() =>
+        consumer.events?.onEvent?.({
+          type: willRetry ? 'job.retry_scheduled' : 'job.failed',
+          jobId: String(job.id),
+          jobType,
+          tenantId,
+          attempt,
+          at: new Date(),
+          error: { message: error.message, name: error.name },
+          metadata,
+        }),
+      );
       throw error;
     }
   }
 
-  private async resolveJobId(
+  private resolveJobId(queue: Queue, opts: EnqueueOptions): string {
+    if (opts.jobId) return opts.jobId;
+    if (opts.idempotencyKey) {
+      return `id-${this.hash(`${queue.name}\u0000${opts.idempotencyKey}`)}`;
+    }
+    return randomUUID();
+  }
+
+  private persistentIdentities(
     queue: Queue,
     opts: EnqueueOptions,
     dedupeKey: string | undefined,
-  ): Promise<string> {
-    if (opts.jobId) return opts.jobId;
-    if (opts.idempotencyKey) return `id-${this.hash(opts.idempotencyKey)}`;
-    if (!opts.dedupe || !dedupeKey || (opts.dedupe.mode ?? 'until_completed') === 'while_active') {
-      return randomUUID();
+  ): PersistentIdentity[] {
+    const identities: PersistentIdentity[] = [];
+    if (opts.idempotencyKey) {
+      identities.push({
+        kind: 'idempotency',
+        mapKey: this.identityMapKey(queue, 'idempotency', opts.idempotencyKey),
+      });
     }
+    if (opts.dedupe && dedupeKey && (opts.dedupe.mode ?? 'until_completed') === 'until_completed') {
+      identities.push({
+        kind: 'dedupe',
+        mapKey: this.identityMapKey(queue, 'dedupe', dedupeKey),
+        ttlMs: opts.dedupe.ttlMs,
+      });
+    }
+    return identities;
+  }
 
-    const jobId = `dedupe-${this.hash(dedupeKey)}`;
-    if (opts.dedupe.ttlMs !== undefined) {
-      const existing = await queue.getJob(jobId);
-      if (existing) {
-        const state = await existing.getState();
-        const terminal = state === 'completed' || state === 'failed';
-        const terminalAt = existing.finishedOn ?? existing.timestamp;
-        if (terminal && Date.now() - terminalAt >= opts.dedupe.ttlMs) await existing.remove();
+  private async findExistingIdentityJob(
+    queue: Queue,
+    client: IdentityRedisClient,
+    identities: PersistentIdentity[],
+  ): Promise<string | undefined> {
+    for (const identity of identities) {
+      const mappedJobId = await client.get(identity.mapKey);
+      if (!mappedJobId) continue;
+
+      const existing = await queue.getJob(mappedJobId);
+      if (!existing) {
+        await client.del(identity.mapKey);
+        continue;
       }
+      if (identity.kind === 'idempotency') return mappedJobId;
+
+      const state = await existing.getState();
+      const terminal = state === 'completed' || state === 'failed';
+      const ttlExpired =
+        terminal &&
+        identity.ttlMs !== undefined &&
+        Date.now() - (existing.finishedOn ?? existing.timestamp) >= Math.max(0, identity.ttlMs);
+      if (ttlExpired) {
+        await client.del(identity.mapKey);
+        continue;
+      }
+      return mappedJobId;
     }
-    return jobId;
+    return undefined;
+  }
+
+  private async withIdentityLocks<T>(
+    queue: Queue,
+    identities: PersistentIdentity[],
+    action: (client: IdentityRedisClient) => Promise<T>,
+  ): Promise<T> {
+    const client = (await queue.client) as unknown as IdentityRedisClient;
+    const token = randomUUID();
+    const lockKeys = [...new Set(identities.map((identity) => `${identity.mapKey}:lock`))].sort();
+    const acquired: string[] = [];
+
+    try {
+      for (const lockKey of lockKeys) {
+        await this.acquireIdentityLock(client, lockKey, token);
+        acquired.push(lockKey);
+      }
+      return await action(client);
+    } finally {
+      await Promise.allSettled(
+        acquired
+          .reverse()
+          .map((lockKey) => client.eval(COMPARE_AND_DELETE_SCRIPT, 1, lockKey, token)),
+      );
+    }
+  }
+
+  private async acquireIdentityLock(
+    client: IdentityRedisClient,
+    lockKey: string,
+    token: string,
+  ): Promise<void> {
+    const deadline = Date.now() + IDENTITY_LOCK_WAIT_MS;
+    do {
+      const result = await client.set(lockKey, token, 'PX', IDENTITY_LOCK_TTL_MS, 'NX');
+      if (result === 'OK') return;
+      await sleep(IDENTITY_LOCK_RETRY_MS);
+    } while (Date.now() < deadline);
+
+    throw new Error(`timed out acquiring BullMQ identity lock: ${lockKey}`);
+  }
+
+  private identityMapKey(queue: Queue, kind: PersistentIdentity['kind'], value: string): string {
+    return queue.toKey(`nestarc:identity:${kind}:${this.hash(value)}`);
   }
 
   private resolveDedupeKey(
@@ -382,9 +532,7 @@ export class BullMQBackend implements JobsBackend {
   private async closeResources(): Promise<void> {
     const failures: unknown[] = [];
     const workers = [...this.workers.entries()];
-    const workerResults = await Promise.allSettled(
-      workers.map(([, worker]) => worker.close()),
-    );
+    const workerResults = await Promise.allSettled(workers.map(([, worker]) => worker.close()));
     workerResults.forEach((result, index) => {
       if (result.status === 'fulfilled') this.workers.delete(workers[index][0]);
       else failures.push(result.reason);
@@ -454,4 +602,8 @@ const requireModule = createRequire(__filename);
 function loadBullMQ(): BullMQModule {
   bullmqModule ??= requireModule('bullmq') as BullMQModule;
   return bullmqModule;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
