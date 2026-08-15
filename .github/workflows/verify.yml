@@ -1,0 +1,159 @@
+name: Verify
+
+on:
+  workflow_call:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  unit:
+    name: Unit (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --runInBand
+
+  redis-integration:
+    name: Redis (Node ${{ matrix.node }}, Nest ${{ matrix.nest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: 20
+            nest: 10
+          - node: 22
+            nest: 11
+          - node: 24
+            nest: 11
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 1s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Select Nest 11
+        if: matrix.nest == 11
+        run: >-
+          npm install --no-save --package-lock=false
+          @nestjs/common@^11.0.0 @nestjs/core@^11.0.0 @nestjs/testing@^11.0.0
+      - run: npm run test:redis
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+
+  consumer-compat:
+    name: Consumer (Node ${{ matrix.node }}, Nest ${{ matrix.nest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+        nest: [10, 11]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm pack --pack-destination "${RUNNER_TEMP}"
+      - name: Install packed library without BullMQ
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir consumer
+          cd consumer
+          npm init -y
+          npm install --package-lock=false \
+            "${RUNNER_TEMP}"/nestarc-jobs-*.tgz \
+            "@nestjs/common@^${{ matrix.nest }}.0.0" \
+            "@nestjs/core@^${{ matrix.nest }}.0.0" \
+            "@nestjs/testing@^${{ matrix.nest }}.0.0" \
+            reflect-metadata@^0.2.0 rxjs@^7.0.0 typescript@^5.4.0 @types/node@^20.0.0
+          npm ls --omit=dev
+          if npm ls bullmq >/dev/null 2>&1; then
+            echo "BullMQ must remain optional for core consumers"
+            exit 1
+          fi
+          node -e "require('reflect-metadata'); const {Test}=require('@nestjs/testing'); const {JobsModule,JobsService,HandlerRegistry}=require('@nestarc/jobs'); (async()=>{const app=await Test.createTestingModule({imports:[JobsModule.forInMemory({jobTypes:['smoke']})]}).compile(); app.get(HandlerRegistry).register('smoke',async()=>null); await app.get(JobsService).enqueue('smoke',{}); await app.close()})().catch(error=>{console.error(error);process.exit(1)})"
+          node -e "require('fs').writeFileSync('index.ts', \"import { defineJobs, job, TypedJobsService } from '@nestarc/jobs'; const defs = defineJobs({ smoke: job<{ value: string }>().defaults({ attempts: 2 }) }); declare const jobs: TypedJobsService<typeof defs>; void jobs.enqueue('smoke', { value: 'ok' });\")"
+          npx tsc --strict --skipLibCheck false --noEmit --target ES2022 --module commonjs --moduleResolution node index.ts
+
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 1s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: >-
+          npm install --no-save --package-lock=false
+          @nestjs/common@^11.0.0 @nestjs/core@^11.0.0 @nestjs/testing@^11.0.0
+      - run: npm run test:coverage
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: mkdir package-artifact
+      - run: npm pack --pack-destination package-artifact
+      - run: tar -tf package-artifact/nestarc-jobs-*.tgz
+      - run: npm publish package-artifact/nestarc-jobs-*.tgz --dry-run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: package-artifact/*.tgz
+          if-no-files-found: error

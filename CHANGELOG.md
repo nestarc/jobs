@@ -6,10 +6,36 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-15
+
+### Added
+
+- Added a first-party `createOutboxJobsPublisher()` adapter compatible with the `@nestarc/outbox` publisher transport. It preserves event, tenant, correlation, and causation lineage and uses the outbox record ID for stable job identity.
+- Added Redis integration tests for scheduling, fixed backoff and retries, restart discovery, metadata/context persistence, concurrent idempotency, tenant/global dedupe, and graceful shutdown.
+- Added Node 20/22/24 and NestJS 10/11 consumer compatibility matrices, Redis 7.2 CI, package tarball smoke tests, and global/BullMQ coverage gates.
+- Added `jobs_capability_unsupported` for operations and enqueue options unavailable on the selected backend.
+
 ### Changed
 
+- Corrected the BullMQ capability matrix to report durable history, timeout, DLQ helpers, and manual drain as unsupported.
+- Persisted BullMQ context, metadata, scheduling, idempotency, and dedupe lineage in a versioned Redis job envelope with backward reads for v0.2 jobs.
+- Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
+- Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
+- Added Redis-backed idempotency and global/tenant dedupe with atomic created-vs-deduped results.
+- Made Nest application shutdown wait for active BullMQ work and close workers and queues idempotently.
+- Applied typed job defaults at runtime and made explicit enqueue options take precedence.
+- Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler restoration.
+- Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
+
+### Compatibility notes
+
+- BullMQ `timeoutMs`, durable `getJobHistory()`, DLQ list/replay/discard, and manual pull/drain now fail explicitly instead of being silently ignored or represented by synthetic state.
+- BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
+- Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
+
+### Documentation
+
 - Rewrote `README.md` so the published documentation matches the current codebase and backend limitations.
-- Strengthened tests around scheduler weighting, module cleanup, failure callbacks, and outbox tenant propagation.
 
 ## [0.2.0]
 

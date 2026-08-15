@@ -4,6 +4,7 @@ import type { JobsBackend } from './backend/jobs-backend.interface';
 import type { HandlerRegistry } from './handler-registry';
 import type { Scheduler } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
+import type { JobDefinitions, JobDefaults } from './contracts';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -22,6 +23,7 @@ export interface JobsServiceDeps {
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
   events?: JobEventsOptions;
+  jobs?: JobDefinitions;
 }
 
 export class JobsService {
@@ -47,23 +49,36 @@ export class JobsService {
     opts: EnqueueOptions = {},
   ): Promise<EnqueueResult> {
     this.assertKnownJobType(jobType);
+    const defaults = this.jobDefaults(jobType);
+    const effectiveOpts: EnqueueOptions = {
+      ...opts,
+      attempts: opts.attempts ?? defaults.attempts,
+      backoff: opts.backoff ?? defaults.backoff,
+      timeoutMs: opts.timeoutMs ?? defaults.timeoutMs,
+    };
+    this.assertEnqueueCapabilities(effectiveOpts);
 
-    const context = opts.context ?? this.deps.contextExtractor?.() ?? {};
+    const context = effectiveOpts.context ?? this.deps.contextExtractor?.() ?? {};
     const envelope = attachContext(payload, context);
     const result = this.deps.backend.enqueueDetailed
-      ? await this.deps.backend.enqueueDetailed(jobType, envelope, { ...opts, context })
-      : { status: 'created' as const, jobId: await this.deps.backend.enqueue(jobType, envelope, { ...opts, context }) };
-    const tenantId = (context.tenantId as string | undefined) ?? '__default__';
-    this.schedulers.get(jobType)?.onEnqueue(result.jobId, tenantId);
-    this.deps.events?.onEvent?.({
-      type: 'job.enqueued',
-      jobId: result.jobId,
-      jobType,
-      tenantId: context.tenantId as string | undefined,
-      attempt: 0,
-      at: new Date(),
-      metadata: opts.metadata,
-    });
+      ? await this.deps.backend.enqueueDetailed(jobType, envelope, { ...effectiveOpts, context })
+      : {
+          status: 'created' as const,
+          jobId: await this.deps.backend.enqueue(jobType, envelope, { ...effectiveOpts, context }),
+        };
+    if (result.status === 'created') {
+      const tenantId = (context.tenantId as string | undefined) ?? '__default__';
+      this.schedulers.get(jobType)?.onEnqueue(result.jobId, tenantId);
+      this.deps.events?.onEvent?.({
+        type: 'job.enqueued',
+        jobId: result.jobId,
+        jobType,
+        tenantId: context.tenantId as string | undefined,
+        attempt: 0,
+        at: new Date(),
+        metadata: effectiveOpts.metadata,
+      });
+    }
     return result;
   }
 
@@ -75,27 +90,48 @@ export class JobsService {
     return this.deps.backend.getJob(jobId);
   }
 
-  getJobHistory(jobId: string): Promise<JobHistoryEntry[]> {
-    return this.deps.backend.getJobHistory(jobId);
+  async getJobHistory(jobId: string): Promise<JobHistoryEntry[]> {
+    this.requireCapability('history');
+    return await this.deps.backend.getJobHistory(jobId);
   }
 
-  listDeadLetters(filter?: DeadLetterFilter): Promise<JobRecord[]> {
-    if (!this.deps.backend.listDeadLetters) return Promise.resolve([]);
-    return this.deps.backend.listDeadLetters(filter);
+  async listDeadLetters(filter?: DeadLetterFilter): Promise<JobRecord[]> {
+    this.requireCapability('deadLetter');
+    if (!this.deps.backend.listDeadLetters) {
+      throw this.unsupported('deadLetter');
+    }
+    return await this.deps.backend.listDeadLetters(filter);
   }
 
-  replayDeadLetter(jobId: string, options?: ReplayOptions): Promise<string> {
+  async replayDeadLetter(jobId: string, options?: ReplayOptions): Promise<string> {
+    this.requireCapability('deadLetter');
     if (!this.deps.backend.replayDeadLetter) {
-      return Promise.reject(new JobsError(JobsErrorCode.FairnessMisconfig, 'DLQ replay is unavailable for this backend'));
+      throw this.unsupported('deadLetter');
     }
-    return this.deps.backend.replayDeadLetter(jobId, options);
+    const replayedJobId = await this.deps.backend.replayDeadLetter(jobId, options);
+    const record = await this.deps.backend.getJob(replayedJobId);
+    if (record) {
+      const tenantId = (record.context as JobContext | undefined)?.tenantId ?? '__default__';
+      this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);
+      this.deps.events?.onEvent?.({
+        type: 'job.replayed',
+        jobId: replayedJobId,
+        jobType: record.type,
+        tenantId: tenantId === '__default__' ? undefined : tenantId,
+        attempt: record.attempt,
+        at: new Date(),
+        metadata: record.metadata,
+      });
+    }
+    return replayedJobId;
   }
 
-  discardDeadLetter(jobId: string, reason?: string): Promise<void> {
+  async discardDeadLetter(jobId: string, reason?: string): Promise<void> {
+    this.requireCapability('deadLetter');
     if (!this.deps.backend.discardDeadLetter) {
-      return Promise.reject(new JobsError(JobsErrorCode.FairnessMisconfig, 'DLQ discard is unavailable for this backend'));
+      throw this.unsupported('deadLetter');
     }
-    return this.deps.backend.discardDeadLetter(jobId, reason);
+    await this.deps.backend.discardDeadLetter(jobId, reason);
   }
 
   setTenantWeight(jobType: string, tenantId: string, weight: number): void {
@@ -122,5 +158,48 @@ export class JobsService {
       );
     }
     return scheduler;
+  }
+
+  private assertEnqueueCapabilities(opts: EnqueueOptions): void {
+    const capabilities = this.deps.backend.capabilities();
+    if (
+      (opts.delay !== undefined || opts.delayMs !== undefined || opts.scheduledFor) &&
+      !capabilities.delayed
+    ) {
+      throw this.unsupported('delayed');
+    }
+    if ((opts.attempts ?? 1) > 1 && !capabilities.retries) {
+      throw this.unsupported('retries');
+    }
+    if (opts.backoff && !capabilities.backoff) {
+      throw this.unsupported('backoff');
+    }
+    if (opts.timeoutMs !== undefined && !capabilities.timeout) {
+      throw this.unsupported('timeout');
+    }
+    if ((opts.idempotencyKey || opts.dedupe) && !capabilities.idempotency) {
+      throw this.unsupported('idempotency');
+    }
+  }
+
+  private jobDefaults(jobType: string): JobDefaults {
+    const definition = this.deps.jobs?.[jobType];
+    if (!definition || typeof definition.defaults !== 'object' || definition.defaults === null) {
+      return {};
+    }
+    return definition.defaults;
+  }
+
+  private requireCapability(capability: 'history' | 'deadLetter'): void {
+    if (!this.deps.backend.capabilities()[capability]) {
+      throw this.unsupported(capability);
+    }
+  }
+
+  private unsupported(capability: string): JobsError {
+    return new JobsError(
+      JobsErrorCode.CapabilityUnsupported,
+      `${capability} is unavailable for this backend`,
+    );
   }
 }

@@ -15,11 +15,13 @@ import { FairWorker } from './fair-worker';
 import { JOB_HANDLER_METADATA } from './decorators/job-handler.decorator';
 import { defaultContextExtractor, defaultContextRunner } from './tenancy-defaults';
 import { InMemoryBackend } from './backend/in-memory-backend';
-import { BullMQBackend } from './backend/bullmq-backend';
+import type { BullMQBackend } from './backend/bullmq-backend';
+import type { JobsBackend } from './backend/jobs-backend.interface';
 import type { JobContext, JobEvent } from './types';
 import { JOBS_SERVICE } from './contracts';
 import type { JobDefinitions } from './contracts';
 import type { JobEventsOptions } from './lifecycle';
+import { JobsError, JobsErrorCode } from './errors';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
@@ -55,6 +57,18 @@ class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
         await sleep(IN_MEMORY_WORKER_IDLE_MS);
       }
     }
+  }
+}
+
+@Injectable()
+class BullMQWorkersHost implements OnModuleDestroy {
+  constructor(
+    @Inject(JOBS_BACKEND) private readonly backend: JobsBackend,
+    @Inject(JOBS_WORKERS) private readonly _workers: unknown[],
+  ) {}
+
+  async onModuleDestroy(): Promise<void> {
+    await this.backend.close();
   }
 }
 
@@ -111,6 +125,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function assertJobDefaultsSupported(backend: JobsBackend, jobs: JobDefinitions | undefined): void {
+  if (!jobs) return;
+  const capabilities = backend.capabilities();
+  for (const [jobType, definition] of Object.entries(jobs)) {
+    if (typeof definition.defaults !== 'object' || definition.defaults === null) continue;
+    const defaults = definition.defaults;
+    if (defaults.timeoutMs !== undefined && !capabilities.timeout) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        `timeout is unavailable for job defaults on ${jobType}`,
+      );
+    }
+    if ((defaults.attempts ?? 1) > 1 && !capabilities.retries) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        `retries are unavailable for job defaults on ${jobType}`,
+      );
+    }
+    if (defaults.backoff && !capabilities.backoff) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        `backoff is unavailable for job defaults on ${jobType}`,
+      );
+    }
+  }
+}
+
 @Module({})
 export class JobsModule {
   static forInMemory(options: InMemoryOptions): DynamicModule {
@@ -120,6 +161,7 @@ export class JobsModule {
       tenantCap: options.concurrency?.tenantCap ?? 10,
     };
     const backend = new InMemoryBackend();
+    if (options.strictCapabilities) assertJobDefaultsSupported(backend, options.jobs);
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
@@ -140,6 +182,7 @@ export class JobsModule {
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
             events: options.events,
+            jobs: options.jobs,
           });
         },
         inject: [HandlerRegistry],
@@ -185,6 +228,8 @@ export class JobsModule {
 
   static forBullMQ(options: BullMQOptions): DynamicModule {
     const runner = options.contextRunner ?? defaultContextRunner;
+    if (options.strictCapabilities) assertJobDefaultsSupported(options.backend, options.jobs);
+    options.backend.registerJobTypes(options.jobTypes);
     const providers: Provider[] = [
       { provide: JOBS_BACKEND, useValue: options.backend },
       HandlerRegistry,
@@ -198,6 +243,7 @@ export class JobsModule {
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
             contextRunner: runner,
             events: options.events,
+            jobs: options.jobs,
           }),
         inject: [HandlerRegistry],
       },
@@ -222,6 +268,7 @@ export class JobsModule {
         },
         inject: [HandlerRegistry, DiscoveryService, MetadataScanner],
       },
+      BullMQWorkersHost,
     ];
 
     return {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { detachContext } from '../context-serializer';
+import { attachContext, detachContext } from '../context-serializer';
 import type { JobsBackend } from './jobs-backend.interface';
 import type { EnqueueOptions, JobEnvelope } from '../types';
 import type {
@@ -24,6 +24,12 @@ interface Slot {
   error?: JobErrorSummary;
 }
 
+interface DedupeEntry {
+  jobId: string;
+  mode: 'while_active' | 'until_completed';
+  expiresAt?: number;
+}
+
 export interface InMemoryBackendOptions {
   now?: () => Date;
   deadLetter?: { enabled?: boolean };
@@ -34,7 +40,7 @@ export class InMemoryBackend implements JobsBackend {
   private readonly jobTypesById = new Map<string, string>();
   private readonly history = new Map<string, JobHistoryEntry[]>();
   private readonly idempotency = new Map<string, string>();
-  private readonly dedupe = new Map<string, string>();
+  private readonly dedupe = new Map<string, DedupeEntry>();
 
   constructor(private readonly opts: InMemoryBackendOptions = {}) {}
 
@@ -103,7 +109,16 @@ export class InMemoryBackend implements JobsBackend {
 
     this.jobTypesById.set(id, jobType);
     if (idempotencyKey) this.idempotency.set(idempotencyKey, id);
-    if (dedupeKey) this.dedupe.set(dedupeKey, id);
+    if (dedupeKey) {
+      this.dedupe.set(dedupeKey, {
+        jobId: id,
+        mode: opts.dedupe?.mode ?? 'until_completed',
+        expiresAt:
+          opts.dedupe?.ttlMs === undefined
+            ? undefined
+            : enqueuedAt.getTime() + Math.max(0, opts.dedupe.ttlMs),
+      });
+    }
     this.recordHistory(id, state, 0);
     return { status: 'created', jobId: id };
   }
@@ -166,7 +181,11 @@ export class InMemoryBackend implements JobsBackend {
     return this.toRecord(slot);
   }
 
-  async markCancelled(jobType: string, jobId: string, reason = 'cancelled'): Promise<JobRecord | null> {
+  async markCancelled(
+    jobType: string,
+    jobId: string,
+    reason = 'cancelled',
+  ): Promise<JobRecord | null> {
     const slot = this.bucketOf(jobType).get(jobId);
     if (!slot) return null;
     slot.state = 'cancelled';
@@ -205,7 +224,7 @@ export class InMemoryBackend implements JobsBackend {
     }
     const newJobId = await this.enqueue(
       slot.envelope.jobType,
-      slot.envelope.payload as Record<string, unknown>,
+      attachContext(slot.envelope.payload as Record<string, unknown>, slot.envelope.context),
       {
         jobId: options.preserveOriginalId ? jobId : undefined,
         context: slot.envelope.context,
@@ -252,8 +271,25 @@ export class InMemoryBackend implements JobsBackend {
       if (existing && this.slotById(existing)?.state !== 'cancelled') return existing;
     }
     if (dedupeKey) {
-      const existing = this.dedupe.get(dedupeKey);
-      if (existing && this.slotById(existing)?.state !== 'cancelled') return existing;
+      const entry = this.dedupe.get(dedupeKey);
+      if (entry) {
+        const slot = this.slotById(entry.jobId);
+        const terminal =
+          !slot ||
+          slot.state === 'succeeded' ||
+          slot.state === 'failed' ||
+          slot.state === 'dead_letter' ||
+          slot.state === 'cancelled';
+        const expired = entry.expiresAt !== undefined && entry.expiresAt <= this.now().getTime();
+        if (
+          (entry.mode === 'while_active' && (terminal || expired)) ||
+          (entry.mode === 'until_completed' && terminal && expired)
+        ) {
+          this.dedupe.delete(dedupeKey);
+        } else {
+          return entry.jobId;
+        }
+      }
     }
     return undefined;
   }
@@ -281,7 +317,9 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   private isDue(slot: Slot): boolean {
-    return !slot.envelope.scheduledFor || slot.envelope.scheduledFor.getTime() <= this.now().getTime();
+    return (
+      !slot.envelope.scheduledFor || slot.envelope.scheduledFor.getTime() <= this.now().getTime()
+    );
   }
 
   private slotById(jobId: string): Slot | null {

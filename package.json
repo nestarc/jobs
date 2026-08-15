@@ -1,12 +1,15 @@
 {
   "name": "@nestarc/jobs",
-  "version": "0.2.0",
-  "description": "BullMQ Pro Groups, open-source. Tenant-fair background jobs for NestJS + Prisma with ALS propagation and outbox bridge.",
+  "version": "0.3.0",
+  "description": "Typed, tenant-aware NestJS jobs with deterministic in-memory fairness, BullMQ durability, and outbox integration.",
   "license": "MIT",
   "author": "nestarc",
-  "repository": "github:nestarc/jobs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nestarc/jobs.git"
+  },
   "engines": {
-    "node": ">=20"
+    "node": "^20.0.0 || ^22.0.0 || ^24.0.0"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -21,20 +24,27 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "jest",
+    "test:redis": "jest --config jest.redis.config.ts --runInBand --detectOpenHandles",
+    "test:coverage": "jest --config jest.coverage.config.ts --runInBand",
     "test:watch": "jest --watch",
     "bench": "ts-node bench/jobs.bench.ts",
     "lint": "eslint src test --ext .ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "prepack": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "@nestjs/common": "^10.0.0",
-    "@nestjs/core": "^10.0.0",
-    "bullmq": "^5.0.0",
+    "@nestarc/outbox": "^0.2.0",
+    "@nestjs/common": "^10.0.0 || ^11.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0",
+    "bullmq": "^5.74.1",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.0.0"
   },
   "peerDependenciesMeta": {
+    "@nestarc/outbox": {
+      "optional": true
+    },
     "bullmq": {
       "optional": true
     }

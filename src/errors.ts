@@ -3,6 +3,8 @@ export const JobsErrorCode = {
   HandlerNotFound: 'jobs_handler_not_found',
   QueueNotFound: 'jobs_queue_not_found',
   FairnessMisconfig: 'jobs_fairness_misconfig',
+  CapabilityUnsupported: 'jobs_capability_unsupported',
+  BackendClosed: 'jobs_backend_closed',
 } as const;
 
 export type JobsErrorCode = (typeof JobsErrorCode)[keyof typeof JobsErrorCode];

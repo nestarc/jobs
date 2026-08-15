@@ -1,4 +1,4 @@
-import { HandlerRegistry, InMemoryBackend, JobsService } from '../../src';
+import { defineJobs, HandlerRegistry, InMemoryBackend, job, JobsService } from '../../src';
 
 function serviceWithBackend() {
   const backend = new InMemoryBackend();
@@ -54,5 +54,27 @@ describe('v0.2 backend status and capabilities', () => {
       'active',
       'succeeded',
     ]);
+  });
+
+  it('applies typed job defaults while preserving enqueue option precedence', async () => {
+    const backend = new InMemoryBackend();
+    const jobs = defineJobs({
+      'email.send': job<{ messageId: string }>().defaults({
+        attempts: 3,
+        backoff: { type: 'fixed', delayMs: 100 },
+      }),
+    });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: Object.keys(jobs),
+      jobs,
+    });
+
+    const defaulted = await service.enqueue('email.send', { messageId: 'msg_1' });
+    const overridden = await service.enqueue('email.send', { messageId: 'msg_2' }, { attempts: 1 });
+
+    expect(await service.getJob(defaulted)).toMatchObject({ maxAttempts: 3 });
+    expect(await service.getJob(overridden)).toMatchObject({ maxAttempts: 1 });
   });
 });

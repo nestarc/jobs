@@ -11,10 +11,14 @@ describe('JobsError', () => {
     expect(err.message).toContain('sendReport');
   });
 
-  it('supports all four codes from spec', () => {
+  it('supports the public error codes', () => {
     expect(new JobsError(JobsErrorCode.ReservedPayloadKey).code).toBe('jobs_reserved_payload_key');
     expect(new JobsError(JobsErrorCode.HandlerNotFound).code).toBe('jobs_handler_not_found');
     expect(new JobsError(JobsErrorCode.QueueNotFound).code).toBe('jobs_queue_not_found');
     expect(new JobsError(JobsErrorCode.FairnessMisconfig).code).toBe('jobs_fairness_misconfig');
+    expect(new JobsError(JobsErrorCode.CapabilityUnsupported).code).toBe(
+      'jobs_capability_unsupported',
+    );
+    expect(new JobsError(JobsErrorCode.BackendClosed).code).toBe('jobs_backend_closed');
   });
 });
