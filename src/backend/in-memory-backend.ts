@@ -22,12 +22,14 @@ interface Slot {
   failedAt?: Date;
   nextAttemptAt?: Date;
   error?: JobErrorSummary;
+  terminalAt?: Date;
 }
 
 interface DedupeEntry {
   jobId: string;
   mode: 'while_active' | 'until_completed';
-  expiresAt?: number;
+  activeExpiresAt?: number;
+  ttlMs?: number;
 }
 
 export interface InMemoryBackendOptions {
@@ -113,10 +115,11 @@ export class InMemoryBackend implements JobsBackend {
       this.dedupe.set(dedupeKey, {
         jobId: id,
         mode: opts.dedupe?.mode ?? 'until_completed',
-        expiresAt:
+        activeExpiresAt:
           opts.dedupe?.ttlMs === undefined
             ? undefined
             : enqueuedAt.getTime() + Math.max(0, opts.dedupe.ttlMs),
+        ttlMs: opts.dedupe?.ttlMs,
       });
     }
     this.recordHistory(id, state, 0);
@@ -145,6 +148,10 @@ export class InMemoryBackend implements JobsBackend {
     if (!slot) return;
     slot.state = 'succeeded';
     slot.completedAt = this.now();
+    slot.terminalAt = slot.completedAt;
+    slot.failedAt = undefined;
+    slot.nextAttemptAt = undefined;
+    slot.error = undefined;
     this.recordHistory(jobId, 'succeeded', slot.envelope.attempts);
     return this.toRecord(slot);
   }
@@ -177,6 +184,7 @@ export class InMemoryBackend implements JobsBackend {
     }
 
     slot.state = this.opts.deadLetter?.enabled === false ? 'failed' : 'dead_letter';
+    slot.terminalAt = slot.failedAt;
     this.recordHistory(jobId, slot.state, slot.envelope.attempts, reason, slot.error);
     return this.toRecord(slot);
   }
@@ -189,6 +197,7 @@ export class InMemoryBackend implements JobsBackend {
     const slot = this.bucketOf(jobType).get(jobId);
     if (!slot) return null;
     slot.state = 'cancelled';
+    slot.terminalAt = this.now();
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
     return this.toRecord(slot);
   }
@@ -242,6 +251,7 @@ export class InMemoryBackend implements JobsBackend {
     const slot = this.slotById(jobId);
     if (!slot || slot.state !== 'dead_letter') return;
     slot.state = 'cancelled';
+    slot.terminalAt = this.now();
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
   }
 
@@ -280,10 +290,18 @@ export class InMemoryBackend implements JobsBackend {
           slot.state === 'failed' ||
           slot.state === 'dead_letter' ||
           slot.state === 'cancelled';
-        const expired = entry.expiresAt !== undefined && entry.expiresAt <= this.now().getTime();
+        const now = this.now().getTime();
+        const activeExpired =
+          entry.activeExpiresAt !== undefined && entry.activeExpiresAt <= now;
+        const terminalExpired =
+          terminal &&
+          entry.ttlMs !== undefined &&
+          !!slot?.terminalAt &&
+          slot.terminalAt.getTime() + Math.max(0, entry.ttlMs) <= now;
         if (
-          (entry.mode === 'while_active' && (terminal || expired)) ||
-          (entry.mode === 'until_completed' && terminal && expired)
+          !slot ||
+          (entry.mode === 'while_active' && (terminal || activeExpired)) ||
+          (entry.mode === 'until_completed' && terminalExpired)
         ) {
           this.dedupe.delete(dedupeKey);
         } else {

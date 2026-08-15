@@ -30,6 +30,7 @@ This project is currently pre-release. The changelog below starts from the curre
 ### Compatibility notes
 
 - BullMQ `timeoutMs`, durable `getJobHistory()`, DLQ list/replay/discard, and manual pull/drain now fail explicitly instead of being silently ignored or represented by synthetic state.
+- `BullMQBackend.getRawQueue()` now defaults to the optional-peer-safe `BullMQRawQueue` surface. Callers using additional BullMQ methods should request the full type explicitly with `getRawQueue<import('bullmq').Queue>(jobType)`.
 - BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
 - Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
 

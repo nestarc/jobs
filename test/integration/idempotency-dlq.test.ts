@@ -103,6 +103,7 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     };
     const retainedId = await service.enqueue('report.generate', {}, untilCompleted);
     await backend.moveToActive('report.generate', retainedId);
+    now = new Date(now.getTime() + 5_000);
     await backend.ack('report.generate', retainedId);
     await expect(
       service.enqueueDetailed('report.generate', {}, untilCompleted),

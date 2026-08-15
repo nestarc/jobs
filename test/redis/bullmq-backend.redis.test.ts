@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { Queue } from 'bullmq';
+import { Queue, UnrecoverableError } from 'bullmq';
 import {
   BullMQBackend,
   createOutboxJobsPublisher,
@@ -128,6 +128,13 @@ describe('BullMQBackend with Redis', () => {
 
     await waitFor(async () => (await instance.getJob(jobId))?.status === 'succeeded');
 
+    expect(await instance.getJob(jobId)).toMatchObject({
+      status: 'succeeded',
+      completedAt: expect.any(Date),
+      failedAt: undefined,
+      error: undefined,
+    });
+
     expect(attempts).toHaveLength(3);
     expect(attempts[1] - attempts[0]).toBeGreaterThanOrEqual(100);
     expect(attempts[2] - attempts[1]).toBeGreaterThanOrEqual(100);
@@ -151,6 +158,76 @@ describe('BullMQBackend with Redis', () => {
       'job.started',
       'job.failed',
     ]);
+  });
+
+  it('reports an unrecoverable error as terminal instead of scheduling a retry', async () => {
+    const { namespace, jobType } = testIdentity('unrecoverable');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    const events: JobLifecycleEvent[] = [];
+    registry.register(jobType, async () => {
+      throw new UnrecoverableError('stop immediately');
+    });
+    instance.startConsumer(
+      [jobType],
+      consumer(registry, { onEvent: (event) => events.push(event) }),
+    );
+
+    const jobId = await service(instance, jobType).enqueue(jobType, {}, { attempts: 3 });
+    await waitFor(async () => (await instance.getJob(jobId))?.status === 'failed');
+
+    expect(events.map((event) => event.type)).toEqual(['job.started', 'job.failed']);
+    expect(await instance.getJob(jobId)).toMatchObject({ status: 'failed', attempt: 1 });
+  });
+
+  it('uses globally unique generated IDs across registered job type queues', async () => {
+    const namespace = `nestarc-multi-queue-${randomUUID()}`;
+    const jobTypes = ['type.a', 'type.b'];
+    const instance = new BullMQBackend({ namespace, connection });
+    instance.registerJobTypes(jobTypes);
+    backends.push(instance);
+    jobTypes.forEach((jobType) => queues.add(`${namespace}.${jobType}`));
+    const jobs = new JobsService({
+      backend: instance,
+      registry: new HandlerRegistry(),
+      jobTypes,
+    });
+
+    const firstId = await jobs.enqueue('type.a', { marker: 'a' });
+    const secondId = await jobs.enqueue('type.b', { marker: 'b' });
+
+    expect(firstId).not.toBe(secondId);
+    expect(await instance.getJob(firstId)).toMatchObject({
+      id: firstId,
+      type: 'type.a',
+      payload: { marker: 'a' },
+    });
+    expect(await instance.getJob(secondId)).toMatchObject({
+      id: secondId,
+      type: 'type.b',
+      payload: { marker: 'b' },
+    });
+  });
+
+  it('rejects the internal envelope key while preserving legacy payload lookalikes', async () => {
+    const { namespace, jobType } = testIdentity('reserved-envelope');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+
+    await expect(
+      jobs.enqueue(jobType, { __nestarcJob: { customerValue: true }, keep: 1 }),
+    ).rejects.toMatchObject({ code: 'jobs_reserved_payload_key' });
+
+    const legacyId = randomUUID();
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    await rawQueue.add(
+      jobType,
+      { __nestarcJob: { customerValue: true }, keep: 1 },
+      { jobId: legacyId },
+    );
+    expect(await instance.getJob(legacyId)).toMatchObject({
+      payload: { __nestarcJob: { customerValue: true }, keep: 1 },
+    });
   });
 
   it('atomically suppresses concurrent idempotent enqueue across producers and restart', async () => {

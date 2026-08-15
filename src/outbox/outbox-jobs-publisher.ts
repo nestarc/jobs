@@ -36,7 +36,8 @@ export interface OutboxJobsPublisherOptions {
 
 /**
  * Creates an OutboxPublisher-compatible Nest provider for use as
- * `OutboxModule.forRoot({ transport: createOutboxJobsPublisher(...) })`.
+ * `OutboxModule.forRoot({ transport: createOutboxJobsPublisher(...),
+ * delivery: { mode: 'publisher' } })`.
  */
 export function createOutboxJobsPublisher(
   publisherOptions: OutboxJobsPublisherOptions,

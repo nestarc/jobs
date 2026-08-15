@@ -78,4 +78,32 @@ describe('BullMQ capability contract', () => {
       }),
     ).toThrow(JobsErrorCode.CapabilityUnsupported);
   });
+
+  it('continues queue cleanup after a worker close failure and allows retry', async () => {
+    const instance = backend();
+    let workerCloseCalls = 0;
+    let queueCloseCalls = 0;
+    const resources = instance as unknown as {
+      workers: Map<string, { close(): Promise<void> }>;
+      queues: Map<string, { close(): Promise<void> }>;
+    };
+    resources.workers.set('worker', {
+      close: async () => {
+        workerCloseCalls += 1;
+        if (workerCloseCalls === 1) throw new Error('transient worker close failure');
+      },
+    });
+    resources.queues.set('queue', {
+      close: async () => {
+        queueCloseCalls += 1;
+      },
+    });
+
+    await expect(instance.close()).rejects.toThrow('transient worker close failure');
+    expect(queueCloseCalls).toBe(1);
+
+    await expect(instance.close()).resolves.toBeUndefined();
+    expect(workerCloseCalls).toBe(2);
+    expect(queueCloseCalls).toBe(1);
+  });
 });

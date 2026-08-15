@@ -354,6 +354,7 @@ const JobsPublisher = createOutboxJobsPublisher({
 
 OutboxModule.forRoot({
   transport: JobsPublisher,
+  delivery: { mode: 'publisher' },
   // other @nestarc/outbox options
 });
 ```

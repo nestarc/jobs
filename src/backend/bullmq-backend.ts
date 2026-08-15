@@ -103,6 +103,9 @@ export class BullMQBackend implements JobsBackend {
     opts: EnqueueOptions,
   ): Promise<EnqueueResult> {
     if (opts.timeoutMs !== undefined) throw this.unsupported('timeout');
+    if (Object.prototype.hasOwnProperty.call(envelope, INTERNAL_KEY)) {
+      throw new JobsError(JobsErrorCode.ReservedPayloadKey, INTERNAL_KEY);
+    }
 
     const queue = this.getOrCreateQueue(jobType);
     const { context } = detachContext(envelope);
@@ -149,11 +152,12 @@ export class BullMQBackend implements JobsBackend {
       const job = await queue.getJob(jobId);
       if (!job) continue;
       const state = await job.getState();
+      const status = this.mapState(state);
       const decoded = this.decode(job.data as Record<string, unknown>);
       return {
         id: String(job.id),
         type: String(job.name),
-        status: this.mapState(state),
+        status,
         payload: decoded.payload,
         context: decoded.context,
         attempt: job.attemptsMade,
@@ -165,9 +169,14 @@ export class BullMQBackend implements JobsBackend {
             ? new Date(job.timestamp + job.delay)
             : undefined,
         startedAt: job.processedOn ? new Date(job.processedOn) : undefined,
-        failedAt: job.failedReason ? new Date(job.finishedOn ?? Date.now()) : undefined,
-        completedAt: !job.failedReason && job.finishedOn ? new Date(job.finishedOn) : undefined,
-        error: job.failedReason ? { message: job.failedReason } : undefined,
+        failedAt:
+          status === 'failed' && job.finishedOn ? new Date(job.finishedOn) : undefined,
+        completedAt:
+          status === 'succeeded' && job.finishedOn ? new Date(job.finishedOn) : undefined,
+        error:
+          status === 'failed' && job.failedReason
+            ? { message: job.failedReason }
+            : undefined,
         idempotencyKey: decoded.internal?.idempotencyKey,
         dedupeKey: decoded.internal?.dedupeKey,
         metadata: { ...(decoded.internal?.metadata ?? {}), queueName },
@@ -225,13 +234,13 @@ export class BullMQBackend implements JobsBackend {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.closePromise = (async () => {
-      await Promise.all([...this.workers.values()].map((worker) => worker.close()));
-      await Promise.all([...this.queues.values()].map((queue) => queue.close()));
-      this.queues.clear();
-      this.workers.clear();
-    })();
-    return this.closePromise;
+    const closing = this.closeResources();
+    this.closePromise = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.closePromise === closing) this.closePromise = null;
+    }
   }
 
   getRawQueue<TQueue = BullMQRawQueue>(jobType: string): TQueue {
@@ -282,7 +291,9 @@ export class BullMQBackend implements JobsBackend {
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       const attempt = job.attemptsMade + 1;
-      const willRetry = attempt < (job.opts.attempts ?? 1);
+      const { UnrecoverableError } = loadBullMQ();
+      const willRetry =
+        !(error instanceof UnrecoverableError) && attempt < (job.opts.attempts ?? 1);
       consumer.onFail?.(event, error);
       consumer.events?.onEvent?.({
         type: willRetry ? 'job.retry_scheduled' : 'job.failed',
@@ -302,11 +313,11 @@ export class BullMQBackend implements JobsBackend {
     queue: Queue,
     opts: EnqueueOptions,
     dedupeKey: string | undefined,
-  ): Promise<string | undefined> {
+  ): Promise<string> {
     if (opts.jobId) return opts.jobId;
     if (opts.idempotencyKey) return `id-${this.hash(opts.idempotencyKey)}`;
     if (!opts.dedupe || !dedupeKey || (opts.dedupe.mode ?? 'until_completed') === 'while_active') {
-      return undefined;
+      return randomUUID();
     }
 
     const jobId = `dedupe-${this.hash(dedupeKey)}`;
@@ -346,18 +357,48 @@ export class BullMQBackend implements JobsBackend {
   }
 
   private decode(envelope: Record<string, unknown>): DecodedEnvelope {
-    const { [INTERNAL_KEY]: rawInternal, ...legacyEnvelope } = envelope;
-    const { payload, context } = detachContext(legacyEnvelope);
-    const internal = this.isPersistedMetadata(rawInternal) ? rawInternal : undefined;
-    return { payload, context, internal };
+    const rawInternal = envelope[INTERNAL_KEY];
+    if (!this.isPersistedMetadata(rawInternal)) {
+      const { payload, context } = detachContext(envelope);
+      return { payload, context };
+    }
+    const persistedEnvelope = { ...envelope };
+    delete persistedEnvelope[INTERNAL_KEY];
+    const { payload, context } = detachContext(persistedEnvelope);
+    return { payload, context, internal: rawInternal };
   }
 
   private isPersistedMetadata(value: unknown): value is PersistedJobMetadata {
     return (
       typeof value === 'object' &&
       value !== null &&
-      (value as { version?: unknown }).version === INTERNAL_VERSION
+      (value as { version?: unknown }).version === INTERNAL_VERSION &&
+      typeof (value as { metadata?: unknown }).metadata === 'object' &&
+      (value as { metadata?: unknown }).metadata !== null &&
+      typeof (value as { enqueueToken?: unknown }).enqueueToken === 'string'
     );
+  }
+
+  private async closeResources(): Promise<void> {
+    const failures: unknown[] = [];
+    const workers = [...this.workers.entries()];
+    const workerResults = await Promise.allSettled(
+      workers.map(([, worker]) => worker.close()),
+    );
+    workerResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') this.workers.delete(workers[index][0]);
+      else failures.push(result.reason);
+    });
+
+    const queues = [...this.queues.entries()];
+    const queueResults = await Promise.allSettled(queues.map(([, queue]) => queue.close()));
+    queueResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') this.queues.delete(queues[index][0]);
+      else failures.push(result.reason);
+    });
+
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, 'BullMQ backend close failed');
   }
 
   private mapState(state: string): JobStatus {
