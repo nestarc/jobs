@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { attachContext, detachContext } from '../context-serializer';
+import { detachContext } from '../context-serializer';
 import type { JobsBackend } from './jobs-backend.interface';
 import type { EnqueueOptions, JobEnvelope } from '../types';
 import type {
@@ -17,6 +17,7 @@ import { computeBackoffDelayMs } from '../retry';
 interface Slot {
   envelope: JobEnvelope;
   state: JobStatus;
+  dedupePolicy?: Omit<DedupeEntry, 'jobId'>;
   initialScheduledFor?: Date;
   startedAt?: Date;
   completedAt?: Date;
@@ -85,6 +86,7 @@ export class InMemoryBackend implements JobsBackend {
     const dedupeMapKey = dedupeKey ? this.scopedIdentityKey(jobType, dedupeKey) : undefined;
     const existingJobId = this.findExistingJobId(idempotencyMapKey, dedupeMapKey);
     if (existingJobId) {
+      this.backfillIdentityMappings(existingJobId, idempotencyMapKey, dedupeMapKey, opts.dedupe);
       return { status: 'deduped', jobId: existingJobId, existingJobId };
     }
 
@@ -97,6 +99,12 @@ export class InMemoryBackend implements JobsBackend {
     this.bucketOf(jobType).set(id, {
       state,
       initialScheduledFor: scheduledFor ? new Date(scheduledFor.getTime()) : undefined,
+      dedupePolicy: opts.dedupe
+        ? {
+            mode: opts.dedupe.mode ?? 'until_completed',
+            ttlMs: opts.dedupe.ttlMs,
+          }
+        : undefined,
       envelope: {
         id,
         jobType,
@@ -244,19 +252,48 @@ export class InMemoryBackend implements JobsBackend {
     if (!slot || slot.state !== 'dead_letter') {
       throw new Error(`dead-letter job not found: ${jobId}`);
     }
-    const newJobId = await this.enqueue(
-      slot.envelope.jobType,
-      attachContext(slot.envelope.payload as Record<string, unknown>, slot.envelope.context),
-      {
-        jobId: options.preserveOriginalId ? jobId : undefined,
+
+    const replayIdentityJobId = this.findReplayIdentityJob(slot, jobId);
+    if (replayIdentityJobId) {
+      slot.state = 'cancelled';
+      this.recordHistory(
+        jobId,
+        'cancelled',
+        slot.envelope.attempts,
+        `replayed as ${replayIdentityJobId}`,
+      );
+      return replayIdentityJobId;
+    }
+
+    const newJobId = options.preserveOriginalId ? jobId : randomUUID();
+    const replayAttempt = options.resetAttempts === false ? slot.envelope.attempts : 0;
+    const replaySlot: Slot = {
+      state: 'queued',
+      dedupePolicy: slot.dedupePolicy ? { ...slot.dedupePolicy } : undefined,
+      envelope: {
+        id: newJobId,
+        jobType: slot.envelope.jobType,
+        payload: slot.envelope.payload,
         context: slot.envelope.context,
-        attempts: slot.envelope.maxAttempts,
-        backoff: slot.envelope.backoff,
+        enqueuedAt: this.now(),
+        attempts: replayAttempt,
+        maxAttempts: slot.envelope.maxAttempts,
         timeoutMs: slot.envelope.timeoutMs,
+        backoff: slot.envelope.backoff,
         metadata: { ...slot.envelope.metadata, ...options.metadata, replayOf: jobId },
+        idempotencyKey: slot.envelope.idempotencyKey,
+        dedupeKey: slot.envelope.dedupeKey,
       },
-    );
-    this.recordHistory(jobId, 'queued', slot.envelope.attempts, 'replayed');
+    };
+
+    this.bucketOf(slot.envelope.jobType).set(newJobId, replaySlot);
+    this.jobTypesById.set(newJobId, slot.envelope.jobType);
+    this.rebindReplayIdentities(slot, jobId, newJobId);
+    this.recordHistory(newJobId, 'queued', replayAttempt);
+    if (newJobId !== jobId) {
+      slot.state = 'cancelled';
+      this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, `replayed as ${newJobId}`);
+    }
     return newJobId;
   }
 
@@ -327,6 +364,67 @@ export class InMemoryBackend implements JobsBackend {
     return undefined;
   }
 
+  private backfillIdentityMappings(
+    jobId: string,
+    idempotencyMapKey: string | undefined,
+    dedupeMapKey: string | undefined,
+    dedupe: EnqueueOptions['dedupe'],
+  ): void {
+    if (idempotencyMapKey) {
+      const mappedJobId = this.idempotency.get(idempotencyMapKey);
+      if (!mappedJobId || this.slotById(mappedJobId)?.state === 'cancelled') {
+        this.idempotency.set(idempotencyMapKey, jobId);
+      }
+    }
+    if (dedupeMapKey && !this.dedupe.has(dedupeMapKey)) {
+      this.dedupe.set(dedupeMapKey, {
+        jobId,
+        mode: dedupe?.mode ?? 'until_completed',
+        ttlMs: dedupe?.ttlMs,
+      });
+    }
+  }
+
+  private findReplayIdentityJob(slot: Slot, originalJobId: string): string | undefined {
+    const idempotencyMapKey = slot.envelope.idempotencyKey
+      ? this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.idempotencyKey)
+      : undefined;
+    if (idempotencyMapKey) {
+      const mappedJobId = this.idempotency.get(idempotencyMapKey);
+      if (
+        mappedJobId &&
+        mappedJobId !== originalJobId &&
+        this.slotById(mappedJobId)?.state !== 'cancelled'
+      ) {
+        return mappedJobId;
+      }
+    }
+
+    const dedupeMapKey = slot.envelope.dedupeKey
+      ? this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.dedupeKey)
+      : undefined;
+    if (!dedupeMapKey) return undefined;
+    const mappedJobId = this.findExistingJobId(undefined, dedupeMapKey);
+    return mappedJobId && mappedJobId !== originalJobId ? mappedJobId : undefined;
+  }
+
+  private rebindReplayIdentities(slot: Slot, originalJobId: string, replayJobId: string): void {
+    if (slot.envelope.idempotencyKey) {
+      const mapKey = this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.idempotencyKey);
+      const mappedJobId = this.idempotency.get(mapKey);
+      if (!mappedJobId || mappedJobId === originalJobId) {
+        this.idempotency.set(mapKey, replayJobId);
+      }
+    }
+    if (slot.envelope.dedupeKey && slot.dedupePolicy) {
+      const mapKey = this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.dedupeKey);
+      const mappedJobId = this.dedupe.get(mapKey)?.jobId;
+      if (!mappedJobId || mappedJobId === originalJobId) {
+        this.dedupe.set(mapKey, { jobId: replayJobId, ...slot.dedupePolicy });
+      }
+    }
+  }
+
   private resolveDedupeKey(tenantId: unknown, opts: EnqueueOptions): string | undefined {
     if (!opts.dedupe) return undefined;
     const scope = opts.dedupe.scope ?? 'global';
@@ -334,9 +432,9 @@ export class InMemoryBackend implements JobsBackend {
       if (typeof tenantId !== 'string' || tenantId.length === 0) {
         throw new Error('tenant-scoped dedupe requires a tenantId');
       }
-      return `tenant:${tenantId}:${opts.dedupe.key}`;
+      return JSON.stringify(['tenant', tenantId, opts.dedupe.key]);
     }
-    return `global:${opts.dedupe.key}`;
+    return JSON.stringify(['global', opts.dedupe.key]);
   }
 
   private scopedIdentityKey(jobType: string, value: string): string {

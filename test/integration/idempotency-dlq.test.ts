@@ -1,11 +1,18 @@
-import { HandlerRegistry, InMemoryBackend, JobsService, Scheduler } from '../../src';
+import {
+  HandlerRegistry,
+  InMemoryBackend,
+  JobsService,
+  Scheduler,
+  type JobLifecycleEvent,
+} from '../../src';
 
-function setup() {
+function setup(events?: JobLifecycleEvent[]) {
   const backend = new InMemoryBackend();
   const service = new JobsService({
     backend,
     registry: new HandlerRegistry(),
     jobTypes: ['report.generate'],
+    events: events ? { onEvent: (event) => events.push(event) } : undefined,
   });
   return { backend, service };
 }
@@ -157,6 +164,66 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     expect(firstDedupe.jobId).not.toBe(secondDedupe.jobId);
   });
 
+  it('backfills every supplied identity when one identity dedupes the enqueue', async () => {
+    const { backend, service } = setup();
+    const first = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      {
+        idempotencyKey: 'identity-a',
+        dedupe: { key: 'shared', mode: 'while_active' },
+      },
+    );
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        {
+          idempotencyKey: 'identity-b',
+          dedupe: { key: 'shared', mode: 'while_active' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
+
+    await backend.moveToActive('report.generate', first.jobId);
+    await backend.ack('report.generate', first.jobId);
+
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        {
+          idempotencyKey: 'identity-b',
+          dedupe: { key: 'different', mode: 'while_active' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
+  });
+
+  it('encodes tenant dedupe identities without delimiter collisions', async () => {
+    const { service } = setup();
+    const first = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      {
+        context: { tenantId: 'a:b' },
+        dedupe: { key: 'c', scope: 'tenant' },
+      },
+    );
+    const second = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      {
+        context: { tenantId: 'a' },
+        dedupe: { key: 'b:c', scope: 'tenant' },
+      },
+    );
+
+    expect(first.status).toBe('created');
+    expect(second.status).toBe('created');
+    expect(second.jobId).not.toBe(first.jobId);
+  });
+
   it('lists, replays, and discards dead-lettered jobs', async () => {
     const { backend, service } = setup();
     const jobId = await service.enqueue(
@@ -175,11 +242,51 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     expect(replayedId).not.toBe(jobId);
     expect(await service.getJob(replayedId)).toMatchObject({
       status: 'queued',
+      attempt: 0,
       context: { tenantId: 'tenant_1', correlationId: 'corr_1' },
     });
 
     await service.discardDeadLetter(jobId, 'handled manually');
     expect(await service.getJob(jobId)).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('rebinds replay identity and honors resetAttempts=false', async () => {
+    const events: JobLifecycleEvent[] = [];
+    const { backend, service } = setup(events);
+    const options = {
+      attempts: 1,
+      idempotencyKey: 'replay-identity',
+      dedupe: { key: 'replay-dedupe', mode: 'until_completed' as const },
+      metadata: { original: true },
+    };
+    const originalId = await service.enqueue('report.generate', {}, options);
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom');
+
+    const replayedId = await service.replayDeadLetter(originalId, {
+      resetAttempts: false,
+      metadata: { operator: 'manual' },
+    });
+
+    expect(replayedId).not.toBe(originalId);
+    expect(await service.getJob(originalId)).toMatchObject({ status: 'cancelled' });
+    expect(await service.getJob(replayedId)).toMatchObject({
+      status: 'queued',
+      attempt: 1,
+      idempotencyKey: 'replay-identity',
+      metadata: { original: true, operator: 'manual', replayOf: originalId },
+    });
+    await expect(service.enqueueDetailed('report.generate', {}, options)).resolves.toMatchObject({
+      status: 'deduped',
+      jobId: replayedId,
+    });
+    expect(events.filter((event) => event.type === 'job.replayed')).toEqual([
+      expect.objectContaining({
+        jobId: replayedId,
+        attempt: 1,
+        metadata: { original: true, operator: 'manual', replayOf: originalId },
+      }),
+    ]);
   });
 
   it('does not restart an expired dedupe retention window when a dead letter is discarded', async () => {

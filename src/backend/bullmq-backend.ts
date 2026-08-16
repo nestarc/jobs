@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } from 'bullmq';
@@ -68,6 +69,7 @@ interface IdentityMapping {
 
 interface IdentityRedisClient {
   get(key: string): Promise<string | null>;
+  zscore(key: string, member: string): Promise<string | null>;
   set(key: string, value: string): Promise<unknown>;
   set(
     key: string,
@@ -105,7 +107,9 @@ export interface BullMQConsumerOptions {
 export class BullMQBackend implements JobsBackend {
   private readonly queues = new Map<string, Queue>();
   private readonly workers = new Map<string, Worker>();
+  private readonly activeHandlerScope = new AsyncLocalStorage<boolean>();
   private closePromise: Promise<void> | null = null;
+  private closing = false;
   private closed = false;
 
   constructor(private readonly opts: BullMQBackendOptions) {}
@@ -193,10 +197,21 @@ export class BullMQBackend implements JobsBackend {
     return await this.withIdentityLocks(queue, identities, async (client) => {
       const existingJobId = await this.findExistingIdentityJob(queue, client, identities);
       if (existingJobId) {
+        await this.backfillIdentityMappings(client, identities, existingJobId);
         return {
           status: 'deduped',
           jobId: existingJobId,
           existingJobId,
+        };
+      }
+
+      const legacyJobId = await this.findLegacyIdempotencyJob(queue, opts);
+      if (legacyJobId) {
+        await this.backfillIdentityMappings(client, identities, legacyJobId);
+        return {
+          status: 'deduped',
+          jobId: legacyJobId,
+          existingJobId: legacyJobId,
         };
       }
 
@@ -256,6 +271,9 @@ export class BullMQBackend implements JobsBackend {
       const state = await job.getState();
       const status = this.mapState(state);
       const decoded = this.decode(job.data as Record<string, unknown>);
+      const delayedAt =
+        status === 'delayed' ? await this.getDelayedTimestamp(queue, String(job.id)) : undefined;
+      const nextAttemptAt = job.attemptsMade > 0 ? delayedAt : undefined;
       return {
         id: String(job.id),
         type: String(job.name),
@@ -265,15 +283,16 @@ export class BullMQBackend implements JobsBackend {
         attempt: job.attemptsMade,
         maxAttempts: job.opts.attempts ?? 1,
         enqueuedAt: new Date(job.timestamp),
-        scheduledFor: decoded.internal?.scheduledFor
-          ? new Date(decoded.internal.scheduledFor)
-          : job.delay
-            ? new Date(job.timestamp + job.delay)
-            : undefined,
+        scheduledFor:
+          nextAttemptAt ??
+          (decoded.internal?.scheduledFor
+            ? new Date(decoded.internal.scheduledFor)
+            : (delayedAt ?? (job.delay ? new Date(job.timestamp + job.delay) : undefined))),
         startedAt: job.processedOn ? new Date(job.processedOn) : undefined,
         failedAt: status === 'failed' && job.finishedOn ? new Date(job.finishedOn) : undefined,
         completedAt:
           status === 'succeeded' && job.finishedOn ? new Date(job.finishedOn) : undefined,
+        nextAttemptAt,
         error: status === 'failed' && job.failedReason ? { message: job.failedReason } : undefined,
         idempotencyKey: decoded.internal?.idempotencyKey,
         dedupeKey: decoded.internal?.dedupeKey,
@@ -325,13 +344,17 @@ export class BullMQBackend implements JobsBackend {
           },
         },
       });
+      worker.on('completed', (job) => this.notifyCompleted(jobType, job, consumer));
+      worker.on('failed', (job, error) => {
+        if (job) this.notifyFailed(jobType, job, error, consumer);
+      });
       this.workers.set(name, worker);
     }
   }
 
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closed = true;
+    this.closing = true;
     const closing = this.closeResources();
     this.closePromise = closing;
     try {
@@ -368,56 +391,73 @@ export class BullMQBackend implements JobsBackend {
       }),
     );
     try {
-      const result = await consumer.contextRunner(context, () =>
-        consumer.registry.invoke(jobType, payload, context),
+      return await this.activeHandlerScope.run(true, () =>
+        consumer.contextRunner(context, () => consumer.registry.invoke(jobType, payload, context)),
       );
-      const finishedAt = new Date();
-      notifyLifecycleObserver(() =>
-        consumer.onFinish?.(
-          snapshotLifecycleValue({
-            ...event,
-            finishedAt,
-            durationMs: finishedAt.getTime() - startedAt.getTime(),
-          }),
-        ),
-      );
-      notifyLifecycleObserver(() =>
-        consumer.events?.onEvent?.({
-          type: 'job.succeeded',
-          jobId: String(job.id),
-          jobType,
-          tenantId,
-          attempt: job.attemptsMade + 1,
-          at: finishedAt,
-          durationMs: finishedAt.getTime() - startedAt.getTime(),
-          metadata: snapshotLifecycleValue(metadata),
-        }),
-      );
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      const attempt = job.attemptsMade + 1;
-      const { UnrecoverableError } = loadBullMQ();
-      const willRetry =
-        !(error instanceof UnrecoverableError) && attempt < (job.opts.attempts ?? 1);
-      const errorSummary = { message: error.message, name: error.name };
-      notifyLifecycleObserver(() =>
-        consumer.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
-      );
-      notifyLifecycleObserver(() =>
-        consumer.events?.onEvent?.({
-          type: willRetry ? 'job.retry_scheduled' : 'job.failed',
-          jobId: String(job.id),
-          jobType,
-          tenantId,
-          attempt,
-          at: new Date(),
-          error: snapshotLifecycleValue(errorSummary),
-          metadata: snapshotLifecycleValue(metadata),
-        }),
-      );
-      throw error;
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
     }
+  }
+
+  private notifyCompleted(jobType: string, job: Job, consumer: BullMQConsumerOptions): void {
+    const { context, internal } = this.decode(job.data as Record<string, unknown>);
+    const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
+    const startedAt = new Date(job.processedOn ?? job.timestamp);
+    const finishedAt = new Date(job.finishedOn ?? Date.now());
+    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+    const event: JobEvent = {
+      jobId: String(job.id),
+      jobType,
+      tenantId,
+      startedAt,
+      finishedAt,
+      durationMs,
+    };
+    notifyLifecycleObserver(() => consumer.onFinish?.(snapshotLifecycleValue(event)));
+    notifyLifecycleObserver(() =>
+      consumer.events?.onEvent?.({
+        type: 'job.succeeded',
+        jobId: String(job.id),
+        jobType,
+        tenantId,
+        attempt: job.attemptsMade,
+        at: finishedAt,
+        durationMs,
+        metadata: snapshotLifecycleValue(internal?.metadata),
+      }),
+    );
+  }
+
+  private notifyFailed(
+    jobType: string,
+    job: Job,
+    error: Error,
+    consumer: BullMQConsumerOptions,
+  ): void {
+    const { context, internal } = this.decode(job.data as Record<string, unknown>);
+    const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
+    const startedAt = new Date(job.processedOn ?? job.timestamp);
+    const finishedAt = new Date(job.finishedOn ?? Date.now());
+    const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt, finishedAt };
+    const { UnrecoverableError } = loadBullMQ();
+    const unrecoverable =
+      error instanceof UnrecoverableError || error.name === 'UnrecoverableError';
+    const willRetry = !unrecoverable && job.attemptsMade < (job.opts.attempts ?? 1);
+    notifyLifecycleObserver(() =>
+      consumer.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
+    );
+    notifyLifecycleObserver(() =>
+      consumer.events?.onEvent?.({
+        type: willRetry ? 'job.retry_scheduled' : 'job.failed',
+        jobId: String(job.id),
+        jobType,
+        tenantId,
+        attempt: job.attemptsMade,
+        at: finishedAt,
+        error: snapshotLifecycleValue({ message: error.message, name: error.name }),
+        metadata: snapshotLifecycleValue(internal?.metadata),
+      }),
+    );
   }
 
   private resolveJobId(queue: Queue, opts: EnqueueOptions): string {
@@ -463,6 +503,7 @@ export class BullMQBackend implements JobsBackend {
     client: IdentityRedisClient,
     identities: PersistentIdentity[],
   ): Promise<string | undefined> {
+    let foundJobId: string | undefined;
     for (const identity of identities) {
       const rawMapping = await client.get(identity.mapKey);
       if (!rawMapping) continue;
@@ -473,7 +514,10 @@ export class BullMQBackend implements JobsBackend {
         await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
-      if (identity.kind === 'idempotency') return mapping.jobId;
+      if (identity.kind === 'idempotency') {
+        foundJobId ??= mapping.jobId;
+        continue;
+      }
 
       const state = await existing.getState();
       const terminal = state === 'completed' || state === 'failed';
@@ -489,9 +533,31 @@ export class BullMQBackend implements JobsBackend {
         await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
-      return mapping.jobId;
+      foundJobId ??= mapping.jobId;
     }
-    return undefined;
+    return foundJobId;
+  }
+
+  private async backfillIdentityMappings(
+    client: IdentityRedisClient,
+    identities: PersistentIdentity[],
+    jobId: string,
+  ): Promise<void> {
+    await Promise.all(
+      identities.map(async (identity) => {
+        if (await client.get(identity.mapKey)) return;
+        await client.set(identity.mapKey, this.serializeIdentityMapping(identity, jobId));
+      }),
+    );
+  }
+
+  private async findLegacyIdempotencyJob(
+    queue: Queue,
+    opts: EnqueueOptions,
+  ): Promise<string | undefined> {
+    if (!opts.idempotencyKey || opts.jobId) return undefined;
+    const legacy = await queue.getJob(opts.idempotencyKey);
+    return legacy ? String(legacy.id) : undefined;
   }
 
   private async withIdentityLocks<T>(
@@ -583,9 +649,9 @@ export class BullMQBackend implements JobsBackend {
           'tenant-scoped dedupe requires a tenantId',
         );
       }
-      return `tenant:${tenantId}:${dedupe.key}`;
+      return JSON.stringify(['tenant', tenantId, dedupe.key]);
     }
-    return `global:${dedupe.key}`;
+    return JSON.stringify(['global', dedupe.key]);
   }
 
   private resolveScheduledFor(opts: EnqueueOptions): Date | undefined {
@@ -626,6 +692,10 @@ export class BullMQBackend implements JobsBackend {
       else failures.push(result.reason);
     });
 
+    // Active handlers have drained. Reject later producer work before queues
+    // are closed, while still allowing handlers to enqueue follow-up jobs.
+    this.closed = true;
+
     const queues = [...this.queues.entries()];
     const queueResults = await Promise.allSettled(queues.map(([, queue]) => queue.close()));
     queueResults.forEach((result, index) => {
@@ -635,6 +705,14 @@ export class BullMQBackend implements JobsBackend {
 
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, 'BullMQ backend close failed');
+  }
+
+  private async getDelayedTimestamp(queue: Queue, jobId: string): Promise<Date | undefined> {
+    const client = (await queue.client) as unknown as IdentityRedisClient;
+    const score = await client.zscore(queue.toKey('delayed'), jobId);
+    if (score === null) return undefined;
+    const timestamp = Math.floor(Number(score) / 0x1000);
+    return Number.isFinite(timestamp) ? new Date(timestamp) : undefined;
   }
 
   private mapState(state: string): JobStatus {
@@ -651,7 +729,7 @@ export class BullMQBackend implements JobsBackend {
   }
 
   private getOrCreateQueue(jobType: string): Queue {
-    this.assertOpen();
+    this.assertAcceptingWork();
     const name = this.queueName(jobType);
     let queue = this.queues.get(name);
     if (!queue) {
@@ -680,6 +758,13 @@ export class BullMQBackend implements JobsBackend {
   private assertOpen(): void {
     if (this.closed) {
       throw new JobsError(JobsErrorCode.BackendClosed, 'BullMQ backend is closed');
+    }
+  }
+
+  private assertAcceptingWork(): void {
+    this.assertOpen();
+    if (this.closing && !this.activeHandlerScope.getStore()) {
+      throw new JobsError(JobsErrorCode.BackendClosed, 'BullMQ backend is closing');
     }
   }
 }

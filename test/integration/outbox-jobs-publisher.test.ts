@@ -69,9 +69,40 @@ describe('createOutboxJobsPublisher', () => {
         source: '@nestarc/outbox',
         outboxEventId: record.id,
         correlationId: record.id,
+        tenantId: 'tenant_1',
         outboxIdempotencyKey: 'source-key',
       }),
     });
+  });
+
+  it('applies mapping-level dedupe across different outbox records', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    let executions = 0;
+    fake.registry.register('invoice.process', async () => {
+      executions += 1;
+      return null;
+    });
+    const Publisher = createOutboxJobsPublisher({
+      map: {
+        'invoice.issued': {
+          job: 'invoice.process',
+          options: { dedupe: { key: 'invoice-stream', mode: 'until_completed' } },
+        },
+      },
+    });
+    const publisher = new Publisher(fake.service);
+    const secondRecord = {
+      ...record,
+      id: 'a998c217-194d-4370-ad1e-2157229e73b8',
+    };
+
+    await publisher.publish(record);
+    await publisher.publish(secondRecord);
+    await fake.drain();
+
+    expect(executions).toBe(1);
+    expect(await fake.service.getJob(secondRecord.id)).toBeNull();
+    expect(await fake.service.getJob(record.id)).toMatchObject({ status: 'succeeded' });
   });
 
   it('fails closed for unmapped events and missing required tenants', async () => {

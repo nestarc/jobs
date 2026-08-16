@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Module, type OnModuleDestroy } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { Queue, UnrecoverableError } from 'bullmq';
+import { Queue } from 'bullmq';
 import {
   BullMQBackend,
   createOutboxJobsPublisher,
@@ -25,6 +25,42 @@ class RedisModuleHandler {
     });
   }
 }
+
+let nestedHandlerEntered = false;
+let releaseNestedHandler: () => void = () => undefined;
+const nestedShutdownTimeline: string[] = [];
+
+@Injectable()
+class NestedShutdownDependency implements OnModuleDestroy {
+  use(): void {
+    nestedShutdownTimeline.push('dependency-use');
+  }
+
+  onModuleDestroy(): void {
+    nestedShutdownTimeline.push('dependency-destroy');
+  }
+}
+
+@Injectable()
+class NestedShutdownHandler {
+  constructor(private readonly dependency: NestedShutdownDependency) {}
+
+  @JobHandler('nested.module.job')
+  async handle(): Promise<void> {
+    nestedShutdownTimeline.push('handler-enter');
+    nestedHandlerEntered = true;
+    await new Promise<void>((resolve) => {
+      releaseNestedHandler = resolve;
+    });
+    this.dependency.use();
+  }
+}
+
+@Module({ providers: [NestedShutdownDependency, NestedShutdownHandler] })
+class NestedShutdownLeafModule {}
+
+@Module({ imports: [NestedShutdownLeafModule] })
+class NestedShutdownFeatureModule {}
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {
@@ -126,7 +162,11 @@ describe('BullMQBackend with Redis', () => {
       { attempts: 3, backoff: { type: 'fixed', delayMs: 150 } },
     );
 
-    await waitFor(async () => (await instance.getJob(jobId))?.status === 'succeeded');
+    await waitFor(
+      async () =>
+        (await instance.getJob(jobId))?.status === 'succeeded' &&
+        events.at(-1)?.type === 'job.succeeded',
+    );
 
     expect(await instance.getJob(jobId)).toMatchObject({
       status: 'succeeded',
@@ -152,7 +192,11 @@ describe('BullMQBackend with Redis', () => {
       { permanent: true },
       { attempts: 1 },
     );
-    await waitFor(async () => (await instance.getJob(failedJobId))?.status === 'failed');
+    await waitFor(
+      async () =>
+        (await instance.getJob(failedJobId))?.status === 'failed' &&
+        events.at(-1)?.type === 'job.failed',
+    );
     expect(await instance.getJob(failedJobId)).toMatchObject({ status: 'failed' });
     expect(events.slice(-2).map((event) => event.type)).toEqual(['job.started', 'job.failed']);
   });
@@ -163,7 +207,9 @@ describe('BullMQBackend with Redis', () => {
     const registry = new HandlerRegistry();
     const events: JobLifecycleEvent[] = [];
     registry.register(jobType, async () => {
-      throw new UnrecoverableError('stop immediately');
+      const error = new Error('stop immediately');
+      error.name = 'UnrecoverableError';
+      throw error;
     });
     instance.startConsumer(
       [jobType],
@@ -171,10 +217,81 @@ describe('BullMQBackend with Redis', () => {
     );
 
     const jobId = await service(instance, jobType).enqueue(jobType, {}, { attempts: 3 });
-    await waitFor(async () => (await instance.getJob(jobId))?.status === 'failed');
+    await waitFor(
+      async () =>
+        (await instance.getJob(jobId))?.status === 'failed' && events.at(-1)?.type === 'job.failed',
+    );
 
     expect(events.map((event) => event.type)).toEqual(['job.started', 'job.failed']);
     expect(await instance.getJob(jobId)).toMatchObject({ status: 'failed', attempt: 1 });
+  });
+
+  it('emits failure only after BullMQ rejects a non-serializable handler result', async () => {
+    const { namespace, jobType } = testIdentity('return-serialization');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    const events: JobLifecycleEvent[] = [];
+    let finishes = 0;
+    let failures = 0;
+    const expectedWorkerError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    registry.register(jobType, async () => 1n);
+    instance.startConsumer([jobType], {
+      ...consumer(registry, { onEvent: (event) => events.push(event) }),
+      onFinish: () => {
+        finishes += 1;
+      },
+      onFail: () => {
+        failures += 1;
+      },
+    });
+
+    try {
+      const jobId = await service(instance, jobType).enqueue(jobType, {}, { attempts: 1 });
+      await waitFor(
+        async () =>
+          (await instance.getJob(jobId))?.status === 'failed' &&
+          events.at(-1)?.type === 'job.failed',
+      );
+
+      expect(events.map((event) => event.type)).toEqual(['job.started', 'job.failed']);
+      expect({ finishes, failures }).toEqual({ finishes: 0, failures: 1 });
+      expect(await instance.getJob(jobId)).toMatchObject({
+        status: 'failed',
+        error: { message: expect.stringContaining('BigInt') },
+      });
+    } finally {
+      expectedWorkerError.mockRestore();
+    }
+  });
+
+  it('reports the actual delayed retry timestamp', async () => {
+    const { namespace, jobType } = testIdentity('retry-timestamp');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => {
+      throw new Error('retry later');
+    });
+    instance.startConsumer([jobType], consumer(registry));
+
+    const jobId = await service(instance, jobType).enqueue(
+      jobType,
+      {},
+      { attempts: 2, backoff: { type: 'fixed', delayMs: 3_000 } },
+    );
+    await waitFor(async () => {
+      const record = await instance.getJob(jobId);
+      return record?.status === 'delayed' && record.attempt === 1;
+    });
+
+    const record = await instance.getJob(jobId);
+    expect(record).toMatchObject({
+      status: 'delayed',
+      attempt: 1,
+      nextAttemptAt: expect.any(Date),
+      scheduledFor: expect.any(Date),
+    });
+    expect(record?.scheduledFor?.getTime()).toBe(record?.nextAttemptAt?.getTime());
+    expect(record?.nextAttemptAt?.getTime()).toBeGreaterThan(Date.now() + 1_000);
   });
 
   it('uses globally unique generated and persistent identity IDs across job type queues', async () => {
@@ -316,6 +433,92 @@ describe('BullMQBackend with Redis', () => {
     await expect(
       service(restarted, jobType).enqueueDetailed(jobType, {}, options),
     ).resolves.toMatchObject({ status: 'deduped', jobId: originalJobId });
+  });
+
+  it('adopts a v0.2 raw idempotency job during an in-place upgrade', async () => {
+    const { namespace, jobType } = testIdentity('legacy-idempotency');
+    const first = backend(namespace, jobType);
+    const legacyIdempotencyKey = 'business-key-from-v0.2';
+    const rawQueue = first.getRawQueue<Queue>(jobType);
+    await rawQueue.add(jobType, { source: 'v0.2' }, { jobId: legacyIdempotencyKey });
+
+    await expect(
+      service(first, jobType).enqueueDetailed(
+        jobType,
+        { source: 'v0.3' },
+        { idempotencyKey: legacyIdempotencyKey },
+      ),
+    ).resolves.toMatchObject({
+      status: 'deduped',
+      jobId: legacyIdempotencyKey,
+      existingJobId: legacyIdempotencyKey,
+    });
+    expect(
+      await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+    ).toBe(1);
+
+    await first.close();
+    const restarted = backend(namespace, jobType);
+    await expect(
+      service(restarted, jobType).enqueueDetailed(
+        jobType,
+        { source: 'v0.3-restart' },
+        { idempotencyKey: legacyIdempotencyKey },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
+  });
+
+  it('backfills composite identities and avoids tenant delimiter collisions', async () => {
+    const { namespace, jobType } = testIdentity('identity-backfill');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const first = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        idempotencyKey: 'identity-a',
+        dedupe: { key: 'shared', mode: 'while_active' },
+      },
+    );
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        {},
+        {
+          idempotencyKey: 'identity-b',
+          dedupe: { key: 'shared', mode: 'while_active' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        {},
+        {
+          idempotencyKey: 'identity-b',
+          dedupe: { key: 'different', mode: 'while_active' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
+
+    const tenantOne = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        context: { tenantId: 'a:b' },
+        dedupe: { key: 'c', scope: 'tenant' },
+      },
+    );
+    const tenantTwo = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        context: { tenantId: 'a' },
+        dedupe: { key: 'b:c', scope: 'tenant' },
+      },
+    );
+    expect(tenantTwo.status).toBe('created');
+    expect(tenantTwo.jobId).not.toBe(tenantOne.jobId);
   });
 
   it('reconciles a committed add when the producer loses the Queue.add response', async () => {
@@ -569,6 +772,7 @@ describe('BullMQBackend with Redis', () => {
     const { namespace, jobType } = testIdentity('shutdown');
     const first = backend(namespace, jobType, 1);
     const registry = new HandlerRegistry();
+    const jobs = service(first, jobType);
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
@@ -578,11 +782,11 @@ describe('BullMQBackend with Redis', () => {
       if (payload.order === 1) {
         entered = true;
         await blocked;
+        await jobs.enqueue(jobType, { order: 3 });
       }
       return null;
     });
     first.startConsumer([jobType], consumer(registry));
-    const jobs = service(first, jobType);
     const firstId = await jobs.enqueue(jobType, { order: 1 });
     const secondId = await jobs.enqueue(jobType, { order: 2 });
     await waitFor(() => entered);
@@ -593,9 +797,12 @@ describe('BullMQBackend with Redis', () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 75));
     expect(closed).toBe(false);
+    await expect(jobs.enqueue(jobType, { order: 4 })).rejects.toMatchObject({
+      code: 'jobs_backend_closed',
+    });
     release();
     await closing;
-    await expect(jobs.enqueue(jobType, { order: 3 })).rejects.toMatchObject({
+    await expect(jobs.enqueue(jobType, { order: 5 })).rejects.toMatchObject({
       code: 'jobs_backend_closed',
     });
 
@@ -604,6 +811,11 @@ describe('BullMQBackend with Redis', () => {
     resumedRegistry.register(jobType, async () => null);
     second.startConsumer([jobType], consumer(resumedRegistry));
     await waitFor(async () => (await second.getJob(secondId))?.status === 'succeeded');
+    const rawQueue = second.getRawQueue<Queue>(jobType);
+    await waitFor(async () => {
+      const completed = await rawQueue.getJobs(['completed']);
+      return completed.some((job) => (job.data as { order?: number }).order === 3);
+    });
     expect(await second.getJob(firstId)).toMatchObject({ status: 'succeeded' });
   });
 
@@ -630,6 +842,42 @@ describe('BullMQBackend with Redis', () => {
     releaseModuleHandler();
     await closing;
     expect(closed).toBe(true);
+  });
+
+  it('drains BullMQ handlers before nested feature providers are destroyed', async () => {
+    nestedHandlerEntered = false;
+    releaseNestedHandler = () => undefined;
+    nestedShutdownTimeline.length = 0;
+    const namespace = `nestarc-nested-module-${randomUUID()}`;
+    const jobType = 'nested.module.job';
+    const instance = backend(namespace, jobType, 1);
+    const app = await Test.createTestingModule({
+      imports: [
+        JobsModule.forBullMQ({ backend: instance, jobTypes: [jobType] }),
+        NestedShutdownFeatureModule,
+      ],
+    }).compile();
+    const jobs = app.get(JobsService);
+    const jobId = await jobs.enqueue(jobType, {});
+    await waitFor(() => nestedHandlerEntered);
+
+    let closed = false;
+    const closing = app.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(closed).toBe(false);
+    expect(nestedShutdownTimeline).toEqual(['handler-enter']);
+    releaseNestedHandler();
+    await closing;
+
+    expect(nestedShutdownTimeline).toEqual([
+      'handler-enter',
+      'dependency-use',
+      'dependency-destroy',
+    ]);
+    const peer = backend(namespace, jobType);
+    expect(await peer.getJob(jobId)).toMatchObject({ status: 'succeeded' });
   });
 
   function backend(namespace: string, jobType: string, workerConcurrency?: number): BullMQBackend {

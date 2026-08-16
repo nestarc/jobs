@@ -65,7 +65,17 @@ class BullMQWorkersHost implements OnModuleDestroy {
   constructor(
     @Inject(JOBS_BACKEND) private readonly backend: JobsBackend,
     @Inject(JOBS_WORKERS) private readonly _workers: unknown[],
-  ) {}
+    discovery: DiscoveryService,
+  ) {
+    // Nest destroys deeper modules first. Make every BullMQ host module a
+    // shutdown barrier so active handlers drain before feature dependencies
+    // receive their onModuleDestroy hooks.
+    for (const provider of discovery.getProviders()) {
+      if (provider.token === BullMQWorkersHost && provider.host) {
+        provider.host.distance = Number.MAX_SAFE_INTEGER;
+      }
+    }
+  }
 
   async onModuleDestroy(): Promise<void> {
     await this.backend.close();

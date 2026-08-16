@@ -22,11 +22,15 @@ This project is currently pre-release. The changelog below starts from the curre
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
 - Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
+- Preserved rolling-upgrade idempotency by adopting v0.2 jobs whose raw BullMQ ID is the producer idempotency key, and backfilled every supplied identity after a deduped enqueue.
 - Unified BullMQ dedupe modes under one persisted identity policy so mode or TTL changes cannot weaken an active dedupe window.
+- Encoded tenant dedupe identities as structured tuples so tenant IDs and keys containing delimiters cannot collide.
 - Reconciled ambiguous BullMQ add failures against the reserved job before clearing identity state, preventing response-loss retries from creating duplicate work.
-- Made Nest application shutdown wait for active BullMQ work and close workers and queues idempotently.
+- Made Nest application shutdown drain active BullMQ work before feature-provider teardown, permit follow-up enqueue from those active handlers, and close workers and queues idempotently.
 - Applied typed job defaults at runtime and in `FakeJobsService`, with explicit enqueue options taking precedence.
-- Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler restoration.
+- Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler/identity restoration, including `resetAttempts` handling.
+- Emitted BullMQ success/failure lifecycle events only after BullMQ commits the matching terminal transition, and reported the actual delayed retry time through `scheduledFor` and `nextAttemptAt`.
+- Preserved outbox tenant lineage in both job context and metadata.
 - Isolated lifecycle observer failures so telemetry callbacks cannot reject committed enqueue operations or corrupt handler state.
 - Snapshot lifecycle callback inputs and restored terminal in-memory scheduling fields so observers and exhausted retries cannot mutate or misrepresent persisted state.
 - Normalized invalid negative/non-finite backoff delays and limited strict capability validation to registered job types.

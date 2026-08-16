@@ -79,6 +79,7 @@ export function createOutboxJobsPublisher(
         outboxEventId: record.id,
         outboxEventType: record.eventType,
         correlationId,
+        ...(tenantId ? { tenantId } : {}),
         ...(record.causationId ? { causationId: record.causationId } : {}),
         ...(record.aggregateType ? { aggregateType: record.aggregateType } : {}),
         ...(record.aggregateId ? { aggregateId: record.aggregateId } : {}),

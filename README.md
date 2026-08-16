@@ -310,6 +310,8 @@ const replayedJobId = await jobs.replayDeadLetter(failed[0].id);
 await jobs.discardDeadLetter(failed[0].id, 'handled manually');
 ```
 
+In-memory replay preserves and rebinds the original idempotency/dedupe identity to the replayed job. Attempts reset by default; pass `{ resetAttempts: false }` to retain the recorded attempt count.
+
 Tenant-scoped dedupe requires a tenant id:
 
 ```ts
