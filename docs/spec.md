@@ -1,5 +1,7 @@
 # @nestarc/jobs — v0.1 Technical Spec
 
+> Historical document: this specification describes the v0.1 design and is not the current v0.3 contract. See [spec-v0.3.md](spec-v0.3.md) for implemented v0.3 behavior.
+
 본 문서는 v0.1에서 고정되는 기술 결정을 기록한다. 변경은 RFC 수준의 논의를 거친다.
 
 ## 1. 아키텍처 한눈에
@@ -21,6 +23,7 @@ Handler invocation (ALS 복원 후 실행)
 ```
 
 **v0.1 구현 경로 (A안 확정)**: 두 backend path가 분리된다.
+
 - **InMemory backend + FairWorker**: scheduler가 다음 job을 완전히 선택. 이 경로에서 tenant fairness가 100% 보장됨.
 - **BullMQ backend**: 표준 `Worker`(autorun: true)가 FIFO로 job을 소비. scheduler는 **개입하지 않음**. `Worker.getNextJob()`이 임의 job 선택을 지원하지 않는 BullMQ 내부 구조상, OSS BullMQ에서 fairness를 동시 달성하려면 Redis Lua 스크립트가 필요하며 이는 v0.2로 연기.
 
@@ -29,17 +32,20 @@ Handler invocation (ALS 복원 후 실행)
 ## 2. 키 포맷 및 명명
 
 ### 2.1 Queue 이름
+
 - 기본: `<namespace>.<jobType>` (예: `acme.sendReport`)
 - namespace는 `JobsModule.forRoot({ namespace: 'acme' })`로 설정, 기본 `nestarc`
 - 큐는 job type당 하나. **tenant별 큐 생성 금지**
 
 ### 2.2 Job ID
+
 - BullMQ 기본 (auto) + 사용자 지정 허용
 - dedupe용 키는 사용자가 payload 외에 `jobId`로 전달
 
 ## 3. ALS 컨텍스트 전파
 
 ### 3.1 Enqueue 시점
+
 ```ts
 async enqueue(jobType: string, payload: unknown, opts?: JobOptions) {
   const ctx = this.contextExtractor();   // e.g. tenancy ALS 읽기
@@ -48,6 +54,7 @@ async enqueue(jobType: string, payload: unknown, opts?: JobOptions) {
 ```
 
 ### 3.2 Execute 시점
+
 ```ts
 async process(job: BullJob) {
   const { __nestarcCtx, ...payload } = job.data;
@@ -56,21 +63,25 @@ async process(job: BullJob) {
 ```
 
 ### 3.3 contextExtractor / contextRunner
+
 - 모듈 설정에서 주입. `@nestarc/tenancy` 사용 시 기본값 자동 제공
 - 주입 없으면 `{}` payload 그대로 통과 (no-op)
 
 ### 3.4 보안
+
 - `__nestarcCtx` 키는 예약어. 사용자가 동일 키로 payload를 보내면 enqueue에서 거절
 - 복원된 ALS는 handler 실행 중에만 유효. 외부로 직접 노출되는 API 없음
 
 ## 4. 공정 스케줄러 (Shard-based Weighted Round Robin)
 
 ### 4.1 기본 개념
+
 - 각 job type queue 안의 waiting job들을 `tenantId` 기준으로 **가상 shard**에 그룹핑
 - dispatcher는 shard 목록을 round-robin으로 순회
 - 각 shard의 가중치(weight)는 shard 당 1사이클당 pick 가능 횟수
 
 ### 4.2 알고리즘 (의사 코드)
+
 ```
 state: {
   shards: Map<tenantId, { weight, inflight, starvationTokens }>,
@@ -96,12 +107,14 @@ pickNext():
 ```
 
 ### 4.3 Minimum Share Guarantee
+
 - 기본 `minSharePct = 0.1` (10%)
 - 매 N cycles마다 각 shard의 최소 `N * minSharePct` 실행 보장
 - 보장 미달 시 `starvationTokens`가 증가, 임계 도달 시 강제 pick
 - 이 접근은 BullMQ Pro Groups에 없는 **nestarc의 추가 안전망**
 
 ### 4.4 가중치
+
 - `dataSubjectService.setTenantWeight(tenantId, n)` 런타임 변경 허용
 - plan 변경 이벤트에 반응 (v0.2)
 - shard 상태는 v0.1에서는 **단일 worker 프로세스 메모리**. 분산은 v0.3
@@ -115,6 +128,7 @@ pickNext():
 ## 6. Public API
 
 ### 6.1 Module
+
 ```ts
 JobsModule.forRoot({
   namespace?: string;
@@ -130,17 +144,19 @@ JobsModule.forRoot({
 ```
 
 ### 6.2 Service
+
 ```ts
 interface JobsService {
   enqueue(jobType: string, payload: unknown, opts?: JobOptions): Promise<string>;
-  getQueue(jobType: string): BullQueue;     // raw escape
-  getWorker(jobType: string): FairWorker;   // raw escape
+  getQueue(jobType: string): BullQueue; // raw escape
+  getWorker(jobType: string): FairWorker; // raw escape
   setTenantWeight(tenantId: string, weight: number): void;
   listShards(jobType: string): ShardInfo[];
 }
 ```
 
 ### 6.3 Handler 데코레이터
+
 ```ts
 @Injectable()
 export class ReportHandler {
@@ -152,6 +168,7 @@ export class ReportHandler {
 ```
 
 ### 6.4 Outbox Bridge
+
 ```ts
 JobsOutboxBridge.forRoot({
   source: outboxService,
@@ -172,27 +189,29 @@ JobsOutboxBridge.forRoot({
 ## 8. 테스트 기반
 
 ### 8.1 In-Memory Fake Queue
+
 - `FakeJobsService`를 제공
 - enqueue는 메모리 배열에 push
 - `drain()`으로 등록 handler를 순차 호출 (dispatcher 동작도 시뮬레이션)
 - tenant cap, weight, min share 모두 Fake에도 적용 → 배포 전 fairness 테스트 가능
 
 ### 8.2 예시
+
 ```ts
 const fake = new FakeJobsService({ tenantCap: 2, weights: { t1: 3, t2: 1 } });
 await fake.enqueue('x', { msg: 1 }, { ctx: { tenantId: 't1' } });
 await fake.drain();
-expect(fake.picked.map(j => j.ctx.tenantId)).toEqual(['t1','t1','t1','t2']);
+expect(fake.picked.map((j) => j.ctx.tenantId)).toEqual(['t1', 't1', 't1', 't2']);
 ```
 
 ## 9. 에러 코드
 
-| 코드 | 의미 |
-|---|---|
+| 코드                        | 의미                               |
+| --------------------------- | ---------------------------------- |
 | `jobs_reserved_payload_key` | payload에 `__nestarcCtx` 사용 시도 |
-| `jobs_handler_not_found` | 등록되지 않은 jobType |
-| `jobs_queue_not_found` | raw escape에서 없는 큐 요청 |
-| `jobs_fairness_misconfig` | weight ≤ 0 또는 minSharePct > 1 등 |
+| `jobs_handler_not_found`    | 등록되지 않은 jobType              |
+| `jobs_queue_not_found`      | raw escape에서 없는 큐 요청        |
+| `jobs_fairness_misconfig`   | weight ≤ 0 또는 minSharePct > 1 등 |
 
 ## 10. 보안 체크리스트
 
@@ -205,30 +224,36 @@ expect(fake.picked.map(j => j.ctx.tenantId)).toEqual(['t1','t1','t1','t2']);
 ## 11. 다른 nestarc 패키지와의 결합
 
 ### @nestarc/tenancy
+
 - 기본 `contextExtractor` = tenancy ALS store 읽기
 - 기본 `contextRunner` = tenancy ALS `run()` wrapping
 - tenancy 없어도 jobs는 작동 (no-op context)
 
 ### @nestarc/outbox
+
 - `JobsOutboxBridge`가 outbox의 polling 이벤트를 구독
 - **polling 로직은 outbox 패키지에 그대로 유지**. jobs는 dispatch target
 - 같은 트랜잭션 내 outbox insert → consumer worker가 잠시 후 job으로 변환
 
 ### @nestarc/audit-log
+
 - `onJobStart/Finish/Fail` 콜백을 audit-log와 wire
 - jobType, tenantId, duration, failureReason 기록
 
 ### @nestarc/data-subject
+
 - 기존에 `data_subject.erasure_requested` outbox 이벤트 publish
 - Bridge map에 한 줄 추가로 consumer 연결
+
 ```ts
 JobsOutboxBridge.forRoot({
   source: outboxService,
   map: { 'data_subject.erasure_requested': 'handleErasure' },
-})
+});
 ```
 
 ### @nestarc/webhook (미래)
+
 - outbound webhook 재시도 worker로 jobs 활용
 
 ## 12. v0.1에서 의도적으로 제외된 것

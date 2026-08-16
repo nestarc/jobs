@@ -3,7 +3,11 @@ import type { Scheduler } from './scheduler';
 import type { HandlerRegistry } from './handler-registry';
 import type { JobContext, JobEvent } from './types';
 import type { JobEventsOptions, JobLifecycleEventType } from './lifecycle';
-import { notifyLifecycleObserver } from './lifecycle-observer';
+import {
+  notifyLifecycleObserver,
+  snapshotLifecycleError,
+  snapshotLifecycleValue,
+} from './lifecycle-observer';
 
 export interface FairWorkerOptions {
   jobType: string;
@@ -42,7 +46,7 @@ export class FairWorker {
       startedAt,
       attempt: envelope.attempts,
     };
-    notifyLifecycleObserver(() => this.opts.onStart?.(event));
+    notifyLifecycleObserver(() => this.opts.onStart?.(snapshotLifecycleValue(event)));
     notifyLifecycleObserver(() =>
       this.opts.events?.onEvent?.({
         type: 'job.started',
@@ -51,7 +55,7 @@ export class FairWorker {
         tenantId: picked.tenantId,
         attempt: envelope.attempts,
         at: startedAt,
-        metadata: envelope.metadata,
+        metadata: snapshotLifecycleValue(envelope.metadata),
       }),
     );
 
@@ -90,11 +94,13 @@ export class FairWorker {
       await this.opts.backend.ack(this.opts.jobType, picked.jobId);
       this.opts.scheduler.onAck(picked.jobId);
       notifyLifecycleObserver(() =>
-        this.opts.onFinish?.({
-          ...event,
-          finishedAt,
-          durationMs: finishedAt.getTime() - startedAt.getTime(),
-        }),
+        this.opts.onFinish?.(
+          snapshotLifecycleValue({
+            ...event,
+            finishedAt,
+            durationMs: finishedAt.getTime() - startedAt.getTime(),
+          }),
+        ),
       );
       notifyLifecycleObserver(() =>
         this.opts.events?.onEvent?.({
@@ -105,18 +111,21 @@ export class FairWorker {
           attempt: envelope.attempts,
           at: finishedAt,
           durationMs: finishedAt.getTime() - startedAt.getTime(),
-          metadata: envelope.metadata,
+          metadata: snapshotLifecycleValue(envelope.metadata),
         }),
       );
       return true;
     } catch (err) {
-      const reason = (err as Error & { reason?: string }).reason ?? (err as Error).message;
+      const error = err instanceof Error ? err : new Error(String(err));
+      const reason = (error as Error & { reason?: string }).reason ?? error.message;
       const record = await this.opts.backend.fail(this.opts.jobType, picked.jobId, reason);
       this.opts.scheduler.onAck(picked.jobId);
       if (record?.status === 'queued' || record?.status === 'delayed') {
         this.opts.scheduler.onEnqueue(picked.jobId, picked.tenantId);
       }
-      notifyLifecycleObserver(() => this.opts.onFail?.(event, err as Error));
+      notifyLifecycleObserver(() =>
+        this.opts.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
+      );
       notifyLifecycleObserver(() =>
         this.opts.events?.onEvent?.({
           type: this.eventTypeForFailure(record?.status),
@@ -125,8 +134,8 @@ export class FairWorker {
           tenantId: picked.tenantId,
           attempt: envelope.attempts,
           at: new Date(),
-          error: record?.error ?? { message: reason },
-          metadata: envelope.metadata,
+          error: snapshotLifecycleValue(record?.error ?? { message: reason }),
+          metadata: snapshotLifecycleValue(envelope.metadata),
         }),
       );
       return true;

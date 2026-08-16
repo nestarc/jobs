@@ -9,12 +9,19 @@ export interface RetryPolicy {
 
 export function computeBackoffDelayMs(policy: BackoffPolicy | undefined, attempt: number): number {
   if (!policy) return 0;
-  const baseDelay = Math.max(0, policy.delayMs);
+  const baseDelay = nonNegativeFinite(policy.delayMs);
   if (policy.type === 'fixed') return withJitter(baseDelay, policy.jitter);
   const exponent = Math.max(0, attempt - 1);
   const uncapped = baseDelay * 2 ** exponent;
-  const capped = policy.maxDelayMs === undefined ? uncapped : Math.min(uncapped, policy.maxDelayMs);
+  const capped =
+    policy.maxDelayMs === undefined
+      ? uncapped
+      : Math.min(uncapped, nonNegativeFinite(policy.maxDelayMs));
   return withJitter(capped, policy.jitter);
+}
+
+function nonNegativeFinite(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function withJitter(delayMs: number, jitter: number | undefined): number {

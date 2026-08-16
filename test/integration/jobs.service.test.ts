@@ -62,6 +62,31 @@ describe('JobsService', () => {
     expect(waiting[0].context).toEqual({ tenantId: 't1' });
   });
 
+  it('isolates persisted metadata from lifecycle observer mutation', async () => {
+    const backend = new InMemoryBackend();
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['doThing'],
+      events: {
+        onEvent: (event) => {
+          const metadata = event.metadata as { nested?: { value: string } } | undefined;
+          if (metadata?.nested) metadata.nested.value = 'observer-mutated';
+        },
+      },
+    });
+
+    const jobId = await service.enqueue(
+      'doThing',
+      {},
+      { metadata: { nested: { value: 'persisted' } } },
+    );
+
+    await expect(service.getJob(jobId)).resolves.toMatchObject({
+      metadata: { nested: { value: 'persisted' } },
+    });
+  });
+
   it('rejects fairness controls when scheduler state is unavailable', () => {
     const service = new JobsService({
       backend: new InMemoryBackend(),
@@ -69,8 +94,6 @@ describe('JobsService', () => {
       jobTypes: ['doThing'],
     });
 
-    expect(() => service.setTenantWeight('doThing', 't1', 2)).toThrow(
-      'jobs_fairness_misconfig',
-    );
+    expect(() => service.setTenantWeight('doThing', 't1', 2)).toThrow('jobs_fairness_misconfig');
   });
 });

@@ -125,10 +125,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function assertJobDefaultsSupported(backend: JobsBackend, jobs: JobDefinitions | undefined): void {
+function assertJobDefaultsSupported(
+  backend: JobsBackend,
+  jobs: JobDefinitions | undefined,
+  jobTypes: Iterable<string>,
+): void {
   if (!jobs) return;
   const capabilities = backend.capabilities();
-  for (const [jobType, definition] of Object.entries(jobs)) {
+  for (const jobType of jobTypes) {
+    const definition = jobs[jobType];
+    if (!definition) continue;
     if (typeof definition.defaults !== 'object' || definition.defaults === null) continue;
     const defaults = definition.defaults;
     if (defaults.timeoutMs !== undefined && !capabilities.timeout) {
@@ -161,7 +167,9 @@ export class JobsModule {
       tenantCap: options.concurrency?.tenantCap ?? 10,
     };
     const backend = new InMemoryBackend();
-    if (options.strictCapabilities) assertJobDefaultsSupported(backend, options.jobs);
+    if (options.strictCapabilities) {
+      assertJobDefaultsSupported(backend, options.jobs, options.jobTypes);
+    }
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
@@ -228,7 +236,9 @@ export class JobsModule {
 
   static forBullMQ(options: BullMQOptions): DynamicModule {
     const runner = options.contextRunner ?? defaultContextRunner;
-    if (options.strictCapabilities) assertJobDefaultsSupported(options.backend, options.jobs);
+    if (options.strictCapabilities) {
+      assertJobDefaultsSupported(options.backend, options.jobs, options.jobTypes);
+    }
     options.backend.registerJobTypes(options.jobTypes);
     const providers: Provider[] = [
       { provide: JOBS_BACKEND, useValue: options.backend },

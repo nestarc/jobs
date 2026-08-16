@@ -181,4 +181,27 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     await service.discardDeadLetter(jobId, 'handled manually');
     expect(await service.getJob(jobId)).toMatchObject({ status: 'cancelled' });
   });
+
+  it('does not restart an expired dedupe retention window when a dead letter is discarded', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['report.generate'],
+    });
+    const options = {
+      dedupe: { key: 'discarded', mode: 'until_completed' as const, ttlMs: 100 },
+    };
+    const jobId = await service.enqueue('report.generate', {}, options);
+    await backend.moveToActive('report.generate', jobId);
+    await backend.fail('report.generate', jobId, 'boom');
+
+    now = new Date('2026-08-16T00:00:00.200Z');
+    await service.discardDeadLetter(jobId);
+
+    await expect(service.enqueueDetailed('report.generate', {}, options)).resolves.toMatchObject({
+      status: 'created',
+    });
+  });
 });

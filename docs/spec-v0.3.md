@@ -23,7 +23,7 @@ v0.3 stabilizes the production BullMQ path and adds the first-party `@nestarc/ou
 | fairness    | local-tenant | none   |
 | manualDrain | true         | false  |
 
-Unsupported operations fail with `jobs_capability_unsupported`; they must not return empty or synthetic results.
+Unsupported timeout, history, dead-letter, and manual-drain operations fail with `jobs_capability_unsupported`; they must not return empty or synthetic results. Fairness controls on a backend without a scheduler continue to fail with `jobs_fairness_misconfig`.
 
 ## BullMQ behavior
 
@@ -32,9 +32,10 @@ Unsupported operations fail with `jobs_capability_unsupported`; they must not re
 - The public fixed/exponential backoff policy is evaluated by the worker, including `maxDelayMs` and symmetric bounded `jitter`.
 - Context, user metadata, schedule, idempotency key, dedupe key, and backoff policy are stored in a versioned job envelope. v0.2 envelopes remain readable.
 - Redis identity mappings scope `idempotencyKey` and dedupe keys to a job type. Generated idempotent IDs also include queue identity, so status IDs remain unique across registered queues. Explicit `jobId` values retain their public value without bypassing idempotency or `until_completed` dedupe.
-- `while_active` dedupe releases only on a terminal state; `ttlMs` never permits a duplicate while the original job is queued, delayed, or active. `until_completed` may create a new identity only after `ttlMs` expires on a terminal record, with concurrent producers serialized by the identity mapping.
+- Both dedupe modes use the same Redis identity namespace and lock. The mode and TTL stored by the current identity remain authoritative until release, even if a later producer supplies different options. `while_active` releases only on a terminal state; `ttlMs` never permits a duplicate while the original job is queued, delayed, or active. `until_completed` may create a new identity only after its stored `ttlMs` expires on a terminal record, with concurrent producers serialized by the identity mapping.
+- If a BullMQ add response is lost after Redis commits the job, enqueue reconciles the reserved job and token before changing identity state. An indeterminate reconciliation keeps the reservation for a later producer to verify instead of risking duplicate work.
 - Nest shutdown stops new consumption, waits for active handlers, and closes workers and queues. Calling close repeatedly is safe.
-- Lifecycle observers are best-effort and cannot change enqueue results, handler outcomes, or persisted job state by throwing or returning a rejected promise.
+- Lifecycle observers are best-effort and receive snapshots; throwing, rejecting, or mutating callback inputs cannot change enqueue results, handler outcomes, or persisted job state.
 
 ## Outbox publisher
 

@@ -51,11 +51,18 @@ If you use the BullMQ backend, install BullMQ too:
 npm install bullmq
 ```
 
+If you use the first-party outbox publisher, install the matching outbox package:
+
+```bash
+npm install @nestarc/outbox
+```
+
 Peer expectations:
 
 - Node.js `20`, `22`, or `24`
 - NestJS `^10` or `^11`
 - BullMQ `^5.74.1` when using `forBullMQ()`
+- `@nestarc/outbox ^0.2.0` when using `createOutboxJobsPublisher()`
 - `reflect-metadata`
 - `rxjs`
 
@@ -312,7 +319,7 @@ await jobs.enqueueDetailed('generateReport', payload, {
 });
 ```
 
-Identity and dedupe keys are scoped to a job type; `scope: 'global'` means across tenants of that type. `while_active` always releases at a terminal state, and `ttlMs` does not shorten that active window. For `until_completed`, `ttlMs` permits a new identity only after the retained job is terminal and the TTL has elapsed. These are duplicate-enqueue controls, not exactly-once execution guarantees.
+Identity and dedupe keys are scoped to a job type; `scope: 'global'` means across tenants of that type. `while_active` always releases at a terminal state, and `ttlMs` does not shorten that active window. For `until_completed`, `ttlMs` permits a new identity only after the retained job is terminal and the TTL has elapsed. The mode and TTL stored by the active identity remain authoritative until that identity is released, so a rolling configuration change cannot weaken an existing dedupe window. These are duplicate-enqueue controls, not exactly-once execution guarantees.
 
 ## Tenant fairness
 
@@ -341,7 +348,9 @@ const snapshot = jobs.scheduler('sendReport').snapshot();
 Use the publisher factory as the `@nestarc/outbox` transport. Publishing resolves only after Redis or in-memory enqueue succeeds, so mapping and enqueue failures remain retryable by the outbox poller.
 
 ```ts
+import { OutboxModule } from '@nestarc/outbox';
 import { createOutboxJobsPublisher } from '@nestarc/jobs';
+import { PrismaService } from './prisma.service';
 
 const JobsPublisher = createOutboxJobsPublisher({
   map: {
@@ -354,9 +363,9 @@ const JobsPublisher = createOutboxJobsPublisher({
 });
 
 OutboxModule.forRoot({
+  prisma: PrismaService,
   transport: JobsPublisher,
   delivery: { mode: 'publisher' },
-  // other @nestarc/outbox options
 });
 ```
 
@@ -499,8 +508,8 @@ Useful scripts:
 ```bash
 npm run build
 npm test
-npm run test:redis # requires REDIS_URL
-npm run test:coverage # requires REDIS_URL
+REDIS_URL=redis://127.0.0.1:16379 npm run test:redis
+REDIS_URL=redis://127.0.0.1:16379 npm run test:coverage
 npm run lint
 ```
 
@@ -521,8 +530,8 @@ The npm trusted publisher is configured for:
 
 ## Docs
 
-- [PRD](docs/prd.md)
-- [Technical spec](docs/spec.md)
+- [Historical v0.1 PRD](docs/prd.md)
+- [Historical v0.1 technical spec](docs/spec.md)
 - [v0.2.0 technical spec](docs/spec-v0.2.md)
 - [v0.3.0 stabilization contract](docs/spec-v0.3.md)
 

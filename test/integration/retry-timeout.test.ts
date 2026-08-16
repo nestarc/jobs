@@ -23,10 +23,14 @@ describe('v0.2 retry and timeout', () => {
       if (calls === 1) throw new Error('temporary');
     });
     const { backend, scheduler, worker } = setupWorker(handler);
-    const jobId = await backend.enqueue('task', { ok: true }, {
-      attempts: 2,
-      backoff: { type: 'fixed', delayMs: 0 },
-    });
+    const jobId = await backend.enqueue(
+      'task',
+      { ok: true },
+      {
+        attempts: 2,
+        backoff: { type: 'fixed', delayMs: 0 },
+      },
+    );
     scheduler.onEnqueue(jobId, '__default__');
 
     await worker.tick();
@@ -37,9 +41,11 @@ describe('v0.2 retry and timeout', () => {
   });
 
   it('moves exhausted failures to dead_letter', async () => {
-    const { backend, scheduler, worker } = setupWorker(jest.fn(async () => {
-      throw new Error('permanent');
-    }));
+    const { backend, scheduler, worker } = setupWorker(
+      jest.fn(async () => {
+        throw new Error('permanent');
+      }),
+    );
     const jobId = await backend.enqueue('task', { ok: true }, { attempts: 1 });
     scheduler.onEnqueue(jobId, '__default__');
 
@@ -49,6 +55,36 @@ describe('v0.2 retry and timeout', () => {
       status: 'dead_letter',
       attempt: 1,
       error: { message: 'permanent' },
+    });
+  });
+
+  it('clears retry scheduling fields when the final attempt is exhausted', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const { backend, scheduler, worker } = setupWorker(
+      jest.fn(async () => {
+        throw new Error('permanent');
+      }),
+      () => now,
+    );
+    const jobId = await backend.enqueue(
+      'task',
+      { ok: true },
+      { attempts: 2, backoff: { type: 'fixed', delayMs: 100 } },
+    );
+    scheduler.onEnqueue(jobId, '__default__');
+
+    await worker.tick();
+    expect(await backend.getJob(jobId)).toMatchObject({
+      status: 'delayed',
+      nextAttemptAt: new Date('2026-08-16T00:00:00.100Z'),
+    });
+
+    now = new Date('2026-08-16T00:00:00.100Z');
+    await worker.tick();
+    expect(await backend.getJob(jobId)).toMatchObject({
+      status: 'dead_letter',
+      nextAttemptAt: undefined,
+      scheduledFor: undefined,
     });
   });
 

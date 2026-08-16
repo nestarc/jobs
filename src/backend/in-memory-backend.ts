@@ -17,6 +17,7 @@ import { computeBackoffDelayMs } from '../retry';
 interface Slot {
   envelope: JobEnvelope;
   state: JobStatus;
+  initialScheduledFor?: Date;
   startedAt?: Date;
   completedAt?: Date;
   failedAt?: Date;
@@ -95,6 +96,7 @@ export class InMemoryBackend implements JobsBackend {
 
     this.bucketOf(jobType).set(id, {
       state,
+      initialScheduledFor: scheduledFor ? new Date(scheduledFor.getTime()) : undefined,
       envelope: {
         id,
         jobType,
@@ -138,6 +140,7 @@ export class InMemoryBackend implements JobsBackend {
     slot.state = 'active';
     slot.envelope.attempts += 1;
     slot.startedAt = this.now();
+    slot.nextAttemptAt = undefined;
     this.recordHistory(jobId, 'active', slot.envelope.attempts);
     return { ...slot.envelope };
   }
@@ -150,6 +153,9 @@ export class InMemoryBackend implements JobsBackend {
     slot.terminalAt = slot.completedAt;
     slot.failedAt = undefined;
     slot.nextAttemptAt = undefined;
+    slot.envelope.scheduledFor = slot.initialScheduledFor
+      ? new Date(slot.initialScheduledFor.getTime())
+      : undefined;
     slot.error = undefined;
     this.recordHistory(jobId, 'succeeded', slot.envelope.attempts);
     return this.toRecord(slot);
@@ -184,6 +190,10 @@ export class InMemoryBackend implements JobsBackend {
 
     slot.state = this.opts.deadLetter?.enabled === false ? 'failed' : 'dead_letter';
     slot.terminalAt = slot.failedAt;
+    slot.nextAttemptAt = undefined;
+    slot.envelope.scheduledFor = slot.initialScheduledFor
+      ? new Date(slot.initialScheduledFor.getTime())
+      : undefined;
     this.recordHistory(jobId, slot.state, slot.envelope.attempts, reason, slot.error);
     return this.toRecord(slot);
   }
@@ -196,7 +206,11 @@ export class InMemoryBackend implements JobsBackend {
     const slot = this.bucketOf(jobType).get(jobId);
     if (!slot) return null;
     slot.state = 'cancelled';
-    slot.terminalAt = this.now();
+    slot.terminalAt ??= this.now();
+    slot.nextAttemptAt = undefined;
+    slot.envelope.scheduledFor = slot.initialScheduledFor
+      ? new Date(slot.initialScheduledFor.getTime())
+      : undefined;
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
     return this.toRecord(slot);
   }
@@ -250,7 +264,11 @@ export class InMemoryBackend implements JobsBackend {
     const slot = this.slotById(jobId);
     if (!slot || slot.state !== 'dead_letter') return;
     slot.state = 'cancelled';
-    slot.terminalAt = this.now();
+    slot.terminalAt ??= this.now();
+    slot.nextAttemptAt = undefined;
+    slot.envelope.scheduledFor = slot.initialScheduledFor
+      ? new Date(slot.initialScheduledFor.getTime())
+      : undefined;
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
   }
 

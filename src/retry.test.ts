@@ -13,6 +13,10 @@ describe('computeBackoffDelayMs', () => {
     expect(computeBackoffDelayMs({ type: 'exponential', delayMs: 100, maxDelayMs: 250 }, 3)).toBe(
       250,
     );
+    expect(computeBackoffDelayMs({ type: 'exponential', delayMs: 100, maxDelayMs: -1 }, 1)).toBe(0);
+    expect(
+      computeBackoffDelayMs({ type: 'exponential', delayMs: Number.NaN, maxDelayMs: 250 }, 1),
+    ).toBe(0);
   });
 
   it('bounds jitter to the documented symmetric range', () => {

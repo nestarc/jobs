@@ -4,7 +4,11 @@ import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } f
 import { detachContext } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
 import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
-import { notifyLifecycleObserver } from '../lifecycle-observer';
+import {
+  notifyLifecycleObserver,
+  snapshotLifecycleError,
+  snapshotLifecycleValue,
+} from '../lifecycle-observer';
 import type { JobsBackend } from './jobs-backend.interface';
 import type { DedupeOptions, EnqueueOptions, JobContext, JobEnvelope, JobEvent } from '../types';
 import type { HandlerRegistry } from '../handler-registry';
@@ -44,9 +48,21 @@ interface DecodedEnvelope {
   internal?: PersistedJobMetadata;
 }
 
-interface PersistentIdentity {
-  kind: 'idempotency' | 'dedupe';
-  mapKey: string;
+type PersistentIdentity =
+  | {
+      kind: 'idempotency';
+      mapKey: string;
+    }
+  | {
+      kind: 'dedupe';
+      mapKey: string;
+      mode: 'while_active' | 'until_completed';
+      ttlMs?: number;
+    };
+
+interface IdentityMapping {
+  jobId: string;
+  mode?: 'while_active' | 'until_completed';
   ttlMs?: number;
 }
 
@@ -156,10 +172,6 @@ export class BullMQBackend implements JobsBackend {
         backoff: opts.backoff
           ? { type: CUSTOM_BACKOFF_TYPE, delay: opts.backoff.delayMs }
           : undefined,
-        deduplication:
-          opts.dedupe && (opts.dedupe.mode ?? 'until_completed') === 'while_active'
-            ? { id: this.hash(`dedupe:${dedupeKey}`) }
-            : undefined,
       };
       const added = await queue.add(jobType, persistedEnvelope, addOptions);
       const addedJobId = String(added.id);
@@ -191,21 +203,46 @@ export class BullMQBackend implements JobsBackend {
       const reservedJobId = this.resolveJobId(queue, opts);
       // Reserve before Queue.add so a producer crash cannot leave a job without
       // a durable identity mapping. A later producer clears a stale reservation.
-      await Promise.all(identities.map((identity) => client.set(identity.mapKey, reservedJobId)));
+      await Promise.all(
+        identities.map((identity) =>
+          client.set(identity.mapKey, this.serializeIdentityMapping(identity, reservedJobId)),
+        ),
+      );
       try {
         const result = await addJob(reservedJobId);
         if (result.jobId !== reservedJobId) {
           await Promise.all(
-            identities.map((identity) => client.set(identity.mapKey, result.jobId)),
+            identities.map((identity) =>
+              client.set(identity.mapKey, this.serializeIdentityMapping(identity, result.jobId)),
+            ),
           );
         }
         return result;
       } catch (error) {
-        await Promise.allSettled(
-          identities.map((identity) =>
-            client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, reservedJobId),
-          ),
-        );
+        try {
+          const recovered = await queue.getJob(reservedJobId);
+          if (recovered) {
+            const recoveredToken = this.decode(recovered.data as Record<string, unknown>).internal
+              ?.enqueueToken;
+            return recoveredToken === enqueueToken
+              ? { status: 'created', jobId: reservedJobId }
+              : { status: 'deduped', jobId: reservedJobId, existingJobId: reservedJobId };
+          }
+
+          await Promise.allSettled(
+            identities.map((identity) =>
+              client.eval(
+                COMPARE_AND_DELETE_SCRIPT,
+                1,
+                identity.mapKey,
+                this.serializeIdentityMapping(identity, reservedJobId),
+              ),
+            ),
+          );
+        } catch {
+          // Keep the reservation when the add outcome cannot be reconciled. A
+          // later producer will remove it only after confirming the job is absent.
+        }
         throw error;
       }
     });
@@ -250,19 +287,19 @@ export class BullMQBackend implements JobsBackend {
     throw this.unsupported('history');
   }
 
-  async peekWaiting(_jobType: string): Promise<JobEnvelope[]> {
+  async peekWaiting(_jobType?: string): Promise<JobEnvelope[]> {
     throw this.unsupported('manualDrain');
   }
 
-  async moveToActive(_jobType: string, _jobId: string): Promise<JobEnvelope | null> {
+  async moveToActive(_jobType?: string, _jobId?: string): Promise<JobEnvelope | null> {
     throw this.unsupported('manualDrain');
   }
 
-  async ack(_jobType: string, _jobId: string): Promise<void> {
+  async ack(_jobType?: string, _jobId?: string): Promise<void> {
     throw this.unsupported('manualDrain');
   }
 
-  async fail(_jobType: string, _jobId: string, _reason: string): Promise<void> {
+  async fail(_jobType?: string, _jobId?: string, _reason?: string): Promise<void> {
     throw this.unsupported('manualDrain');
   }
 
@@ -318,7 +355,7 @@ export class BullMQBackend implements JobsBackend {
     const startedAt = new Date();
     const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt };
     const metadata = internal?.metadata;
-    notifyLifecycleObserver(() => consumer.onStart?.(event));
+    notifyLifecycleObserver(() => consumer.onStart?.(snapshotLifecycleValue(event)));
     notifyLifecycleObserver(() =>
       consumer.events?.onEvent?.({
         type: 'job.started',
@@ -327,7 +364,7 @@ export class BullMQBackend implements JobsBackend {
         tenantId,
         attempt: job.attemptsMade + 1,
         at: startedAt,
-        metadata,
+        metadata: snapshotLifecycleValue(metadata),
       }),
     );
     try {
@@ -336,11 +373,13 @@ export class BullMQBackend implements JobsBackend {
       );
       const finishedAt = new Date();
       notifyLifecycleObserver(() =>
-        consumer.onFinish?.({
-          ...event,
-          finishedAt,
-          durationMs: finishedAt.getTime() - startedAt.getTime(),
-        }),
+        consumer.onFinish?.(
+          snapshotLifecycleValue({
+            ...event,
+            finishedAt,
+            durationMs: finishedAt.getTime() - startedAt.getTime(),
+          }),
+        ),
       );
       notifyLifecycleObserver(() =>
         consumer.events?.onEvent?.({
@@ -351,7 +390,7 @@ export class BullMQBackend implements JobsBackend {
           attempt: job.attemptsMade + 1,
           at: finishedAt,
           durationMs: finishedAt.getTime() - startedAt.getTime(),
-          metadata,
+          metadata: snapshotLifecycleValue(metadata),
         }),
       );
       return result;
@@ -361,7 +400,10 @@ export class BullMQBackend implements JobsBackend {
       const { UnrecoverableError } = loadBullMQ();
       const willRetry =
         !(error instanceof UnrecoverableError) && attempt < (job.opts.attempts ?? 1);
-      notifyLifecycleObserver(() => consumer.onFail?.(event, error));
+      const errorSummary = { message: error.message, name: error.name };
+      notifyLifecycleObserver(() =>
+        consumer.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
+      );
       notifyLifecycleObserver(() =>
         consumer.events?.onEvent?.({
           type: willRetry ? 'job.retry_scheduled' : 'job.failed',
@@ -370,8 +412,8 @@ export class BullMQBackend implements JobsBackend {
           tenantId,
           attempt,
           at: new Date(),
-          error: { message: error.message, name: error.name },
-          metadata,
+          error: snapshotLifecycleValue(errorSummary),
+          metadata: snapshotLifecycleValue(metadata),
         }),
       );
       throw error;
@@ -402,6 +444,14 @@ export class BullMQBackend implements JobsBackend {
       identities.push({
         kind: 'dedupe',
         mapKey: this.identityMapKey(queue, 'dedupe', dedupeKey),
+        mode: 'until_completed',
+        ttlMs: opts.dedupe.ttlMs,
+      });
+    } else if (opts.dedupe && dedupeKey) {
+      identities.push({
+        kind: 'dedupe',
+        mapKey: this.identityMapKey(queue, 'dedupe', dedupeKey),
+        mode: 'while_active',
         ttlMs: opts.dedupe.ttlMs,
       });
     }
@@ -414,27 +464,32 @@ export class BullMQBackend implements JobsBackend {
     identities: PersistentIdentity[],
   ): Promise<string | undefined> {
     for (const identity of identities) {
-      const mappedJobId = await client.get(identity.mapKey);
-      if (!mappedJobId) continue;
+      const rawMapping = await client.get(identity.mapKey);
+      if (!rawMapping) continue;
+      const mapping = this.parseIdentityMapping(identity, rawMapping);
 
-      const existing = await queue.getJob(mappedJobId);
+      const existing = await queue.getJob(mapping.jobId);
       if (!existing) {
-        await client.del(identity.mapKey);
+        await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
-      if (identity.kind === 'idempotency') return mappedJobId;
+      if (identity.kind === 'idempotency') return mapping.jobId;
 
       const state = await existing.getState();
       const terminal = state === 'completed' || state === 'failed';
-      const ttlExpired =
-        terminal &&
-        identity.ttlMs !== undefined &&
-        Date.now() - (existing.finishedOn ?? existing.timestamp) >= Math.max(0, identity.ttlMs);
-      if (ttlExpired) {
-        await client.del(identity.mapKey);
+      if ((mapping.mode ?? identity.mode) === 'while_active' && terminal) {
+        await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
-      return mappedJobId;
+      const ttlExpired =
+        terminal &&
+        mapping.ttlMs !== undefined &&
+        Date.now() - (existing.finishedOn ?? existing.timestamp) >= Math.max(0, mapping.ttlMs);
+      if (ttlExpired) {
+        await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
+        continue;
+      }
+      return mapping.jobId;
     }
     return undefined;
   }
@@ -481,6 +536,39 @@ export class BullMQBackend implements JobsBackend {
 
   private identityMapKey(queue: Queue, kind: PersistentIdentity['kind'], value: string): string {
     return queue.toKey(`nestarc:identity:${kind}:${this.hash(value)}`);
+  }
+
+  private serializeIdentityMapping(identity: PersistentIdentity, jobId: string): string {
+    const mapping: IdentityMapping =
+      identity.kind === 'dedupe'
+        ? { jobId, mode: identity.mode, ttlMs: identity.ttlMs }
+        : { jobId };
+    return JSON.stringify(mapping);
+  }
+
+  private parseIdentityMapping(identity: PersistentIdentity, value: string): IdentityMapping {
+    try {
+      const parsed = JSON.parse(value) as Partial<IdentityMapping>;
+      if (typeof parsed.jobId === 'string') {
+        if (identity.kind === 'dedupe') {
+          return {
+            jobId: parsed.jobId,
+            mode:
+              parsed.mode === 'while_active' || parsed.mode === 'until_completed'
+                ? parsed.mode
+                : identity.mode,
+            ttlMs: parsed.ttlMs,
+          };
+        }
+        return { jobId: parsed.jobId };
+      }
+    } catch {
+      // v0.3 pre-release snapshots stored the job ID as a plain string.
+    }
+
+    return identity.kind === 'dedupe'
+      ? { jobId: value, mode: identity.mode, ttlMs: identity.ttlMs }
+      : { jobId: value };
   }
 
   private resolveDedupeKey(

@@ -5,7 +5,7 @@ import type { HandlerRegistry } from './handler-registry';
 import type { Scheduler } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
-import { notifyLifecycleObserver } from './lifecycle-observer';
+import { notifyLifecycleObserver, snapshotLifecycleValue } from './lifecycle-observer';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -78,7 +78,7 @@ export class JobsService {
           tenantId: context.tenantId as string | undefined,
           attempt: 0,
           at: new Date(),
-          metadata: effectiveOpts.metadata,
+          metadata: snapshotLifecycleValue(effectiveOpts.metadata),
         }),
       );
     }
@@ -124,7 +124,7 @@ export class JobsService {
           tenantId: tenantId === '__default__' ? undefined : tenantId,
           attempt: record.attempt,
           at: new Date(),
-          metadata: record.metadata,
+          metadata: snapshotLifecycleValue(record.metadata),
         }),
       );
     }

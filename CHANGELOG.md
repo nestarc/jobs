@@ -6,7 +6,7 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-15
+## [0.3.0] - 2026-08-16
 
 ### Added
 
@@ -22,22 +22,30 @@ This project is currently pre-release. The changelog below starts from the curre
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
 - Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
+- Unified BullMQ dedupe modes under one persisted identity policy so mode or TTL changes cannot weaken an active dedupe window.
+- Reconciled ambiguous BullMQ add failures against the reserved job before clearing identity state, preventing response-loss retries from creating duplicate work.
 - Made Nest application shutdown wait for active BullMQ work and close workers and queues idempotently.
 - Applied typed job defaults at runtime and in `FakeJobsService`, with explicit enqueue options taking precedence.
 - Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler restoration.
 - Isolated lifecycle observer failures so telemetry callbacks cannot reject committed enqueue operations or corrupt handler state.
+- Snapshot lifecycle callback inputs and restored terminal in-memory scheduling fields so observers and exhausted retries cannot mutate or misrepresent persisted state.
+- Normalized invalid negative/non-finite backoff delays and limited strict capability validation to registered job types.
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
 
 ### Compatibility notes
 
 - BullMQ `timeoutMs`, durable `getJobHistory()`, DLQ list/replay/discard, and manual pull/drain now fail explicitly instead of being silently ignored or represented by synthetic state.
+- BullMQ failed jobs now report `status: "failed"` rather than the previous synthetic `dead_letter` status; `failedAt` and `completedAt` are populated only for their matching terminal state.
+- Generated BullMQ IDs for `idempotencyKey` values now use a queue-scoped `id-<sha256>` form instead of exposing the original key. Explicit `jobId` values are unchanged.
+- The supported runtime range is Node 20/22/24, and BullMQ consumers must use 5.74.1 or newer within major 5.
+- Direct calls to BullMQ manual-drain methods may still omit their legacy arguments, but every call now fails with `jobs_capability_unsupported`.
 - `BullMQBackend.getRawQueue()` now defaults to the optional-peer-safe `BullMQRawQueue` surface. Callers using additional BullMQ methods should request the full type explicitly with `getRawQueue<import('bullmq').Queue>(jobType)`.
 - BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
 - Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
 
 ### Documentation
 
-- Rewrote `README.md` so the published documentation matches the current codebase and backend limitations.
+- Rewrote `README.md` so the published documentation matches the current codebase and backend limitations, and included the linked versioned specs in the npm tarball.
 
 ## [0.2.0]
 

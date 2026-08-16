@@ -47,19 +47,19 @@ describe('BullMQ capability contract', () => {
     await expect(service.enqueue('test.job', {}, { timeoutMs: 100 })).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
-    await expect(instance.peekWaiting('test.job')).rejects.toMatchObject({
+    await expect(instance.peekWaiting()).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
     await expect(instance.getJobHistory('job_1')).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
-    await expect(instance.moveToActive('test.job', 'job_1')).rejects.toMatchObject({
+    await expect(instance.moveToActive()).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
-    await expect(instance.ack('test.job', 'job_1')).rejects.toMatchObject({
+    await expect(instance.ack()).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
-    await expect(instance.fail('test.job', 'job_1', 'boom')).rejects.toMatchObject({
+    await expect(instance.fail()).rejects.toMatchObject({
       code: JobsErrorCode.CapabilityUnsupported,
     });
   });
@@ -77,6 +77,26 @@ describe('BullMQ capability contract', () => {
         strictCapabilities: true,
       }),
     ).toThrow(JobsErrorCode.CapabilityUnsupported);
+  });
+
+  it('validates strict defaults only for registered job types', async () => {
+    const jobs = defineJobs({
+      enabled: job<Record<string, never>>().defaults({ attempts: 2 }),
+      unused: job<Record<string, never>>().defaults({ timeoutMs: 100 }),
+    });
+    const instance = backend();
+    jest.spyOn(instance, 'registerJobTypes').mockImplementation(() => undefined);
+
+    expect(() =>
+      JobsModule.forBullMQ({
+        backend: instance,
+        jobTypes: ['enabled'],
+        jobs,
+        strictCapabilities: true,
+      }),
+    ).not.toThrow();
+
+    await instance.close();
   });
 
   it('continues queue cleanup after a worker close failure and allows retry', async () => {

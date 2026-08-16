@@ -318,6 +318,99 @@ describe('BullMQBackend with Redis', () => {
     ).resolves.toMatchObject({ status: 'deduped', jobId: originalJobId });
   });
 
+  it('reconciles a committed add when the producer loses the Queue.add response', async () => {
+    const { namespace, jobType } = testIdentity('ambiguous-add');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const mutableQueue = rawQueue as unknown as {
+      add(name: string, data: unknown, options?: unknown): Promise<unknown>;
+    };
+    const originalAdd = mutableQueue.add.bind(mutableQueue);
+    let injected = false;
+    mutableQueue.add = async (name, data, options) => {
+      const added = await originalAdd(name, data, options);
+      if (!injected) {
+        injected = true;
+        mutableQueue.add = originalAdd;
+        throw new Error('simulated response loss after Redis commit');
+      }
+      return added;
+    };
+
+    try {
+      const first = await jobs.enqueueDetailed(
+        jobType,
+        { sequence: 1 },
+        { dedupe: { key: 'ambiguous', mode: 'until_completed' } },
+      );
+      expect(first.status).toBe('created');
+
+      await expect(
+        jobs.enqueueDetailed(
+          jobType,
+          { sequence: 2 },
+          { dedupe: { key: 'ambiguous', mode: 'until_completed' } },
+        ),
+      ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
+      expect(
+        await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+      ).toBe(1);
+    } finally {
+      mutableQueue.add = originalAdd;
+    }
+  });
+
+  it('keeps the first dedupe mode and TTL authoritative until identity release', async () => {
+    const { namespace, jobType } = testIdentity('dedupe-policy');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+
+    const whileActive = await jobs.enqueueDetailed(
+      jobType,
+      { policy: 'while-active' },
+      { dedupe: { key: 'mode-a', mode: 'while_active' } },
+    );
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        { policy: 'until-completed' },
+        { dedupe: { key: 'mode-a', mode: 'until_completed' } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: whileActive.jobId });
+
+    const untilCompleted = await jobs.enqueueDetailed(
+      jobType,
+      { policy: 'until-completed' },
+      { dedupe: { key: 'mode-b', mode: 'until_completed' } },
+    );
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        { policy: 'while-active' },
+        { dedupe: { key: 'mode-b', mode: 'while_active' } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: untilCompleted.jobId });
+
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => null);
+    instance.startConsumer([jobType], consumer(registry));
+    const retained = await jobs.enqueueDetailed(
+      jobType,
+      { policy: 'retained' },
+      { dedupe: { key: 'ttl', mode: 'until_completed', ttlMs: 60_000 } },
+    );
+    await waitFor(async () => (await instance.getJob(retained.jobId))?.status === 'succeeded');
+
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        { policy: 'weakened' },
+        { dedupe: { key: 'ttl', mode: 'until_completed', ttlMs: 0 } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: retained.jobId });
+  });
+
   it('preserves outbox identity and lineage through Redis restart and redelivery', async () => {
     const { namespace, jobType } = testIdentity('outbox');
     const first = backend(namespace, jobType);
