@@ -23,6 +23,7 @@ export interface PickedJob {
 export class Scheduler {
   private readonly shards = new Map<string, Shard>();
   private readonly activeJobs = new Map<string, string>();
+  private readonly waitingJobs = new Set<string>();
   private orderedTenants: string[] = [];
   private cursor = 0;
 
@@ -41,8 +42,10 @@ export class Scheduler {
   }
 
   onEnqueue(jobId: string, tenantId: string): void {
+    if (this.waitingJobs.has(jobId) || this.activeJobs.has(jobId)) return;
     const shard = this.ensureShard(tenantId);
     shard.waiting.push(jobId);
+    this.waitingJobs.add(jobId);
   }
 
   onAck(jobId: string): void {
@@ -68,6 +71,7 @@ export class Scheduler {
           if (!this.canPickFromShard(shard, lap)) continue;
           const jobId = shard.waiting.shift();
           if (!jobId) continue;
+          this.waitingJobs.delete(jobId);
           shard.inflight += 1;
           shard.creditsLeftInCycle = Math.max(0, shard.creditsLeftInCycle - 1);
           this.activeJobs.set(jobId, tenantId);
@@ -92,7 +96,13 @@ export class Scheduler {
     }
   }
 
-  snapshot(): Array<{ tenantId: string; waiting: number; inflight: number; weight: number; starvationTokens: number }> {
+  snapshot(): Array<{
+    tenantId: string;
+    waiting: number;
+    inflight: number;
+    weight: number;
+    starvationTokens: number;
+  }> {
     return [...this.shards.values()].map((s) => ({
       tenantId: s.tenantId,
       waiting: s.waiting.length,

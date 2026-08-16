@@ -13,7 +13,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Added a first-party `createOutboxJobsPublisher()` adapter compatible with the `@nestarc/outbox` publisher transport. It preserves event, tenant, correlation, and causation lineage and uses the outbox record ID for stable job identity.
 - Added Redis integration tests for scheduling, fixed backoff and retries, restart discovery, metadata/context persistence, concurrent idempotency, tenant/global dedupe, and graceful shutdown.
 - Added Node 20/22/24 and NestJS 10/11 consumer compatibility matrices, Redis 7.2 CI, package tarball smoke tests, and global/BullMQ coverage gates.
-- Added `jobs_capability_unsupported` for operations and enqueue options unavailable on the selected backend.
+- Added `jobs_capability_unsupported` for operations and enqueue options unavailable on the selected backend, and `jobs_identity_conflict` for composite identities that already point to different jobs.
 
 ### Changed
 
@@ -22,11 +22,12 @@ This project is currently pre-release. The changelog below starts from the curre
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
 - Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
-- Preserved rolling-upgrade idempotency by adopting v0.2 jobs whose raw BullMQ ID is the producer idempotency key, and backfilled every supplied identity after a deduped enqueue.
+- Preserved rolling-upgrade idempotency, including producers that also supply an explicit `jobId`, by adopting v0.2 jobs whose raw BullMQ ID is the producer idempotency key.
+- Backfilled every unused supplied identity after a deduped enqueue, retained the complete identity lineage through in-memory DLQ replay, and rejected conflicting pre-existing mappings.
 - Unified BullMQ dedupe modes under one persisted identity policy so mode or TTL changes cannot weaken an active dedupe window.
 - Encoded tenant dedupe identities as structured tuples so tenant IDs and keys containing delimiters cannot collide.
 - Reconciled ambiguous BullMQ add failures against the reserved job before clearing identity state, preventing response-loss retries from creating duplicate work.
-- Made Nest application shutdown drain active BullMQ work before feature-provider teardown, permit follow-up enqueue from those active handlers, and close workers and queues idempotently.
+- Made Nest 10 and 11 application shutdown drain active BullMQ work before feature-provider teardown, permit follow-up enqueue from those active handlers, and close workers and queues idempotently.
 - Applied typed job defaults at runtime and in `FakeJobsService`, with explicit enqueue options taking precedence.
 - Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler/identity restoration, including `resetAttempts` handling.
 - Emitted BullMQ success/failure lifecycle events only after BullMQ commits the matching terminal transition, and reported the actual delayed retry time through `scheduledFor` and `nextAttemptAt`.
@@ -34,6 +35,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Isolated lifecycle observer failures so telemetry callbacks cannot reject committed enqueue operations or corrupt handler state.
 - Snapshot lifecycle callback inputs and restored terminal in-memory scheduling fields so observers and exhausted retries cannot mutate or misrepresent persisted state.
 - Normalized invalid negative/non-finite backoff delays and limited strict capability validation to registered job types.
+- Normalized arbitrary non-`Error` handler rejections without leaving in-memory work active or stopping the worker loop.
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
 
 ### Compatibility notes

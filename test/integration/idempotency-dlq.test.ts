@@ -200,6 +200,41 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
   });
 
+  it('rejects supplied identities that already resolve to different jobs', async () => {
+    const { service } = setup();
+    const idempotent = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      { idempotencyKey: 'conflicting-idempotency' },
+    );
+    const deduped = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      { dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' } },
+    );
+
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        {
+          idempotencyKey: 'conflicting-idempotency',
+          dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' },
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
+    await expect(
+      service.enqueueDetailed('report.generate', {}, { idempotencyKey: 'conflicting-idempotency' }),
+    ).resolves.toMatchObject({ jobId: idempotent.jobId });
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' } },
+      ),
+    ).resolves.toMatchObject({ jobId: deduped.jobId });
+  });
+
   it('encodes tenant dedupe identities without delimiter collisions', async () => {
     const { service } = setup();
     const first = await service.enqueueDetailed(
@@ -286,6 +321,84 @@ describe('v0.2 idempotency and DLQ APIs', () => {
         attempt: 1,
         metadata: { original: true, operator: 'manual', replayOf: originalId },
       }),
+    ]);
+  });
+
+  it('preserves backfilled identity lineage across dead-letter replay', async () => {
+    const { backend, service } = setup();
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      { idempotencyKey: 'backfilled-replay-idempotency' },
+    );
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        {
+          idempotencyKey: 'backfilled-replay-idempotency',
+          dedupe: { key: 'backfilled-replay-dedupe', mode: 'until_completed' },
+        },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: originalId });
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom');
+
+    const replayedId = await service.replayDeadLetter(originalId);
+    expect(replayedId).not.toBe(originalId);
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { dedupe: { key: 'backfilled-replay-dedupe', mode: 'until_completed' } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: replayedId });
+  });
+
+  it('rebinds every identity when replay converges on an existing job', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      schedulers: new Map([['report.generate', scheduler]]),
+    });
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      {
+        context: { tenantId: 'tenant_1' },
+        idempotencyKey: 'converged-replay-idempotency',
+        dedupe: { key: 'converged-replay-dedupe', mode: 'until_completed', ttlMs: 10 },
+      },
+    );
+    expect(scheduler.pickNext()?.jobId).toBe(originalId);
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom');
+    scheduler.onAck(originalId);
+
+    now = new Date('2026-08-16T00:00:00.020Z');
+    const existing = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      {
+        context: { tenantId: 'tenant_1' },
+        dedupe: { key: 'converged-replay-dedupe', mode: 'until_completed', ttlMs: 10 },
+      },
+    );
+    expect(existing.status).toBe('created');
+
+    await expect(service.replayDeadLetter(originalId)).resolves.toBe(existing.jobId);
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { idempotencyKey: 'converged-replay-idempotency' },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: existing.jobId });
+    expect(scheduler.snapshot()).toEqual([
+      expect.objectContaining({ tenantId: 'tenant_1', waiting: 1 }),
     ]);
   });
 

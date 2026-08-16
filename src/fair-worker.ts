@@ -8,6 +8,7 @@ import {
   snapshotLifecycleError,
   snapshotLifecycleValue,
 } from './lifecycle-observer';
+import { normalizeError } from './error-utils';
 
 export interface FairWorkerOptions {
   jobType: string;
@@ -116,7 +117,7 @@ export class FairWorker {
       );
       return true;
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
+      const error = normalizeError(err);
       const reason = (error as Error & { reason?: string }).reason ?? error.message;
       const record = await this.opts.backend.fail(this.opts.jobType, picked.jobId, reason);
       this.opts.scheduler.onAck(picked.jobId);

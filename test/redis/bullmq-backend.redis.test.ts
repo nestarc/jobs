@@ -226,6 +226,23 @@ describe('BullMQBackend with Redis', () => {
     expect(await instance.getJob(jobId)).toMatchObject({ status: 'failed', attempt: 1 });
   });
 
+  it('normalizes unstringifiable non-Error handler rejections', async () => {
+    const { namespace, jobType } = testIdentity('non-error-rejection');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => {
+      throw Object.create(null) as unknown;
+    });
+    instance.startConsumer([jobType], consumer(registry));
+
+    const jobId = await service(instance, jobType).enqueue(jobType, {});
+    await waitFor(async () => (await instance.getJob(jobId))?.status === 'failed');
+    expect(await instance.getJob(jobId)).toMatchObject({
+      status: 'failed',
+      error: { message: 'Job handler rejected with a non-error value' },
+    });
+  });
+
   it('emits failure only after BullMQ rejects a non-serializable handler result', async () => {
     const { namespace, jobType } = testIdentity('return-serialization');
     const instance = backend(namespace, jobType);
@@ -446,13 +463,14 @@ describe('BullMQBackend with Redis', () => {
       service(first, jobType).enqueueDetailed(
         jobType,
         { source: 'v0.3' },
-        { idempotencyKey: legacyIdempotencyKey },
+        { jobId: 'explicit-v0.3-id', idempotencyKey: legacyIdempotencyKey },
       ),
     ).resolves.toMatchObject({
       status: 'deduped',
       jobId: legacyIdempotencyKey,
       existingJobId: legacyIdempotencyKey,
     });
+    expect(await rawQueue.getJob('explicit-v0.3-id')).toBeUndefined();
     expect(
       await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
     ).toBe(1);
@@ -519,6 +537,43 @@ describe('BullMQBackend with Redis', () => {
     );
     expect(tenantTwo.status).toBe('created');
     expect(tenantTwo.jobId).not.toBe(tenantOne.jobId);
+  });
+
+  it('rejects composite identities that already resolve to different jobs', async () => {
+    const { namespace, jobType } = testIdentity('identity-conflict');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const idempotent = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      { idempotencyKey: 'conflicting-idempotency' },
+    );
+    const deduped = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      { dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' } },
+    );
+
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        {},
+        {
+          idempotencyKey: 'conflicting-idempotency',
+          dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' },
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
+    await expect(
+      jobs.enqueueDetailed(jobType, {}, { idempotencyKey: 'conflicting-idempotency' }),
+    ).resolves.toMatchObject({ jobId: idempotent.jobId });
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        {},
+        { dedupe: { key: 'conflicting-dedupe', mode: 'until_completed' } },
+      ),
+    ).resolves.toMatchObject({ jobId: deduped.jobId });
   });
 
   it('reconciles a committed add when the producer loses the Queue.add response', async () => {

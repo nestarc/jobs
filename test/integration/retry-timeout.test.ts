@@ -58,6 +58,23 @@ describe('v0.2 retry and timeout', () => {
     });
   });
 
+  it('normalizes unstringifiable non-Error rejections without stalling the worker', async () => {
+    const { backend, scheduler, worker } = setupWorker(
+      jest.fn(async () => {
+        throw Object.create(null) as unknown;
+      }),
+    );
+    const jobId = await backend.enqueue('task', { ok: true }, { attempts: 1 });
+    scheduler.onEnqueue(jobId, '__default__');
+
+    await expect(worker.tick()).resolves.toBe(true);
+    expect(await backend.getJob(jobId)).toMatchObject({
+      status: 'dead_letter',
+      error: { message: 'Job handler rejected with a non-error value' },
+    });
+    expect(scheduler.snapshot()).toEqual([expect.objectContaining({ waiting: 0, inflight: 0 })]);
+  });
+
   it('clears retry scheduling fields when the final attempt is exhausted', async () => {
     let now = new Date('2026-08-16T00:00:00.000Z');
     const { backend, scheduler, worker } = setupWorker(

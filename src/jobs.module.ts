@@ -7,6 +7,7 @@ import {
   OnModuleInit,
   Provider,
 } from '@nestjs/common';
+import { createRequire } from 'node:module';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { JobsService } from './jobs.service';
 import { HandlerRegistry } from './handler-registry';
@@ -27,6 +28,9 @@ export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
 
 const IN_MEMORY_WORKER_IDLE_MS = 10;
+const requireModule = createRequire(__filename);
+const BULLMQ_SHUTDOWN_DISTANCE =
+  nestCoreMajorVersion() >= 11 ? Number.MIN_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
 
 @Injectable()
 class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
@@ -67,12 +71,12 @@ class BullMQWorkersHost implements OnModuleDestroy {
     @Inject(JOBS_WORKERS) private readonly _workers: unknown[],
     discovery: DiscoveryService,
   ) {
-    // Nest destroys deeper modules first. Make every BullMQ host module a
-    // shutdown barrier so active handlers drain before feature dependencies
-    // receive their onModuleDestroy hooks.
+    // Nest 10 destroys modules in descending distance order, while Nest 11
+    // reverses that order. Keep the BullMQ host first in either version so
+    // active handlers drain before feature dependencies are destroyed.
     for (const provider of discovery.getProviders()) {
       if (provider.token === BullMQWorkersHost && provider.host) {
-        provider.host.distance = Number.MAX_SAFE_INTEGER;
+        provider.host.distance = BULLMQ_SHUTDOWN_DISTANCE;
       }
     }
   }
@@ -133,6 +137,16 @@ function registerHandlers(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nestCoreMajorVersion(): number {
+  try {
+    const packageJson = requireModule('@nestjs/core/package.json') as { version?: unknown };
+    const major = Number.parseInt(String(packageJson.version).split('.')[0], 10);
+    return Number.isFinite(major) ? major : 10;
+  } catch {
+    return 10;
+  }
 }
 
 function assertJobDefaultsSupported(

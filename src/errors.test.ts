@@ -20,5 +20,6 @@ describe('JobsError', () => {
       'jobs_capability_unsupported',
     );
     expect(new JobsError(JobsErrorCode.BackendClosed).code).toBe('jobs_backend_closed');
+    expect(new JobsError(JobsErrorCode.IdentityConflict).code).toBe('jobs_identity_conflict');
   });
 });

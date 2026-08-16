@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } from 'bullmq';
 import { detachContext } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
+import { normalizeError } from '../error-utils';
 import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
 import {
   notifyLifecycleObserver,
@@ -195,23 +196,19 @@ export class BullMQBackend implements JobsBackend {
     }
 
     return await this.withIdentityLocks(queue, identities, async (client) => {
-      const existingJobId = await this.findExistingIdentityJob(queue, client, identities);
+      const mappedJobId = await this.findExistingIdentityJob(queue, client, identities);
+      const idempotencyIdentity = identities.find((identity) => identity.kind === 'idempotency');
+      const legacyJobId =
+        idempotencyIdentity && !(await client.get(idempotencyIdentity.mapKey))
+          ? await this.findLegacyIdempotencyJob(queue, opts)
+          : undefined;
+      const existingJobId = this.mergeIdentityCandidates(mappedJobId, legacyJobId);
       if (existingJobId) {
         await this.backfillIdentityMappings(client, identities, existingJobId);
         return {
           status: 'deduped',
           jobId: existingJobId,
           existingJobId,
-        };
-      }
-
-      const legacyJobId = await this.findLegacyIdempotencyJob(queue, opts);
-      if (legacyJobId) {
-        await this.backfillIdentityMappings(client, identities, legacyJobId);
-        return {
-          status: 'deduped',
-          jobId: legacyJobId,
-          existingJobId: legacyJobId,
         };
       }
 
@@ -395,7 +392,7 @@ export class BullMQBackend implements JobsBackend {
         consumer.contextRunner(context, () => consumer.registry.invoke(jobType, payload, context)),
       );
     } catch (error) {
-      throw error instanceof Error ? error : new Error(String(error));
+      throw normalizeError(error);
     }
   }
 
@@ -515,7 +512,7 @@ export class BullMQBackend implements JobsBackend {
         continue;
       }
       if (identity.kind === 'idempotency') {
-        foundJobId ??= mapping.jobId;
+        foundJobId = this.mergeIdentityCandidates(foundJobId, mapping.jobId);
         continue;
       }
 
@@ -533,7 +530,7 @@ export class BullMQBackend implements JobsBackend {
         await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
-      foundJobId ??= mapping.jobId;
+      foundJobId = this.mergeIdentityCandidates(foundJobId, mapping.jobId);
     }
     return foundJobId;
   }
@@ -555,9 +552,20 @@ export class BullMQBackend implements JobsBackend {
     queue: Queue,
     opts: EnqueueOptions,
   ): Promise<string | undefined> {
-    if (!opts.idempotencyKey || opts.jobId) return undefined;
+    if (!opts.idempotencyKey) return undefined;
     const legacy = await queue.getJob(opts.idempotencyKey);
     return legacy ? String(legacy.id) : undefined;
+  }
+
+  private mergeIdentityCandidates(
+    current: string | undefined,
+    candidate: string | undefined,
+  ): string | undefined {
+    if (!candidate || !current || current === candidate) return current ?? candidate;
+    throw new JobsError(
+      JobsErrorCode.IdentityConflict,
+      `supplied identities resolve to different jobs: ${current}, ${candidate}`,
+    );
   }
 
   private async withIdentityLocks<T>(

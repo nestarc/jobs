@@ -5,6 +5,7 @@ export const JobsErrorCode = {
   FairnessMisconfig: 'jobs_fairness_misconfig',
   CapabilityUnsupported: 'jobs_capability_unsupported',
   BackendClosed: 'jobs_backend_closed',
+  IdentityConflict: 'jobs_identity_conflict',
 } as const;
 
 export type JobsErrorCode = (typeof JobsErrorCode)[keyof typeof JobsErrorCode];

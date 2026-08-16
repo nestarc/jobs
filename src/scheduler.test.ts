@@ -8,9 +8,7 @@ describe('Scheduler', () => {
     s.onEnqueue('j2', 't2');
     s.onEnqueue('j3', 't1');
     s.onEnqueue('j4', 't2');
-    const picks = [s.pickNext(), s.pickNext(), s.pickNext(), s.pickNext()].map(
-      (p) => p?.tenantId,
-    );
+    const picks = [s.pickNext(), s.pickNext(), s.pickNext(), s.pickNext()].map((p) => p?.tenantId);
     expect(picks).toEqual(['t1', 't2', 't1', 't2']);
   });
 
@@ -53,6 +51,21 @@ describe('Scheduler', () => {
     expect(s.pickNext()).toBeNull();
     s.onAck(first!.jobId);
     expect(s.pickNext()?.jobId).toBe('b');
+  });
+
+  it('does not enqueue the same waiting or active job twice', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    s.onEnqueue('a', 't1');
+    s.onEnqueue('a', 't1');
+    expect(s.snapshot()).toEqual([
+      { tenantId: 't1', waiting: 1, inflight: 0, weight: 1, starvationTokens: 0 },
+    ]);
+
+    expect(s.pickNext()?.jobId).toBe('a');
+    s.onEnqueue('a', 't1');
+    expect(s.snapshot()).toEqual([
+      { tenantId: 't1', waiting: 0, inflight: 1, weight: 1, starvationTokens: 0 },
+    ]);
   });
 
   it('ack only releases the acknowledged tenant inflight slot', () => {

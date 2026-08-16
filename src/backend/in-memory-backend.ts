@@ -13,11 +13,12 @@ import type {
   ReplayOptions,
 } from '../lifecycle';
 import { computeBackoffDelayMs } from '../retry';
+import { JobsError, JobsErrorCode } from '../errors';
 
 interface Slot {
   envelope: JobEnvelope;
   state: JobStatus;
-  dedupePolicy?: Omit<DedupeEntry, 'jobId'>;
+  identityLineage: IdentityLineage;
   initialScheduledFor?: Date;
   startedAt?: Date;
   completedAt?: Date;
@@ -31,6 +32,11 @@ interface DedupeEntry {
   jobId: string;
   mode: 'while_active' | 'until_completed';
   ttlMs?: number;
+}
+
+interface IdentityLineage {
+  idempotencyMapKeys: Set<string>;
+  dedupePolicies: Map<string, Omit<DedupeEntry, 'jobId'>>;
 }
 
 export interface InMemoryBackendOptions {
@@ -99,12 +105,7 @@ export class InMemoryBackend implements JobsBackend {
     this.bucketOf(jobType).set(id, {
       state,
       initialScheduledFor: scheduledFor ? new Date(scheduledFor.getTime()) : undefined,
-      dedupePolicy: opts.dedupe
-        ? {
-            mode: opts.dedupe.mode ?? 'until_completed',
-            ttlMs: opts.dedupe.ttlMs,
-          }
-        : undefined,
+      identityLineage: this.createIdentityLineage(idempotencyMapKey, dedupeMapKey, opts.dedupe),
       envelope: {
         id,
         jobType,
@@ -255,6 +256,7 @@ export class InMemoryBackend implements JobsBackend {
 
     const replayIdentityJobId = this.findReplayIdentityJob(slot, jobId);
     if (replayIdentityJobId) {
+      this.rebindReplayIdentities(slot, jobId, replayIdentityJobId);
       slot.state = 'cancelled';
       this.recordHistory(
         jobId,
@@ -269,7 +271,7 @@ export class InMemoryBackend implements JobsBackend {
     const replayAttempt = options.resetAttempts === false ? slot.envelope.attempts : 0;
     const replaySlot: Slot = {
       state: 'queued',
-      dedupePolicy: slot.dedupePolicy ? { ...slot.dedupePolicy } : undefined,
+      identityLineage: this.cloneIdentityLineage(slot.identityLineage),
       envelope: {
         id: newJobId,
         jobType: slot.envelope.jobType,
@@ -330,9 +332,12 @@ export class InMemoryBackend implements JobsBackend {
     idempotencyMapKey: string | undefined,
     dedupeMapKey: string | undefined,
   ): string | undefined {
+    let foundJobId: string | undefined;
     if (idempotencyMapKey) {
       const existing = this.idempotency.get(idempotencyMapKey);
-      if (existing && this.slotById(existing)?.state !== 'cancelled') return existing;
+      if (existing && this.slotById(existing)?.state !== 'cancelled') {
+        foundJobId = this.mergeIdentityCandidates(foundJobId, existing);
+      }
     }
     if (dedupeMapKey) {
       const entry = this.dedupe.get(dedupeMapKey);
@@ -357,11 +362,11 @@ export class InMemoryBackend implements JobsBackend {
         ) {
           this.dedupe.delete(dedupeMapKey);
         } else {
-          return entry.jobId;
+          foundJobId = this.mergeIdentityCandidates(foundJobId, entry.jobId);
         }
       }
     }
-    return undefined;
+    return foundJobId;
   }
 
   private backfillIdentityMappings(
@@ -370,59 +375,109 @@ export class InMemoryBackend implements JobsBackend {
     dedupeMapKey: string | undefined,
     dedupe: EnqueueOptions['dedupe'],
   ): void {
+    const slot = this.slotById(jobId);
     if (idempotencyMapKey) {
       const mappedJobId = this.idempotency.get(idempotencyMapKey);
       if (!mappedJobId || this.slotById(mappedJobId)?.state === 'cancelled') {
         this.idempotency.set(idempotencyMapKey, jobId);
       }
+      if (this.idempotency.get(idempotencyMapKey) === jobId) {
+        slot?.identityLineage.idempotencyMapKeys.add(idempotencyMapKey);
+      }
     }
-    if (dedupeMapKey && !this.dedupe.has(dedupeMapKey)) {
-      this.dedupe.set(dedupeMapKey, {
-        jobId,
-        mode: dedupe?.mode ?? 'until_completed',
-        ttlMs: dedupe?.ttlMs,
-      });
+    if (dedupeMapKey) {
+      let entry = this.dedupe.get(dedupeMapKey);
+      if (!entry) {
+        entry = {
+          jobId,
+          mode: dedupe?.mode ?? 'until_completed',
+          ttlMs: dedupe?.ttlMs,
+        };
+        this.dedupe.set(dedupeMapKey, entry);
+      }
+      if (entry.jobId === jobId) {
+        slot?.identityLineage.dedupePolicies.set(dedupeMapKey, {
+          mode: entry.mode,
+          ttlMs: entry.ttlMs,
+        });
+      }
     }
   }
 
   private findReplayIdentityJob(slot: Slot, originalJobId: string): string | undefined {
-    const idempotencyMapKey = slot.envelope.idempotencyKey
-      ? this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.idempotencyKey)
-      : undefined;
-    if (idempotencyMapKey) {
-      const mappedJobId = this.idempotency.get(idempotencyMapKey);
-      if (
-        mappedJobId &&
-        mappedJobId !== originalJobId &&
-        this.slotById(mappedJobId)?.state !== 'cancelled'
-      ) {
-        return mappedJobId;
+    let foundJobId: string | undefined;
+    for (const mapKey of slot.identityLineage.idempotencyMapKeys) {
+      const mappedJobId = this.idempotency.get(mapKey);
+      if (mappedJobId && mappedJobId !== originalJobId && this.isLiveReplayTarget(mappedJobId)) {
+        foundJobId = this.mergeIdentityCandidates(foundJobId, mappedJobId);
       }
     }
 
-    const dedupeMapKey = slot.envelope.dedupeKey
-      ? this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.dedupeKey)
-      : undefined;
-    if (!dedupeMapKey) return undefined;
-    const mappedJobId = this.findExistingJobId(undefined, dedupeMapKey);
-    return mappedJobId && mappedJobId !== originalJobId ? mappedJobId : undefined;
+    for (const mapKey of slot.identityLineage.dedupePolicies.keys()) {
+      const mappedJobId = this.findExistingJobId(undefined, mapKey);
+      if (mappedJobId && mappedJobId !== originalJobId && this.isLiveReplayTarget(mappedJobId)) {
+        foundJobId = this.mergeIdentityCandidates(foundJobId, mappedJobId);
+      }
+    }
+    return foundJobId;
   }
 
   private rebindReplayIdentities(slot: Slot, originalJobId: string, replayJobId: string): void {
-    if (slot.envelope.idempotencyKey) {
-      const mapKey = this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.idempotencyKey);
+    for (const mapKey of slot.identityLineage.idempotencyMapKeys) {
       const mappedJobId = this.idempotency.get(mapKey);
-      if (!mappedJobId || mappedJobId === originalJobId) {
+      if (!mappedJobId || mappedJobId === originalJobId || !this.isLiveReplayTarget(mappedJobId)) {
         this.idempotency.set(mapKey, replayJobId);
       }
     }
-    if (slot.envelope.dedupeKey && slot.dedupePolicy) {
-      const mapKey = this.scopedIdentityKey(slot.envelope.jobType, slot.envelope.dedupeKey);
+    for (const [mapKey, policy] of slot.identityLineage.dedupePolicies) {
       const mappedJobId = this.dedupe.get(mapKey)?.jobId;
-      if (!mappedJobId || mappedJobId === originalJobId) {
-        this.dedupe.set(mapKey, { jobId: replayJobId, ...slot.dedupePolicy });
+      if (!mappedJobId || mappedJobId === originalJobId || !this.isLiveReplayTarget(mappedJobId)) {
+        this.dedupe.set(mapKey, { jobId: replayJobId, ...policy });
       }
     }
+  }
+
+  private createIdentityLineage(
+    idempotencyMapKey: string | undefined,
+    dedupeMapKey: string | undefined,
+    dedupe: EnqueueOptions['dedupe'],
+  ): IdentityLineage {
+    const dedupePolicies = new Map<string, Omit<DedupeEntry, 'jobId'>>();
+    if (dedupeMapKey) {
+      dedupePolicies.set(dedupeMapKey, {
+        mode: dedupe?.mode ?? 'until_completed',
+        ttlMs: dedupe?.ttlMs,
+      });
+    }
+    return {
+      idempotencyMapKeys: new Set(idempotencyMapKey ? [idempotencyMapKey] : []),
+      dedupePolicies,
+    };
+  }
+
+  private cloneIdentityLineage(lineage: IdentityLineage): IdentityLineage {
+    return {
+      idempotencyMapKeys: new Set(lineage.idempotencyMapKeys),
+      dedupePolicies: new Map(
+        [...lineage.dedupePolicies].map(([mapKey, policy]) => [mapKey, { ...policy }]),
+      ),
+    };
+  }
+
+  private isLiveReplayTarget(jobId: string): boolean {
+    const target = this.slotById(jobId);
+    return !!target && target.state !== 'cancelled';
+  }
+
+  private mergeIdentityCandidates(
+    current: string | undefined,
+    candidate: string | undefined,
+  ): string | undefined {
+    if (!candidate || !current || current === candidate) return current ?? candidate;
+    throw new JobsError(
+      JobsErrorCode.IdentityConflict,
+      `supplied identities resolve to different jobs: ${current}, ${candidate}`,
+    );
   }
 
   private resolveDedupeKey(tenantId: unknown, opts: EnqueueOptions): string | undefined {

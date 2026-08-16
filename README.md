@@ -323,6 +323,8 @@ await jobs.enqueueDetailed('generateReport', payload, {
 
 Identity and dedupe keys are scoped to a job type; `scope: 'global'` means across tenants of that type. `while_active` always releases at a terminal state, and `ttlMs` does not shorten that active window. For `until_completed`, `ttlMs` permits a new identity only after the retained job is terminal and the TTL has elapsed. The mode and TTL stored by the active identity remain authoritative until that identity is released, so a rolling configuration change cannot weaken an existing dedupe window. These are duplicate-enqueue controls, not exactly-once execution guarantees.
 
+When one supplied identity matches a job and the other identity is unused, both identities are bound to that job. If the supplied identities already resolve to different jobs, enqueue fails with `jobs_identity_conflict`; the library does not silently replace an active mapping.
+
 ## Tenant fairness
 
 The in-memory backend uses a shard-based scheduler with:
@@ -494,6 +496,7 @@ The library exposes these error codes through `JobsError`:
 - `jobs_fairness_misconfig`
 - `jobs_capability_unsupported`
 - `jobs_backend_closed`
+- `jobs_identity_conflict`
 
 ## Limitations
 
