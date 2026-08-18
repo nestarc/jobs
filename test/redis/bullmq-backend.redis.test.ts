@@ -213,15 +213,11 @@ describe('BullMQBackend with Redis', () => {
       return null;
     });
 
-    const legacy = await rawQueue.add(
-      jobType,
-      { source: 'v0.2', __nestarcCtx: {} },
-      {
-        jobId: 'legacy-backoff-job',
-        attempts: 2,
-        backoff: { type: 'fixed', delayMs: 200 },
-      } as never,
-    );
+    const legacy = await rawQueue.add(jobType, { source: 'v0.2', __nestarcCtx: {} }, {
+      jobId: 'legacy-backoff-job',
+      attempts: 2,
+      backoff: { type: 'fixed', delayMs: 200 },
+    } as never);
     instance.startConsumer([jobType], consumer(registry));
 
     await waitFor(async () => (await instance.getJob(String(legacy.id)))?.status === 'succeeded');
@@ -519,6 +515,29 @@ describe('BullMQBackend with Redis', () => {
         { idempotencyKey: legacyIdempotencyKey },
       ),
     ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
+  });
+
+  it('claims an adopted v0.2 job ID across every queue in the namespace', async () => {
+    const namespace = `nestarc-legacy-global-${randomUUID()}`;
+    const legacyType = 'type.a';
+    const peerType = 'type.b';
+    const legacy = backend(namespace, legacyType);
+    const rawQueue = legacy.getRawQueue<Queue>(legacyType);
+    const legacyId = 'legacy-shared-id';
+    await rawQueue.add(legacyType, { source: 'v0.2' }, { jobId: legacyId });
+
+    await expect(
+      service(legacy, legacyType).enqueueDetailed(
+        legacyType,
+        { source: 'v0.3' },
+        { idempotencyKey: legacyId },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: legacyId });
+
+    const peer = backend(namespace, peerType);
+    await expect(
+      service(peer, peerType).enqueueDetailed(peerType, { source: 'peer' }, { jobId: legacyId }),
+    ).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
   });
 
   it('does not adopt an unrelated v0.3 explicit job as legacy idempotency state', async () => {
@@ -1097,6 +1116,108 @@ describe('BullMQBackend with Redis', () => {
     });
   });
 
+  it('starts an until-completed TTL at completion even with a stale active snapshot', async () => {
+    const { namespace, jobType } = testIdentity('dedupe-completion-race');
+    const instance = backend(namespace, jobType, 1);
+    const jobs = service(instance, jobType);
+    const registry = new HandlerRegistry();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    registry.register(jobType, async () => blocked);
+    instance.startConsumer([jobType], consumer(registry));
+
+    const options = {
+      dedupe: { key: 'completion-race', mode: 'until_completed' as const, ttlMs: 100 },
+    };
+    const first = await jobs.enqueueDetailed(jobType, {}, options);
+    await waitFor(async () => (await instance.getJob(first.jobId))?.status === 'active');
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const activeSnapshot = await rawQueue.getJob(first.jobId);
+    expect(activeSnapshot?.finishedOn).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 125));
+    release();
+    await waitFor(async () => (await instance.getJob(first.jobId))?.status === 'succeeded');
+
+    const originalGetJob = rawQueue.getJob.bind(rawQueue);
+    const getJob = jest
+      .spyOn(rawQueue, 'getJob')
+      .mockImplementationOnce(async () => activeSnapshot)
+      .mockImplementation((jobId) => originalGetJob(jobId));
+    try {
+      await expect(jobs.enqueueDetailed(jobType, {}, options)).resolves.toMatchObject({
+        status: 'deduped',
+        jobId: first.jobId,
+      });
+    } finally {
+      getJob.mockRestore();
+    }
+  });
+
+  it('emits enqueued before worker lifecycle events for fast jobs', async () => {
+    const { namespace, jobType } = testIdentity('event-order');
+    const instance = backend(namespace, jobType);
+    const registry = new HandlerRegistry();
+    const events: JobLifecycleEvent[] = [];
+    registry.register(jobType, async () => null);
+    instance.startConsumer(
+      [jobType],
+      consumer(registry, { onEvent: (event) => events.push(event) }),
+    );
+    const jobs = new JobsService({
+      backend: instance,
+      registry: new HandlerRegistry(),
+      jobTypes: [jobType],
+      events: { onEvent: (event) => events.push(event) },
+    });
+
+    const jobIds: string[] = [];
+    for (let index = 0; index < 20; index += 1) {
+      jobIds.push(await jobs.enqueue(jobType, { index }));
+    }
+    await waitFor(
+      async () =>
+        (await Promise.all(jobIds.map((jobId) => instance.getJob(jobId)))).every(
+          (record) => record?.status === 'succeeded',
+        ) && events.filter((event) => event.type === 'job.succeeded').length === jobIds.length,
+    );
+
+    for (const jobId of jobIds) {
+      const types = events.filter((event) => event.jobId === jobId).map((event) => event.type);
+      expect(types).toEqual(['job.enqueued', 'job.started', 'job.succeeded']);
+    }
+  });
+
+  it('reports the first active BullMQ attempt as one', async () => {
+    const { namespace, jobType } = testIdentity('active-attempt');
+    const instance = backend(namespace, jobType, 1);
+    const registry = new HandlerRegistry();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    registry.register(jobType, async () => blocked);
+    instance.startConsumer([jobType], consumer(registry));
+
+    const jobId = await service(instance, jobType).enqueue(jobType, {});
+    await waitFor(async () => (await instance.getJob(jobId))?.status === 'active');
+    await expect(instance.getJob(jobId)).resolves.toMatchObject({ status: 'active', attempt: 1 });
+    release();
+  });
+
+  it('does not create global job-ID mappings for ordinary generated IDs', async () => {
+    const { namespace, jobType } = testIdentity('ordinary-id-cleanup');
+    const instance = backend(namespace, jobType);
+    await service(instance, jobType).enqueue(jobType, {});
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const client = (await rawQueue.client) as unknown as {
+      keys(pattern: string): Promise<string[]>;
+    };
+
+    await expect(client.keys(`bull:${namespace}:nestarc:identity:jobId:*`)).resolves.toEqual([]);
+  });
+
   it('waits for active work on close and leaves waiting work durable for another worker', async () => {
     const { namespace, jobType } = testIdentity('shutdown');
     const first = backend(namespace, jobType, 1);
@@ -1146,6 +1267,57 @@ describe('BullMQBackend with Redis', () => {
       return completed.some((job) => (job.data as { order?: number }).order === 3);
     });
     expect(await second.getJob(firstId)).toMatchObject({ status: 'succeeded' });
+  });
+
+  it('waits for an enqueue that entered before close and releases its identity lock', async () => {
+    const { namespace, jobType } = testIdentity('enqueue-close-race');
+    const first = backend(namespace, jobType);
+    const jobs = service(first, jobType);
+    const rawQueue = first.getRawQueue<Queue>(jobType);
+    const originalAdd = rawQueue.add.bind(rawQueue);
+    let releaseAdd!: () => void;
+    let enteredAdd!: () => void;
+    const addEntered = new Promise<void>((resolve) => {
+      enteredAdd = resolve;
+    });
+    const addBlocked = new Promise<void>((resolve) => {
+      releaseAdd = resolve;
+    });
+    const add = jest.spyOn(rawQueue, 'add').mockImplementation(async (...args) => {
+      enteredAdd();
+      await addBlocked;
+      return originalAdd(...args);
+    });
+
+    try {
+      const enqueue = jobs.enqueueDetailed(
+        jobType,
+        { source: 'closing-producer' },
+        { idempotencyKey: 'closing-identity' },
+      );
+      await addEntered;
+      let closed = false;
+      const closing = first.close().then(() => {
+        closed = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(closed).toBe(false);
+      releaseAdd();
+      await expect(enqueue).resolves.toMatchObject({ status: 'created' });
+      await closing;
+
+      const peer = backend(namespace, jobType);
+      await expect(
+        service(peer, jobType).enqueueDetailed(
+          jobType,
+          { source: 'retry' },
+          { idempotencyKey: 'closing-identity' },
+        ),
+      ).resolves.toMatchObject({ status: 'deduped' });
+    } finally {
+      add.mockRestore();
+      releaseAdd?.();
+    }
   });
 
   it('closes the BullMQ backend through the Nest application lifecycle', async () => {

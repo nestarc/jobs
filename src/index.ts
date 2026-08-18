@@ -39,4 +39,4 @@ export type {
   OutboxJobTarget,
   OutboxJobsPublisherOptions,
 } from './outbox/outbox-jobs-publisher';
-export { attachContext, detachContext, CONTEXT_KEY } from './context-serializer';
+export { attachContext, detachContext, CONTEXT_KEY, INTERNAL_JOB_KEY } from './context-serializer';

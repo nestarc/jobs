@@ -8,13 +8,20 @@ import type {
   ReplayOptions,
 } from '../lifecycle';
 
+export type EnqueueCommitObserver = (result: EnqueueResult) => void;
+
 export interface JobsBackend {
   capabilities(): BackendCapabilities;
-  enqueue(jobType: string, envelope: Record<string, unknown>, opts: EnqueueOptions): Promise<string>;
+  enqueue(
+    jobType: string,
+    envelope: Record<string, unknown>,
+    opts: EnqueueOptions,
+  ): Promise<string>;
   enqueueDetailed?(
     jobType: string,
     envelope: Record<string, unknown>,
     opts: EnqueueOptions,
+    onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult>;
   peekWaiting(jobType: string): Promise<JobEnvelope[]>;
   moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null>;

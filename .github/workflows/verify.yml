@@ -38,13 +38,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - node: 20
-            nest: 10
-          - node: 22
-            nest: 11
-          - node: 24
-            nest: 11
+        node: [20, 22, 24]
+        nest: [10, 11]
     services:
       redis:
         image: redis:7.2-alpine

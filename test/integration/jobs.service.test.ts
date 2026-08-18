@@ -112,9 +112,13 @@ describe('JobsService', () => {
       },
     });
 
-    const jobId = await service.enqueue('doThing', {}, {
-      metadata: { bytes: Buffer.from('snapshot'), marker, custom },
-    });
+    const jobId = await service.enqueue(
+      'doThing',
+      {},
+      {
+        metadata: { bytes: Buffer.from('snapshot'), marker, custom },
+      },
+    );
 
     expect(observedBuffer).toBe('snapshot');
     expect(marker.state.value).toBe('persisted');
@@ -167,4 +171,36 @@ describe('JobsService', () => {
       expect(backend.getJobCalls).toBe(statusQuery ? 1 : 0);
     },
   );
+
+  it('registers a replay with a local scheduler when status queries are unavailable', async () => {
+    class NoStatusBackend extends InMemoryBackend {
+      override capabilities() {
+        return { ...super.capabilities(), statusQuery: false };
+      }
+
+      override async getJob(): Promise<never> {
+        throw new Error('status query unavailable');
+      }
+    }
+
+    const backend = new NoStatusBackend();
+    const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      schedulers: new Map([['doThing', scheduler]]),
+    });
+    const originalId = await service.enqueue(
+      'doThing',
+      {},
+      { attempts: 1, context: { tenantId: 'tenant_1' } },
+    );
+    expect(scheduler.pickNext()?.jobId).toBe(originalId);
+    await backend.moveToActive('doThing', originalId);
+    await backend.fail('doThing', originalId, 'boom');
+    scheduler.onAck(originalId);
+
+    const replayedId = await service.replayDeadLetter(originalId);
+    expect(scheduler.pickNext()).toEqual({ jobId: replayedId, tenantId: 'tenant_1' });
+  });
 });

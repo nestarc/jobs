@@ -43,6 +43,12 @@ This project is currently pre-release. The changelog below starts from the curre
 - Prevented dead-letter replay from converging on terminal work or registering phantom scheduler entries.
 - Preserved Buffer, typed-array, function-property, and custom-prototype isolation in lifecycle snapshots.
 - Translated queued v0.2 BullMQ `{ type, delayMs }` backoff options to the v0.3 worker strategy before retry scheduling.
+- Rejected empty explicit job IDs before backend or scheduler state changes.
+- Started BullMQ `until_completed` TTL retention at the terminal timestamp even when completion races
+  with identity lookup, and claimed adopted v0.2 job IDs across the full namespace.
+- Drained producer enqueue operations before BullMQ queue connections close and ordered same-process
+  enqueue lifecycle callbacks before worker start callbacks.
+- Isolated in-memory replay payload, context, and metadata from the cancelled source record.
 
 ### Compatibility notes
 
@@ -56,6 +62,11 @@ This project is currently pre-release. The changelog below starts from the curre
 - BullMQ upgrades from v0.2 require a coordinated stop-and-restart cutover; mixed v0.2/v0.3 producers or workers on the same queues are unsupported.
 - In-memory idempotency and dedupe keys are now scoped per job type and honor terminal mode/TTL release. Calls suppressed globally in v0.2 may create distinct work after upgrading.
 - Decorated typed handlers now use `handle(payload, context)`, matching the runtime invocation used by existing untyped handlers. Implementations written against the previous `handle(job)` declaration must update their method signature.
+- Typed payloads and contexts must be plain objects. Arrays, functions, built-ins such as `Date` or
+  `Map`, and class instances are rejected; JavaScript or `any` callers that previously supplied them
+  must migrate to serializable object records.
+- `__nestarcJob` is reserved by the v0.3 BullMQ persistence envelope in addition to
+  `__nestarcCtx`; both keys are rejected consistently before backend selection.
 - Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
 
 ### Documentation

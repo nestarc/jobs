@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { detachContext } from '../context-serializer';
-import type { JobsBackend } from './jobs-backend.interface';
+import type { EnqueueCommitObserver, JobsBackend } from './jobs-backend.interface';
 import type { EnqueueOptions, JobEnvelope } from '../types';
 import type {
   BackendCapabilities,
@@ -15,6 +15,7 @@ import type {
 import { computeBackoffDelayMs } from '../retry';
 import { JobsError, JobsErrorCode } from '../errors';
 import { snapshotLifecycleValue } from '../lifecycle-observer';
+import { assertValidJobId } from '../enqueue-validation';
 
 interface Slot {
   envelope: JobEnvelope;
@@ -83,7 +84,9 @@ export class InMemoryBackend implements JobsBackend {
     jobType: string,
     envelope: Record<string, unknown>,
     opts: EnqueueOptions,
+    onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
+    assertValidJobId(opts.jobId);
     const { payload, context } = detachContext(envelope);
     const idempotencyKey = opts.idempotencyKey;
     const idempotencyMapKey = idempotencyKey
@@ -150,7 +153,9 @@ export class InMemoryBackend implements JobsBackend {
       });
     }
     this.recordHistory(id, state, 0);
-    return { status: 'created', jobId: id };
+    const result: EnqueueResult = { status: 'created', jobId: id };
+    onCommit?.(result);
+    return result;
   }
 
   async peekWaiting(jobType: string): Promise<JobEnvelope[]> {
@@ -292,14 +297,18 @@ export class InMemoryBackend implements JobsBackend {
       envelope: {
         id: newJobId,
         jobType: slot.envelope.jobType,
-        payload: slot.envelope.payload,
-        context: slot.envelope.context,
+        payload: snapshotLifecycleValue(slot.envelope.payload),
+        context: snapshotLifecycleValue(slot.envelope.context),
         enqueuedAt: this.now(),
         attempts: replayAttempt,
         maxAttempts: slot.envelope.maxAttempts,
         timeoutMs: slot.envelope.timeoutMs,
         backoff: slot.envelope.backoff,
-        metadata: { ...slot.envelope.metadata, ...options.metadata, replayOf: jobId },
+        metadata: {
+          ...snapshotLifecycleValue(slot.envelope.metadata),
+          ...snapshotLifecycleValue(options.metadata),
+          replayOf: jobId,
+        },
         idempotencyKey: slot.envelope.idempotencyKey,
         dedupeKey: slot.envelope.dedupeKey,
       },

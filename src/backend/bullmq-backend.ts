@@ -2,16 +2,17 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } from 'bullmq';
-import { detachContext } from '../context-serializer';
+import { detachContext, INTERNAL_JOB_KEY } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
 import { normalizeError } from '../error-utils';
+import { assertValidJobId } from '../enqueue-validation';
 import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
 import {
   notifyLifecycleObserver,
   snapshotLifecycleError,
   snapshotLifecycleValue,
 } from '../lifecycle-observer';
-import type { JobsBackend } from './jobs-backend.interface';
+import type { EnqueueCommitObserver, JobsBackend } from './jobs-backend.interface';
 import type { DedupeOptions, EnqueueOptions, JobContext, JobEnvelope, JobEvent } from '../types';
 import type { HandlerRegistry } from '../handler-registry';
 import type {
@@ -23,7 +24,7 @@ import type {
   JobStatus,
 } from '../lifecycle';
 
-const INTERNAL_KEY = '__nestarcJob';
+const INTERNAL_KEY = INTERNAL_JOB_KEY;
 const INTERNAL_VERSION = 1;
 const CUSTOM_BACKOFF_TYPE = 'nestarc';
 const IDENTITY_LOCK_TTL_MS = 60_000;
@@ -126,6 +127,8 @@ export class BullMQBackend implements JobsBackend {
   private readonly queues = new Map<string, Queue>();
   private readonly workers = new Map<string, Worker>();
   private readonly activeHandlerScope = new AsyncLocalStorage<boolean>();
+  private readonly inFlightEnqueues = new Set<Promise<EnqueueResult>>();
+  private readonly enqueueBarriers = new Map<string, Promise<void>>();
   private closePromise: Promise<void> | null = null;
   private closing = false;
   private closed = false;
@@ -165,6 +168,24 @@ export class BullMQBackend implements JobsBackend {
     jobType: string,
     envelope: Record<string, unknown>,
     opts: EnqueueOptions,
+    onCommit?: EnqueueCommitObserver,
+  ): Promise<EnqueueResult> {
+    assertValidJobId(opts.jobId);
+    this.assertAcceptingWork();
+    const operation = this.performEnqueueDetailed(jobType, envelope, opts, onCommit);
+    this.inFlightEnqueues.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.inFlightEnqueues.delete(operation);
+    }
+  }
+
+  private async performEnqueueDetailed(
+    jobType: string,
+    envelope: Record<string, unknown>,
+    opts: EnqueueOptions,
+    onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
     if (opts.timeoutMs !== undefined) throw this.unsupported('timeout');
     if (Object.prototype.hasOwnProperty.call(envelope, INTERNAL_KEY)) {
@@ -175,6 +196,19 @@ export class BullMQBackend implements JobsBackend {
     const { context } = detachContext(envelope);
     const dedupeKey = this.resolveDedupeKey(context.tenantId, opts.dedupe);
     const enqueueToken = randomUUID();
+    let commitNotified = false;
+    let commitObserverFailed = false;
+    let commitObserverError: unknown;
+    const notifyCommit = (result: EnqueueResult): void => {
+      if (commitNotified || result.status !== 'created') return;
+      commitNotified = true;
+      try {
+        onCommit?.(result);
+      } catch (error) {
+        commitObserverFailed = true;
+        commitObserverError = error;
+      }
+    };
     const scheduledFor = this.resolveScheduledFor(opts);
     const internal: PersistedJobMetadata = {
       version: INTERNAL_VERSION,
@@ -204,83 +238,119 @@ export class BullMQBackend implements JobsBackend {
       if (storedToken !== enqueueToken) {
         return { status: 'deduped', jobId: addedJobId, existingJobId: addedJobId };
       }
-      return { status: 'created', jobId: addedJobId };
+      const result: EnqueueResult = { status: 'created', jobId: addedJobId };
+      notifyCommit(result);
+      return result;
     };
 
     const proposedJobId = this.resolveJobId(queue, opts);
     if (opts.jobId) await this.assertNoKnownCrossQueueJob(queue, opts.jobId);
-    const identities = this.persistentIdentities(queue, jobType, opts, dedupeKey, proposedJobId);
+    const legacyJobId = await this.findLegacyIdempotencyJob(queue, opts);
+    const identities = this.persistentIdentities(
+      queue,
+      jobType,
+      opts,
+      dedupeKey,
+      proposedJobId,
+      legacyJobId,
+    );
+    let releaseEnqueueBarrier: () => void = () => undefined;
+    const enqueueBarrier = new Promise<void>((resolve) => {
+      releaseEnqueueBarrier = resolve;
+    });
+    this.enqueueBarriers.set(enqueueToken, enqueueBarrier);
 
-    return await this.withIdentityLocks(queue, identities, async (client) => {
-      const resolution = await this.resolveIdentityMappings(queue, client, identities);
-      const idempotencyIdentity = identities.find((identity) => identity.kind === 'idempotency');
-      const legacyJobId =
-        idempotencyIdentity && !(await client.get(idempotencyIdentity.mapKey))
-          ? await this.findLegacyIdempotencyJob(queue, opts)
-          : undefined;
-      const explicitJobId = opts.jobId && (await queue.getJob(opts.jobId)) ? opts.jobId : undefined;
-      const existingJobId = this.mergeIdentityCandidates(
-        this.mergeIdentityCandidates(resolution.existingJobId, legacyJobId),
-        explicitJobId,
-      );
-      if (existingJobId) {
-        this.mergeIdentityCandidates(existingJobId, resolution.reservedJobId);
-        const backfillIdentities = identities.filter(
-          (identity) =>
-            identity.kind !== 'jobId' || proposedJobId === existingJobId,
-        );
-        await this.backfillIdentityMappings(client, backfillIdentities, existingJobId);
-        return {
-          status: 'deduped',
-          jobId: existingJobId,
-          existingJobId,
-        };
-      }
-
-      const reservedJobId = resolution.reservedJobId ?? proposedJobId;
-      // Reserve before Queue.add so a producer crash cannot leave a job without
-      // a durable identity mapping. If the lock lease is lost while Queue.add is
-      // pending, a later producer adopts the same reservation/job ID so BullMQ's
-      // job-ID uniqueness still prevents duplicate work.
-      await this.reserveIdentityMappings(client, identities, reservedJobId);
-      try {
-        const result = await addJob(reservedJobId);
-        if (result.jobId !== reservedJobId) {
-          await Promise.all(
-            identities.map((identity) =>
-              client.set(identity.mapKey, this.serializeIdentityMapping(identity, result.jobId)),
-            ),
+    try {
+      const result = await this.withIdentityLocks<EnqueueResult>(
+        queue,
+        identities,
+        async (client) => {
+          const resolution = await this.resolveIdentityMappings(queue, client, identities);
+          const idempotencyIdentity = identities.find(
+            (identity) => identity.kind === 'idempotency',
           );
-        }
-        return result;
-      } catch (error) {
-        try {
-          const recovered = await queue.getJob(reservedJobId);
-          if (recovered) {
-            const recoveredToken = this.decode(recovered.data as Record<string, unknown>).internal
-              ?.enqueueToken;
-            return recoveredToken === enqueueToken
-              ? { status: 'created', jobId: reservedJobId }
-              : { status: 'deduped', jobId: reservedJobId, existingJobId: reservedJobId };
+          const adoptedLegacyJobId =
+            idempotencyIdentity && !(await client.get(idempotencyIdentity.mapKey))
+              ? legacyJobId
+              : undefined;
+          const explicitJobId =
+            opts.jobId && (await queue.getJob(opts.jobId)) ? opts.jobId : undefined;
+          const existingJobId = this.mergeIdentityCandidates(
+            this.mergeIdentityCandidates(resolution.existingJobId, adoptedLegacyJobId),
+            explicitJobId,
+          );
+          if (existingJobId) {
+            this.mergeIdentityCandidates(existingJobId, resolution.reservedJobId);
+            const backfillIdentities = identities.filter(
+              (identity) =>
+                identity.kind !== 'jobId' ||
+                identity.mapKey === this.globalJobIdMapKey(existingJobId),
+            );
+            await this.backfillIdentityMappings(client, backfillIdentities, existingJobId);
+            return {
+              status: 'deduped',
+              jobId: existingJobId,
+              existingJobId,
+            };
           }
 
-          await Promise.allSettled(
-            identities.map((identity) =>
-              client.eval(
-                COMPARE_AND_DELETE_SCRIPT,
-                1,
-                identity.mapKey,
-                this.serializeIdentityMapping(identity, reservedJobId),
-              ),
-            ),
-          );
-        } catch {
-          // Keep the reservation when the add outcome cannot be reconciled. A
-          // later producer will remove it only after confirming the job is absent.
-        }
-        throw error;
-      }
-    });
+          const reservedJobId = resolution.reservedJobId ?? proposedJobId;
+          // Reserve before Queue.add so a producer crash cannot leave a job without
+          // a durable identity mapping. If the lock lease is lost while Queue.add is
+          // pending, a later producer adopts the same reservation/job ID so BullMQ's
+          // job-ID uniqueness still prevents duplicate work.
+          await this.reserveIdentityMappings(client, identities, reservedJobId);
+          try {
+            const result = await addJob(reservedJobId);
+            if (result.jobId !== reservedJobId) {
+              await Promise.all(
+                identities.map((identity) =>
+                  client.set(
+                    identity.mapKey,
+                    this.serializeIdentityMapping(identity, result.jobId),
+                  ),
+                ),
+              );
+            }
+            return result;
+          } catch (error) {
+            try {
+              const recovered = await queue.getJob(reservedJobId);
+              if (recovered) {
+                const recoveredToken = this.decode(recovered.data as Record<string, unknown>)
+                  .internal?.enqueueToken;
+                if (recoveredToken === enqueueToken) {
+                  const result: EnqueueResult = { status: 'created', jobId: reservedJobId };
+                  notifyCommit(result);
+                  return result;
+                }
+                return { status: 'deduped', jobId: reservedJobId, existingJobId: reservedJobId };
+              }
+
+              await Promise.allSettled(
+                identities.map((identity) =>
+                  client.eval(
+                    COMPARE_AND_DELETE_SCRIPT,
+                    1,
+                    identity.mapKey,
+                    this.serializeIdentityMapping(identity, reservedJobId),
+                  ),
+                ),
+              );
+            } catch {
+              // Keep the reservation when the add outcome cannot be reconciled. A
+              // later producer will remove it only after confirming the job is absent.
+            }
+            throw error;
+          }
+        },
+      );
+      if (commitObserverFailed) throw commitObserverError;
+      return result;
+    } finally {
+      releaseEnqueueBarrier();
+      this.enqueueBarriers.delete(enqueueToken);
+    }
   }
 
   async getJob(jobId: string): Promise<JobRecord | null> {
@@ -300,7 +370,7 @@ export class BullMQBackend implements JobsBackend {
         status,
         payload: decoded.payload,
         context: decoded.context,
-        attempt: job.attemptsMade,
+        attempt: status === 'active' ? job.attemptsMade + 1 : job.attemptsMade,
         maxAttempts: job.opts.attempts ?? 1,
         enqueuedAt: new Date(job.timestamp),
         scheduledFor:
@@ -360,9 +430,11 @@ export class BullMQBackend implements JobsBackend {
           ) => {
             if (type !== CUSTOM_BACKOFF_TYPE || !job) return -1;
             const internal = this.decode(job.data as Record<string, unknown>).internal;
-            const normalized = (job.opts.backoff as JobsOptions['backoff'] & {
-              nestarcPolicy?: BackoffPolicy;
-            })?.nestarcPolicy;
+            const normalized = (
+              job.opts.backoff as JobsOptions['backoff'] & {
+                nestarcPolicy?: BackoffPolicy;
+              }
+            )?.nestarcPolicy;
             return computeBackoffDelayMs(internal?.backoff ?? normalized, attemptsMade);
           },
         },
@@ -398,6 +470,9 @@ export class BullMQBackend implements JobsBackend {
   ): Promise<unknown> {
     this.normalizeLegacyBackoff(job);
     const { payload, context, internal } = this.decode(job.data as Record<string, unknown>);
+    if (internal?.enqueueToken) {
+      await this.enqueueBarriers.get(internal.enqueueToken);
+    }
     const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
     const startedAt = new Date();
     const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt };
@@ -537,9 +612,11 @@ export class BullMQBackend implements JobsBackend {
     opts: EnqueueOptions,
     dedupeKey: string | undefined,
     proposedJobId: string,
+    legacyJobId?: string,
   ): PersistentIdentity[] {
-    const identities: PersistentIdentity[] = [
-      {
+    const identities: PersistentIdentity[] = [];
+    if (opts.jobId || opts.idempotencyKey) {
+      identities.push({
         kind: 'jobId',
         mapKey: this.globalJobIdMapKey(proposedJobId),
         jobType,
@@ -548,8 +625,16 @@ export class BullMQBackend implements JobsBackend {
           : opts.idempotencyKey
             ? `idempotency:${this.hash(`${queue.name}\u0000${opts.idempotencyKey}`)}`
             : `generated:${proposedJobId}`,
-      },
-    ];
+      });
+    }
+    if (legacyJobId && legacyJobId !== proposedJobId && opts.idempotencyKey) {
+      identities.push({
+        kind: 'jobId',
+        mapKey: this.globalJobIdMapKey(legacyJobId),
+        jobType,
+        claim: `legacy-idempotency:${this.hash(`${queue.name}\u0000${opts.idempotencyKey}`)}`,
+      });
+    }
     if (opts.idempotencyKey) {
       identities.push({
         kind: 'idempotency',
@@ -624,10 +709,18 @@ export class BullMQBackend implements JobsBackend {
         await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
       }
+      let finishedOn = existing.finishedOn;
+      if (terminal && mapping.ttlMs !== undefined && finishedOn === undefined) {
+        // getState() can observe completion after getJob() returned an active
+        // snapshot. Refetch instead of falling back to the enqueue timestamp,
+        // which would count handler runtime against the terminal TTL.
+        finishedOn = (await mappedQueue.getJob(mapping.jobId))?.finishedOn;
+      }
       const ttlExpired =
         terminal &&
         mapping.ttlMs !== undefined &&
-        Date.now() - (existing.finishedOn ?? existing.timestamp) >= Math.max(0, mapping.ttlMs);
+        finishedOn !== undefined &&
+        Date.now() - finishedOn >= Math.max(0, mapping.ttlMs);
       if (ttlExpired) {
         await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
         continue;
@@ -884,6 +977,13 @@ export class BullMQBackend implements JobsBackend {
       if (result.status === 'fulfilled') this.workers.delete(workers[index][0]);
       else failures.push(result.reason);
     });
+
+    // External producers that entered before closing began own identity locks
+    // and Redis commands. Drain them before closing queue connections so their
+    // cleanup cannot strand a lock until its lease expires.
+    while (this.inFlightEnqueues.size > 0) {
+      await Promise.allSettled([...this.inFlightEnqueues]);
+    }
 
     // Active handlers have drained. Reject later producer work before queues
     // are closed, while still allowing handlers to enqueue follow-up jobs.

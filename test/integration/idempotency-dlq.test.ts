@@ -18,6 +18,15 @@ function setup(events?: JobLifecycleEvent[]) {
 }
 
 describe('v0.2 idempotency and DLQ APIs', () => {
+  it('rejects an empty explicit job ID before scheduler or indexes are changed', async () => {
+    const { backend, service } = setup();
+
+    await expect(
+      service.enqueueDetailed('report.generate', { generation: 'invalid' }, { jobId: '' }),
+    ).rejects.toThrow('jobId must be a non-empty string');
+    await expect(backend.peekWaiting('report.generate')).resolves.toEqual([]);
+  });
+
   it('preserves enqueue return compatibility while exposing detailed dedupe result', async () => {
     const { service } = setup();
     const first = await service.enqueueDetailed(
@@ -383,6 +392,50 @@ describe('v0.2 idempotency and DLQ APIs', () => {
 
     await service.discardDeadLetter(jobId, 'handled manually');
     expect(await service.getJob(jobId)).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('isolates replay payload, context, and metadata from the cancelled source record', async () => {
+    const { backend, service } = setup();
+    const originalId = await service.enqueue(
+      'report.generate',
+      { nested: { value: 'source' } },
+      {
+        attempts: 1,
+        context: { tenantId: 'tenant_1', nested: { value: 'source' } },
+        metadata: { nested: { value: 'source' } },
+      },
+    );
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom');
+
+    const replayedId = await service.replayDeadLetter(originalId);
+    const replayed = await backend.moveToActive('report.generate', replayedId);
+    (replayed?.payload as { nested: { value: string } }).nested.value = 'replayed';
+    (replayed?.context.nested as { value: string }).value = 'replayed';
+    (replayed?.metadata.nested as { value: string }).value = 'replayed';
+
+    await expect(service.getJob(originalId)).resolves.toMatchObject({
+      payload: { nested: { value: 'source' } },
+      context: { nested: { value: 'source' } },
+      metadata: { nested: { value: 'source' } },
+    });
+  });
+
+  it('preserves a real __default__ tenant ID in replay events', async () => {
+    const events: JobLifecycleEvent[] = [];
+    const { backend, service } = setup(events);
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      { attempts: 1, context: { tenantId: '__default__' } },
+    );
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom');
+
+    const replayedId = await service.replayDeadLetter(originalId);
+    expect(events.filter((event) => event.type === 'job.replayed')).toEqual([
+      expect.objectContaining({ jobId: replayedId, tenantId: '__default__' }),
+    ]);
   });
 
   it('rebinds replay identity and honors resetAttempts=false', async () => {

@@ -1,5 +1,12 @@
 import { Inject } from '@nestjs/common';
-import type { BackendCapabilities, DeadLetterFilter, EnqueueResult, JobHistoryEntry, JobRecord, ReplayOptions } from './lifecycle';
+import type {
+  BackendCapabilities,
+  DeadLetterFilter,
+  EnqueueResult,
+  JobHistoryEntry,
+  JobRecord,
+  ReplayOptions,
+} from './lifecycle';
 import type { EnqueueOptions, JobContext } from './types';
 
 export const JOBS_SERVICE = Symbol.for('@nestarc/jobs:JobsService');
@@ -21,7 +28,9 @@ export interface JobBuilder<TPayload, TContext, TResult> {
   readonly __payload?: TPayload;
   readonly __context?: TContext;
   readonly __result?: TResult;
-  context<TNextContext>(): JobBuilder<TPayload, TNextContext, TResult>;
+  context<TNextContext extends object>(
+    ...invalid: PlainObjectArguments<TNextContext>
+  ): JobBuilder<TPayload, TNextContext, TResult>;
   result<TNextResult>(): JobBuilder<TPayload, TContext, TNextResult>;
   defaults(defaults: JobDefaults): JobDefinition<TPayload, TContext, TResult>;
 }
@@ -42,6 +51,13 @@ export type JobPayload<
 export type JobContextOf<
   TJobs extends JobDefinitions,
   TType extends JobType<TJobs>,
+> = TJobs[TType] extends { readonly __context?: infer TContext }
+  ? TContext & JobContext
+  : JobContext;
+
+type DeclaredJobContext<
+  TJobs extends JobDefinitions,
+  TType extends JobType<TJobs>,
 > = TJobs[TType] extends { readonly __context?: infer TContext } ? TContext : JobContext;
 
 export type JobResult<
@@ -49,10 +65,7 @@ export type JobResult<
   TType extends JobType<TJobs>,
 > = TJobs[TType] extends { readonly __result?: infer TResult } ? TResult : unknown;
 
-export interface JobInstance<
-  TJobs extends JobDefinitions,
-  TType extends JobType<TJobs>,
-> {
+export interface JobInstance<TJobs extends JobDefinitions, TType extends JobType<TJobs>> {
   id: string;
   type: TType;
   payload: JobPayload<TJobs, TType>;
@@ -63,10 +76,7 @@ export interface JobInstance<
   metadata: Record<string, unknown>;
 }
 
-export interface TypedJobHandler<
-  TJobs extends JobDefinitions,
-  TType extends JobType<TJobs>,
-> {
+export interface TypedJobHandler<TJobs extends JobDefinitions, TType extends JobType<TJobs>> {
   handle(
     payload: JobPayload<TJobs, TType>,
     context: JobContextOf<TJobs, TType>,
@@ -77,13 +87,13 @@ export interface TypedJobsService<TJobs extends JobDefinitions> {
   enqueue<TType extends JobType<TJobs>>(
     type: TType,
     payload: JobPayload<TJobs, TType>,
-    options?: EnqueueOptions<JobContextOf<TJobs, TType>>,
+    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>>,
   ): Promise<string>;
 
   enqueueDetailed<TType extends JobType<TJobs>>(
     type: TType,
     payload: JobPayload<TJobs, TType>,
-    options?: EnqueueOptions<JobContextOf<TJobs, TType>>,
+    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>>,
   ): Promise<EnqueueResult>;
 
   getJob<TType extends JobType<TJobs> = JobType<TJobs>>(
@@ -97,7 +107,24 @@ export interface TypedJobsService<TJobs extends JobDefinitions> {
   discardDeadLetter(jobId: string, reason?: string): Promise<void>;
 }
 
-export function job<TPayload extends object>(): JobBuilder<TPayload, JobContext, unknown> {
+type NonPlainObject =
+  | readonly unknown[]
+  | ((...args: never[]) => unknown)
+  | Date
+  | RegExp
+  | Map<unknown, unknown>
+  | Set<unknown>
+  | ArrayBuffer
+  | ArrayBufferView
+  | URL;
+
+type PlainObjectArguments<T extends object> = T extends NonPlainObject
+  ? [error: 'job payload and context types must be plain objects']
+  : [];
+
+export function job<TPayload extends object>(
+  ..._invalid: PlainObjectArguments<TPayload>
+): JobBuilder<TPayload, JobContext, unknown> {
   return makeJobBuilder<TPayload, JobContext, unknown>();
 }
 
@@ -111,7 +138,7 @@ export function InjectJobs(): ReturnType<typeof Inject> {
 
 function makeJobBuilder<TPayload, TContext, TResult>(): JobBuilder<TPayload, TContext, TResult> {
   return {
-    context<TNextContext>() {
+    context<TNextContext extends object>(..._invalid: PlainObjectArguments<TNextContext>) {
       return makeJobBuilder<TPayload, TNextContext, TResult>();
     },
     result<TNextResult>() {

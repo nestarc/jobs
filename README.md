@@ -250,8 +250,9 @@ JobsModule.forInMemory({
 
 Notes:
 
-- payloads must be non-null objects; primitive and array payloads are rejected
-- payloads must not contain the reserved key `__nestarcCtx`
+- payloads and contexts must be plain objects; primitives, arrays, functions, built-ins such as
+  `Date`/`Map`, and class instances are rejected before enqueue
+- payloads must not contain the reserved keys `__nestarcCtx` or `__nestarcJob`
 - if you do not provide a context extractor, the default context is `{}`
 
 ## Handler discovery
@@ -315,6 +316,8 @@ Behavior notes:
 - handler timeout uses cooperative cancellation through `ctx.signal` on the in-memory backend
 - BullMQ rejects `timeoutMs`, history, DLQ helpers, and manual drain with `jobs_capability_unsupported`
 - lifecycle callbacks are observational; thrown errors and rejected promises do not alter enqueue or handler outcomes
+- BullMQ producer and worker events can cross process boundaries; consumers that merge events from
+  multiple processes should use timestamps and terminal-state precedence rather than arrival order
 
 ## Status, retry, idempotency, and DLQ
 

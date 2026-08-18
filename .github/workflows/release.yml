@@ -29,11 +29,26 @@ jobs:
         run: |
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
+      - name: Verify release commit belongs to main
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"
       - uses: actions/download-artifact@v4
         with:
           name: package-tarball
           path: package-artifact
-      - run: npm publish ./package-artifact/nestarc-jobs-*.tgz --provenance --access public
+      - name: Check whether the package version is already published
+        id: registry
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@nestarc/jobs@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Publish npm package
+        if: steps.registry.outputs.published != 'true'
+        run: npm publish ./package-artifact/nestarc-jobs-*.tgz --provenance --access public
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

@@ -30,6 +30,14 @@ describe('job contracts', () => {
     const compileOnly = () => {
       // @ts-expect-error job payloads must be non-null objects
       job<string>();
+      // @ts-expect-error arrays are not plain job payload objects
+      job<string[]>();
+      // @ts-expect-error built-in objects would lose their value during envelope creation
+      job<Date>();
+      // @ts-expect-error functions are not serializable job payload objects
+      job<() => void>();
+      // @ts-expect-error job contexts must be objects
+      job<SendPayload>().context<string>();
     };
     expect(compileOnly).toEqual(expect.any(Function));
   });
@@ -50,20 +58,32 @@ describe('job contracts', () => {
       discardDeadLetter: jest.fn().mockResolvedValue(undefined),
     } as unknown as TypedJobsService<AppJobs>;
 
-    await service.enqueue('email.send', { messageId: 'msg_1' }, {
-      context: { tenantId: 'tenant_1' },
-    });
+    await service.enqueue(
+      'email.send',
+      { messageId: 'msg_1' },
+      {
+        context: { tenantId: 'tenant_1' },
+      },
+    );
 
-    expect(service.enqueue).toHaveBeenCalledWith('email.send', { messageId: 'msg_1' }, {
-      context: { tenantId: 'tenant_1' },
-    });
+    expect(service.enqueue).toHaveBeenCalledWith(
+      'email.send',
+      { messageId: 'msg_1' },
+      {
+        context: { tenantId: 'tenant_1' },
+      },
+    );
   });
 
   it('supports typed handler instances', async () => {
     class SendHandler implements TypedJobHandler<AppJobs, 'email.send'> {
-      async handle(payload: SendPayload, context: TenantContext): Promise<void> {
+      async handle(
+        payload: SendPayload,
+        context: TenantContext & { signal?: AbortSignal },
+      ): Promise<void> {
         expect(payload.messageId).toBe('msg_1');
         expect(context.tenantId).toBe('tenant_1');
+        void context.signal;
       }
     }
 

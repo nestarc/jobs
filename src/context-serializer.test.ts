@@ -1,4 +1,4 @@
-import { attachContext, detachContext, CONTEXT_KEY } from './context-serializer';
+import { attachContext, detachContext, CONTEXT_KEY, INTERNAL_JOB_KEY } from './context-serializer';
 import { JobsError } from './errors';
 
 describe('attachContext', () => {
@@ -9,6 +9,7 @@ describe('attachContext', () => {
 
   it('rejects payload that already uses reserved key', () => {
     expect(() => attachContext({ [CONTEXT_KEY]: 'x' }, { tenantId: 't1' })).toThrow(JobsError);
+    expect(() => attachContext({ [INTERNAL_JOB_KEY]: 'x' }, { tenantId: 't1' })).toThrow(JobsError);
   });
 
   it('handles undefined context as empty', () => {
@@ -19,6 +20,22 @@ describe('attachContext', () => {
   it('rejects primitive and array payloads at runtime', () => {
     expect(() => attachContext('payload' as never, undefined)).toThrow(TypeError);
     expect(() => attachContext([] as never, undefined)).toThrow(TypeError);
+  });
+
+  it('rejects non-plain payloads and contexts before data can be lost', () => {
+    class Payload {
+      constructor(readonly value: string) {}
+    }
+
+    expect(() => attachContext(new Date() as never, undefined)).toThrow(
+      'job payload must be a plain object',
+    );
+    expect(() => attachContext(new Payload('x') as never, undefined)).toThrow(
+      'job payload must be a plain object',
+    );
+    expect(() => attachContext({}, 'tenant' as never)).toThrow(
+      'job context must be a plain object',
+    );
   });
 });
 

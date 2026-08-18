@@ -41,7 +41,9 @@ Unsupported timeout, history, dead-letter, and manual-drain operations fail with
 
 ## Typed handler contract
 
-- Job payload definitions must be non-null object types.
+- Job payload and context definitions must be plain object types. Runtime validation rejects
+  primitives, arrays, functions, built-ins such as `Date`/`Map`, and class instances before
+  envelope creation. `__nestarcCtx` and `__nestarcJob` are reserved payload keys.
 - `TypedJobHandler<TJobs, TType>.handle(payload, context)` matches the arguments delivered by `@JobHandler()` discovery on both backends.
 - `JobInstance` remains available as a record type for status- and adapter-oriented code; decorated handlers are not invoked with a `JobInstance` wrapper.
 
@@ -70,7 +72,8 @@ Unsupported timeout, history, dead-letter, and manual-drain operations fail with
 
 - Unit/in-memory tests run on Node 20, 22, and 24.
 - Consumer tarballs compile and bootstrap on Node 20/22/24 with NestJS 10 and 11, without BullMQ installed.
-- Redis 7.2 integration runs on representative Node/Nest combinations and fails when `REDIS_URL` is missing.
+- Redis 7.2 integration runs on every supported Node 20/22/24 × NestJS 10/11 combination and fails
+  when `REDIS_URL` is missing.
 - Coverage includes `bullmq-backend.ts`; global and BullMQ-specific thresholds are enforced.
 - Pull requests and tag releases call the same reusable verification workflow. Release publishes the tarball produced by that workflow.
 

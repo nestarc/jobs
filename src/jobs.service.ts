@@ -6,6 +6,7 @@ import type { Scheduler } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
 import { notifyLifecycleObserver, snapshotLifecycleValue } from './lifecycle-observer';
+import { assertValidJobId } from './enqueue-validation';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -50,6 +51,7 @@ export class JobsService {
     opts: EnqueueOptions = {},
   ): Promise<EnqueueResult> {
     this.assertKnownJobType(jobType);
+    assertValidJobId(opts.jobId);
     const defaults = this.jobDefaults(jobType);
     const effectiveOpts: EnqueueOptions = {
       ...opts,
@@ -61,13 +63,10 @@ export class JobsService {
 
     const context = effectiveOpts.context ?? this.deps.contextExtractor?.() ?? {};
     const envelope = attachContext(payload, context);
-    const result = this.deps.backend.enqueueDetailed
-      ? await this.deps.backend.enqueueDetailed(jobType, envelope, { ...effectiveOpts, context })
-      : {
-          status: 'created' as const,
-          jobId: await this.deps.backend.enqueue(jobType, envelope, { ...effectiveOpts, context }),
-        };
-    if (result.status === 'created') {
+    let enqueueNotified = false;
+    const notifyEnqueued = (result: EnqueueResult): void => {
+      if (enqueueNotified || result.status !== 'created') return;
+      enqueueNotified = true;
       const tenantId = (context.tenantId as string | undefined) ?? '__default__';
       this.schedulers.get(jobType)?.onEnqueue(result.jobId, tenantId);
       notifyLifecycleObserver(() =>
@@ -81,7 +80,19 @@ export class JobsService {
           metadata: snapshotLifecycleValue(effectiveOpts.metadata),
         }),
       );
-    }
+    };
+    const result = this.deps.backend.enqueueDetailed
+      ? await this.deps.backend.enqueueDetailed(
+          jobType,
+          envelope,
+          { ...effectiveOpts, context },
+          notifyEnqueued,
+        )
+      : {
+          status: 'created' as const,
+          jobId: await this.deps.backend.enqueue(jobType, envelope, { ...effectiveOpts, context }),
+        };
+    notifyEnqueued(result);
     return result;
   }
 
@@ -111,9 +122,24 @@ export class JobsService {
     if (!this.deps.backend.replayDeadLetter) {
       throw this.unsupported('deadLetter');
     }
+    const capabilities = this.deps.backend.capabilities();
+    const needsSourceRecord =
+      this.schedulers.size > 0 ||
+      this.deps.events?.onEvent !== undefined ||
+      !capabilities.statusQuery;
+    const sourceRecord = needsSourceRecord
+      ? await this.findReplaySourceRecord(jobId, capabilities.statusQuery)
+      : null;
+    if (!capabilities.statusQuery && this.schedulers.size > 0 && !sourceRecord) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        'dead-letter replay on a local scheduler requires the source job record',
+      );
+    }
+
     const replayedJobId = await this.deps.backend.replayDeadLetter(jobId, options);
     let record: JobRecord | null = null;
-    if (this.deps.backend.capabilities().statusQuery) {
+    if (capabilities.statusQuery) {
       try {
         record = await this.deps.backend.getJob(replayedJobId);
       } catch {
@@ -121,21 +147,35 @@ export class JobsService {
         // successful side effect into an apparent failure that callers retry.
       }
     }
+    record ??= sourceRecord
+      ? {
+          ...sourceRecord,
+          id: replayedJobId,
+          status: 'queued',
+          attempt: options?.resetAttempts === false ? sourceRecord.attempt : 0,
+          metadata: {
+            ...sourceRecord.metadata,
+            ...options?.metadata,
+            replayOf: jobId,
+          },
+        }
+      : null;
     if (record && !this.isTerminal(record.status)) {
-      const tenantId = (record.context as JobContext | undefined)?.tenantId ?? '__default__';
+      const tenantId = (record.context as JobContext | undefined)?.tenantId;
+      const schedulerTenantId = tenantId ?? '__default__';
       if (
         record.status === 'queued' ||
         record.status === 'delayed' ||
         record.status === 'retrying'
       ) {
-        this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);
+        this.schedulers.get(record.type)?.onEnqueue(replayedJobId, schedulerTenantId);
       }
       notifyLifecycleObserver(() =>
         this.deps.events?.onEvent?.({
           type: 'job.replayed',
           jobId: replayedJobId,
           jobType: record.type,
-          tenantId: tenantId === '__default__' ? undefined : tenantId,
+          tenantId,
           attempt: record.attempt,
           at: new Date(),
           metadata: snapshotLifecycleValue(record.metadata),
@@ -143,6 +183,28 @@ export class JobsService {
       );
     }
     return replayedJobId;
+  }
+
+  private async findReplaySourceRecord(
+    jobId: string,
+    statusQuery: boolean,
+  ): Promise<JobRecord | null> {
+    if (statusQuery) {
+      try {
+        const record = await this.deps.backend.getJob(jobId);
+        if (record) return record;
+      } catch {
+        // Fall through to the DLQ listing when the backend can still provide it.
+      }
+    }
+    if (!this.deps.backend.listDeadLetters) return null;
+    try {
+      return (
+        (await this.deps.backend.listDeadLetters()).find((record) => record.id === jobId) ?? null
+      );
+    } catch {
+      return null;
+    }
   }
 
   async discardDeadLetter(jobId: string, reason?: string): Promise<void> {
