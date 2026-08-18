@@ -87,6 +87,42 @@ describe('JobsService', () => {
     });
   });
 
+  it('snapshots buffers, function properties, and custom prototypes for observers', async () => {
+    const backend = new InMemoryBackend();
+    const marker = Object.assign(() => undefined, { state: { value: 'persisted' } });
+    const prototype = { state: { value: 'persisted' } };
+    const custom = Object.create(prototype) as Record<string, unknown>;
+    let observedBuffer = '';
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['doThing'],
+      events: {
+        onEvent: (event) => {
+          const metadata = event.metadata as {
+            bytes: Buffer;
+            marker: typeof marker;
+            custom: Record<string, unknown>;
+          };
+          observedBuffer = metadata.bytes.toString('utf8');
+          metadata.marker.state.value = 'observer-mutated';
+          (Object.getPrototypeOf(metadata.custom) as typeof prototype).state.value =
+            'observer-mutated';
+        },
+      },
+    });
+
+    const jobId = await service.enqueue('doThing', {}, {
+      metadata: { bytes: Buffer.from('snapshot'), marker, custom },
+    });
+
+    expect(observedBuffer).toBe('snapshot');
+    expect(marker.state.value).toBe('persisted');
+    expect(prototype.state.value).toBe('persisted');
+    const record = await service.getJob(jobId);
+    expect((record?.metadata.marker as typeof marker).state.value).toBe('persisted');
+  });
+
   it('rejects fairness controls when scheduler state is unavailable', () => {
     const service = new JobsService({
       backend: new InMemoryBackend(),

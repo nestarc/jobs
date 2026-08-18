@@ -4,7 +4,6 @@ import {
   InjectJobs,
   JOBS_SERVICE,
   job,
-  type JobInstance,
   type TypedJobHandler,
   type TypedJobsService,
 } from './contracts';
@@ -27,6 +26,14 @@ const appJobs = defineJobs({
 type AppJobs = typeof appJobs;
 
 describe('job contracts', () => {
+  it('requires object payload definitions', () => {
+    const compileOnly = () => {
+      // @ts-expect-error job payloads must be non-null objects
+      job<string>();
+    };
+    expect(compileOnly).toEqual(expect.any(Function));
+  });
+
   it('keeps runtime metadata for defaults', () => {
     expect(appJobs['email.send'].defaults).toEqual({ attempts: 3 });
   });
@@ -54,22 +61,13 @@ describe('job contracts', () => {
 
   it('supports typed handler instances', async () => {
     class SendHandler implements TypedJobHandler<AppJobs, 'email.send'> {
-      async handle(jobToHandle: JobInstance<AppJobs, 'email.send'>): Promise<void> {
-        expect(jobToHandle.payload.messageId).toBe('msg_1');
-        expect(jobToHandle.context.tenantId).toBe('tenant_1');
+      async handle(payload: SendPayload, context: TenantContext): Promise<void> {
+        expect(payload.messageId).toBe('msg_1');
+        expect(context.tenantId).toBe('tenant_1');
       }
     }
 
-    await new SendHandler().handle({
-      id: 'job_1',
-      type: 'email.send',
-      payload: { messageId: 'msg_1' },
-      context: { tenantId: 'tenant_1' },
-      attempt: 1,
-      maxAttempts: 3,
-      signal: new AbortController().signal,
-      metadata: {},
-    });
+    await new SendHandler().handle({ messageId: 'msg_1' }, { tenantId: 'tenant_1' });
   });
 
   it('creates a Nest injection decorator for JobsService', () => {

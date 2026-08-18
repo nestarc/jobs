@@ -67,7 +67,10 @@ export interface TypedJobHandler<
   TJobs extends JobDefinitions,
   TType extends JobType<TJobs>,
 > {
-  handle(job: JobInstance<TJobs, TType>): Promise<JobResult<TJobs, TType>>;
+  handle(
+    payload: JobPayload<TJobs, TType>,
+    context: JobContextOf<TJobs, TType>,
+  ): Promise<JobResult<TJobs, TType>>;
 }
 
 export interface TypedJobsService<TJobs extends JobDefinitions> {
@@ -94,7 +97,7 @@ export interface TypedJobsService<TJobs extends JobDefinitions> {
   discardDeadLetter(jobId: string, reason?: string): Promise<void>;
 }
 
-export function job<TPayload>(): JobBuilder<TPayload, JobContext, unknown> {
+export function job<TPayload extends object>(): JobBuilder<TPayload, JobContext, unknown> {
   return makeJobBuilder<TPayload, JobContext, unknown>();
 }
 

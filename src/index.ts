@@ -17,8 +17,13 @@ export { FairWorker } from './fair-worker';
 export type { FairWorkerOptions } from './fair-worker';
 export type { JobsBackend } from './backend/jobs-backend.interface';
 export { InMemoryBackend } from './backend/in-memory-backend';
+export type { InMemoryBackendOptions } from './backend/in-memory-backend';
 export { BullMQBackend } from './backend/bullmq-backend';
-export type { BullMQBackendOptions, BullMQRawQueue } from './backend/bullmq-backend';
+export type {
+  BullMQBackendOptions,
+  BullMQConsumerOptions,
+  BullMQRawQueue,
+} from './backend/bullmq-backend';
 export { FakeJobsService, createFakeJobs } from './fake-jobs.service';
 export type { FakeJobsOptions } from './fake-jobs.service';
 export { JobsOutboxBridge } from './outbox/outbox-bridge.module';

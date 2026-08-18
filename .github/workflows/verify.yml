@@ -151,7 +151,7 @@ jobs:
       - run: mkdir package-artifact
       - run: npm pack --pack-destination package-artifact
       - run: tar -tf package-artifact/nestarc-jobs-*.tgz
-      - run: npm publish package-artifact/nestarc-jobs-*.tgz --dry-run
+      - run: npm publish ./package-artifact/nestarc-jobs-*.tgz --dry-run
       - uses: actions/upload-artifact@v4
         with:
           name: package-tarball

@@ -96,6 +96,36 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     });
   });
 
+  it('rejects an explicit job ID that conflicts with another supplied identity', async () => {
+    const { service } = setup();
+    const explicit = await service.enqueueDetailed(
+      'report.generate',
+      { owner: 'explicit' },
+      { jobId: 'explicit-job' },
+    );
+    const idempotent = await service.enqueueDetailed(
+      'report.generate',
+      { owner: 'idempotent' },
+      { idempotencyKey: 'existing-idempotency' },
+    );
+
+    expect(explicit.jobId).not.toBe(idempotent.jobId);
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { jobId: explicit.jobId, idempotencyKey: 'existing-idempotency' },
+      ),
+    ).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { jobId: explicit.jobId, dedupe: { key: 'unused', mode: 'until_completed' } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: explicit.jobId });
+  });
+
   it('requires tenant context for tenant-scoped dedupe', async () => {
     const { service } = setup();
     await expect(
@@ -469,6 +499,53 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     ).resolves.toMatchObject({ status: 'deduped', jobId: existing.jobId });
     expect(scheduler.snapshot()).toEqual([
       expect.objectContaining({ tenantId: 'tenant_1', waiting: 1 }),
+    ]);
+  });
+
+  it('creates runnable work instead of converging replay onto a terminal job', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    const events: JobLifecycleEvent[] = [];
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      schedulers: new Map([['report.generate', scheduler]]),
+      events: { onEvent: (event) => events.push(event) },
+    });
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      {
+        idempotencyKey: 'terminal-replay-idempotency',
+        dedupe: { key: 'terminal-replay-dedupe', mode: 'until_completed', ttlMs: 10 },
+      },
+    );
+    scheduler.pickNext();
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure');
+    scheduler.onAck(originalId);
+
+    now = new Date('2026-08-16T00:00:00.020Z');
+    const terminalTarget = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      { dedupe: { key: 'terminal-replay-dedupe', mode: 'until_completed', ttlMs: 1_000 } },
+    );
+    scheduler.pickNext();
+    await backend.moveToActive('report.generate', terminalTarget.jobId);
+    await backend.ack('report.generate', terminalTarget.jobId);
+    scheduler.onAck(terminalTarget.jobId);
+
+    const replayedId = await service.replayDeadLetter(originalId);
+
+    expect(replayedId).not.toBe(terminalTarget.jobId);
+    await expect(service.getJob(replayedId)).resolves.toMatchObject({ status: 'queued' });
+    expect(scheduler.snapshot()).toEqual([
+      expect.objectContaining({ tenantId: '__default__', waiting: 1 }),
+    ]);
+    expect(events.filter((event) => event.type === 'job.replayed')).toEqual([
+      expect.objectContaining({ jobId: replayedId }),
     ]);
   });
 

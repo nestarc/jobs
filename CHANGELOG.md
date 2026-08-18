@@ -6,7 +6,7 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-16
+## [0.3.0] - 2026-08-18
 
 ### Added
 
@@ -37,6 +37,12 @@ This project is currently pre-release. The changelog below starts from the curre
 - Normalized invalid negative/non-finite backoff delays and limited strict capability validation to registered job types.
 - Normalized arbitrary non-`Error` handler rejections without leaving in-memory work active or stopping the worker loop.
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
+- Aligned `TypedJobHandler` with the decorated runtime signature `handle(payload, context)` and restricted typed job payloads to non-null objects.
+- Made explicit job IDs participate in composite identity conflict checks on both backends, and added namespace-wide BullMQ job-ID claims so IDs cannot silently collide across queues or with generated idempotency IDs.
+- Rolled back partial BullMQ identity reservations when a multi-identity bind fails, preventing stale mappings after lock lease loss.
+- Prevented dead-letter replay from converging on terminal work or registering phantom scheduler entries.
+- Preserved Buffer, typed-array, function-property, and custom-prototype isolation in lifecycle snapshots.
+- Translated queued v0.2 BullMQ `{ type, delayMs }` backoff options to the v0.3 worker strategy before retry scheduling.
 
 ### Compatibility notes
 
@@ -48,6 +54,8 @@ This project is currently pre-release. The changelog below starts from the curre
 - `BullMQBackend.getRawQueue()` now defaults to the optional-peer-safe `BullMQRawQueue` surface. Callers using additional BullMQ methods should request the full type explicitly with `getRawQueue<import('bullmq').Queue>(jobType)`.
 - BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
 - BullMQ upgrades from v0.2 require a coordinated stop-and-restart cutover; mixed v0.2/v0.3 producers or workers on the same queues are unsupported.
+- In-memory idempotency and dedupe keys are now scoped per job type and honor terminal mode/TTL release. Calls suppressed globally in v0.2 may create distinct work after upgrading.
+- Decorated typed handlers now use `handle(payload, context)`, matching the runtime invocation used by existing untyped handlers. Implementations written against the previous `handle(job)` declaration must update their method signature.
 - Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
 
 ### Documentation

@@ -33,7 +33,7 @@ jobs:
         with:
           name: package-tarball
           path: package-artifact
-      - run: npm publish package-artifact/nestarc-jobs-*.tgz --provenance --access public
+      - run: npm publish ./package-artifact/nestarc-jobs-*.tgz --provenance --access public
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

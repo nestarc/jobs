@@ -91,7 +91,19 @@ export class InMemoryBackend implements JobsBackend {
       : undefined;
     const dedupeKey = this.resolveDedupeKey(context.tenantId, opts);
     const dedupeMapKey = dedupeKey ? this.scopedIdentityKey(jobType, dedupeKey) : undefined;
-    const existingJobId = this.findExistingJobId(idempotencyMapKey, dedupeMapKey);
+    let existingJobId = this.findExistingJobId(idempotencyMapKey, dedupeMapKey);
+    if (opts.jobId) {
+      const explicitJobType = this.jobTypesById.get(opts.jobId);
+      if (explicitJobType && explicitJobType !== jobType) {
+        throw new JobsError(
+          JobsErrorCode.IdentityConflict,
+          `job ID ${opts.jobId} already belongs to ${explicitJobType}`,
+        );
+      }
+      if (this.bucketOf(jobType).has(opts.jobId)) {
+        existingJobId = this.mergeIdentityCandidates(existingJobId, opts.jobId);
+      }
+    }
     if (existingJobId) {
       this.backfillIdentityMappings(existingJobId, idempotencyMapKey, dedupeMapKey, opts.dedupe);
       return { status: 'deduped', jobId: existingJobId, existingJobId };
@@ -99,17 +111,8 @@ export class InMemoryBackend implements JobsBackend {
 
     const id = opts.jobId ?? randomUUID();
     if (opts.jobId) {
-      const existingJobType = this.jobTypesById.get(id);
-      if (existingJobType && existingJobType !== jobType) {
-        throw new JobsError(
-          JobsErrorCode.IdentityConflict,
-          `job ID ${id} already belongs to ${existingJobType}`,
-        );
-      }
-      if (this.bucketOf(jobType).has(id)) {
-        this.backfillIdentityMappings(id, idempotencyMapKey, dedupeMapKey, opts.dedupe);
-        return { status: 'deduped', jobId: id, existingJobId: id };
-      }
+      // Existing explicit IDs were resolved together with every other supplied
+      // identity above so conflicts cannot be hidden by an early dedupe return.
     }
     const enqueuedAt = this.now();
     const scheduledFor = opts.scheduledFor ?? this.resolveScheduledFor(enqueuedAt, opts);
@@ -491,7 +494,13 @@ export class InMemoryBackend implements JobsBackend {
 
   private isLiveReplayTarget(jobId: string): boolean {
     const target = this.slotById(jobId);
-    return !!target && target.state !== 'cancelled';
+    return (
+      !!target &&
+      (target.state === 'queued' ||
+        target.state === 'delayed' ||
+        target.state === 'active' ||
+        target.state === 'retrying')
+    );
   }
 
   private mergeIdentityCandidates(

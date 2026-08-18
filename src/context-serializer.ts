@@ -7,6 +7,9 @@ export function attachContext<T extends Record<string, unknown>>(
   payload: T,
   context: JobContext | undefined,
 ): T & { [CONTEXT_KEY]: JobContext } {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    throw new TypeError('job payload must be a non-null object');
+  }
   if (CONTEXT_KEY in payload) {
     throw new JobsError(
       JobsErrorCode.ReservedPayloadKey,

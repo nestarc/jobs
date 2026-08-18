@@ -121,9 +121,15 @@ export class JobsService {
         // successful side effect into an apparent failure that callers retry.
       }
     }
-    if (record) {
+    if (record && !this.isTerminal(record.status)) {
       const tenantId = (record.context as JobContext | undefined)?.tenantId ?? '__default__';
-      this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);
+      if (
+        record.status === 'queued' ||
+        record.status === 'delayed' ||
+        record.status === 'retrying'
+      ) {
+        this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);
+      }
       notifyLifecycleObserver(() =>
         this.deps.events?.onEvent?.({
           type: 'job.replayed',
@@ -159,6 +165,15 @@ export class JobsService {
     if (!this.jobTypes.has(jobType)) {
       throw new JobsError(JobsErrorCode.QueueNotFound, jobType);
     }
+  }
+
+  private isTerminal(status: JobRecord['status']): boolean {
+    return (
+      status === 'succeeded' ||
+      status === 'failed' ||
+      status === 'dead_letter' ||
+      status === 'cancelled'
+    );
   }
 
   private requireScheduler(jobType: string): Scheduler {

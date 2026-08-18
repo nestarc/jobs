@@ -15,6 +15,11 @@ describe('attachContext', () => {
     const result = attachContext({ a: 1 }, undefined);
     expect(result).toEqual({ a: 1, [CONTEXT_KEY]: {} });
   });
+
+  it('rejects primitive and array payloads at runtime', () => {
+    expect(() => attachContext('payload' as never, undefined)).toThrow(TypeError);
+    expect(() => attachContext([] as never, undefined)).toThrow(TypeError);
+  });
 });
 
 describe('detachContext', () => {

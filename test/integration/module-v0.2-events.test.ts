@@ -1,16 +1,27 @@
 import 'reflect-metadata';
 import { Injectable } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { defineJobs, job, JobHandler, JobsModule, JobsService } from '../../src';
+import {
+  defineJobs,
+  job,
+  JobHandler,
+  JobsModule,
+  JobsService,
+  type TypedJobHandler,
+} from '../../src';
 
 const jobs = defineJobs({
   'email.send': job<{ messageId: string }>().context<{ tenantId: string }>(),
 });
 
 @Injectable()
-class EmailHandler {
+class EmailHandler implements TypedJobHandler<typeof jobs, 'email.send'> {
+  static received: { messageId: string; tenantId: string } | undefined;
+
   @JobHandler('email.send')
-  async handle(): Promise<void> {}
+  async handle(payload: { messageId: string }, context: { tenantId: string }): Promise<void> {
+    EmailHandler.received = { messageId: payload.messageId, tenantId: context.tenantId };
+  }
 }
 
 let observerJobsHandled = 0;
@@ -25,6 +36,7 @@ class ObserverHandler {
 
 describe('v0.2 module options and lifecycle events', () => {
   it('accepts job contracts and emits lifecycle events', async () => {
+    EmailHandler.received = undefined;
     const events: string[] = [];
     const moduleRef = await Test.createTestingModule({
       imports: [
@@ -57,6 +69,7 @@ describe('v0.2 module options and lifecycle events', () => {
       expect(events).toEqual(
         expect.arrayContaining(['job.enqueued', 'job.started', 'job.succeeded']),
       );
+      expect(EmailHandler.received).toEqual({ messageId: 'msg_1', tenantId: 'tenant_1' });
     } finally {
       await moduleRef.close();
     }

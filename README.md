@@ -250,6 +250,7 @@ JobsModule.forInMemory({
 
 Notes:
 
+- payloads must be non-null objects; primitive and array payloads are rejected
 - payloads must not contain the reserved key `__nestarcCtx`
 - if you do not provide a context extractor, the default context is `{}`
 
@@ -259,12 +260,14 @@ Notes:
 
 ```ts
 import { Injectable } from '@nestjs/common';
-import { JobHandler } from '@nestarc/jobs';
+import { JobHandler, type TypedJobHandler } from '@nestarc/jobs';
+
+type AppJobs = typeof appJobs;
 
 @Injectable()
-export class WebhookHandler {
-  @JobHandler('deliverWebhook')
-  async handle(payload: { url: string }, ctx: { tenantId?: string }): Promise<void> {
+export class EmailHandler implements TypedJobHandler<AppJobs, 'email.send'> {
+  @JobHandler('email.send')
+  async handle(payload: { messageId: string }, ctx: { tenantId: string }): Promise<void> {
     // do work
   }
 }
@@ -295,7 +298,8 @@ Primary service methods:
 - `delayMs?: number`
 - `scheduledFor?: Date`
 - `attempts?: number`
-- `backoff?: { type: 'fixed' | 'exponential'; delayMs: number; maxDelayMs?: number; jitter?: number }`
+- `backoff?: { type: 'fixed'; delayMs: number; jitter?: number }`
+- `backoff?: { type: 'exponential'; delayMs: number; maxDelayMs?: number; jitter?: number }`
 - `timeoutMs?: number`
 - `idempotencyKey?: string`
 - `dedupe?: { key: string; scope?: 'global' | 'tenant'; ttlMs?: number; mode?: 'while_active' | 'until_completed' }`
