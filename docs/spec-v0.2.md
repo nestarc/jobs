@@ -1,8 +1,13 @@
 # @nestarc/jobs - v0.2.0 Technical Spec
 
-Status: Draft  
+Status: Historical draft (superseded; not an implementation contract)
 Source: 2026-06-20 codebase and ecosystem research  
 Target package: `@nestarc/jobs`
+
+> This document preserves the original v0.2 planning proposal. Some capability tables and API
+> sketches below were never implemented or were later changed. Do not use it as current package
+> documentation; see [spec-v0.3.md](spec-v0.3.md), [README.md](../README.md), and
+> [CHANGELOG.md](../CHANGELOG.md) for the shipped behavior.
 
 ## 1. Summary
 

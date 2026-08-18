@@ -51,6 +51,51 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     });
   });
 
+  it('preserves an existing in-memory job when an explicit job ID is reused', async () => {
+    const { backend, service } = setup();
+    const first = await service.enqueueDetailed(
+      'report.generate',
+      { generation: 'first' },
+      { jobId: 'fixed-job-id' },
+    );
+    await backend.moveToActive('report.generate', first.jobId);
+
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        { generation: 'second' },
+        { jobId: 'fixed-job-id' },
+      ),
+    ).resolves.toEqual({
+      status: 'deduped',
+      jobId: first.jobId,
+      existingJobId: first.jobId,
+    });
+    await expect(service.getJob(first.jobId)).resolves.toMatchObject({
+      status: 'active',
+      attempt: 1,
+      payload: { generation: 'first' },
+    });
+  });
+
+  it('rejects an explicit in-memory job ID already owned by another job type', async () => {
+    const backend = new InMemoryBackend();
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['type.a', 'type.b'],
+    });
+    await service.enqueueDetailed('type.a', { owner: 'a' }, { jobId: 'shared-explicit-id' });
+
+    await expect(
+      service.enqueueDetailed('type.b', { owner: 'b' }, { jobId: 'shared-explicit-id' }),
+    ).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
+    await expect(service.getJob('shared-explicit-id')).resolves.toMatchObject({
+      type: 'type.a',
+      payload: { owner: 'a' },
+    });
+  });
+
   it('requires tenant context for tenant-scoped dedupe', async () => {
     const { service } = setup();
     await expect(
@@ -125,6 +170,31 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     await expect(
       service.enqueueDetailed('report.generate', {}, untilCompleted),
     ).resolves.toMatchObject({ status: 'created' });
+  });
+
+  it('does not expose mutable terminal timestamps through job records', async () => {
+    let now = new Date('2026-08-18T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['report.generate'],
+    });
+    const options = {
+      dedupe: { key: 'immutable-terminal', mode: 'until_completed' as const, ttlMs: 1_000 },
+    };
+    const jobId = await service.enqueue('report.generate', {}, options);
+    await backend.moveToActive('report.generate', jobId);
+    await backend.ack('report.generate', jobId);
+
+    const record = await service.getJob(jobId);
+    record?.completedAt?.setTime(0);
+    now = new Date('2026-08-18T00:00:00.500Z');
+
+    await expect(service.enqueueDetailed('report.generate', {}, options)).resolves.toMatchObject({
+      status: 'deduped',
+      jobId,
+    });
   });
 
   it('scopes idempotency and dedupe identities to each job type', async () => {
@@ -400,6 +470,42 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     expect(scheduler.snapshot()).toEqual([
       expect.objectContaining({ tenantId: 'tenant_1', waiting: 1 }),
     ]);
+  });
+
+  it('preserves converged identity lineage through a later replay generation', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['report.generate'],
+    });
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      {
+        idempotencyKey: 'multi-hop-idempotency',
+        dedupe: { key: 'multi-hop-dedupe', mode: 'until_completed', ttlMs: 10 },
+      },
+    );
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure');
+
+    now = new Date('2026-08-16T00:00:00.020Z');
+    const convergedTarget = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      { dedupe: { key: 'multi-hop-dedupe', mode: 'until_completed', ttlMs: 10 } },
+    );
+    await expect(service.replayDeadLetter(originalId)).resolves.toBe(convergedTarget.jobId);
+
+    await backend.moveToActive('report.generate', convergedTarget.jobId);
+    await backend.fail('report.generate', convergedTarget.jobId, 'second failure');
+    const replayedId = await service.replayDeadLetter(convergedTarget.jobId);
+
+    await expect(
+      service.enqueueDetailed('report.generate', {}, { idempotencyKey: 'multi-hop-idempotency' }),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: replayedId });
   });
 
   it('does not restart an expired dedupe retention window when a dead letter is discarded', async () => {

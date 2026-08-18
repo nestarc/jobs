@@ -22,7 +22,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
 - Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
-- Preserved rolling-upgrade idempotency, including producers that also supply an explicit `jobId`, by adopting v0.2 jobs whose raw BullMQ ID is the producer idempotency key.
+- Preserved queued v0.2 idempotency state across a coordinated upgrade, including producers that supplied an explicit `jobId`, by adopting existing v0.2 jobs whose raw BullMQ ID is the producer idempotency key.
 - Backfilled every unused supplied identity after a deduped enqueue, retained the complete identity lineage through in-memory DLQ replay, and rejected conflicting pre-existing mappings.
 - Unified BullMQ dedupe modes under one persisted identity policy so mode or TTL changes cannot weaken an active dedupe window.
 - Encoded tenant dedupe identities as structured tuples so tenant IDs and keys containing delimiters cannot collide.
@@ -47,6 +47,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Direct calls to BullMQ manual-drain methods may still omit their legacy arguments, but every call now fails with `jobs_capability_unsupported`.
 - `BullMQBackend.getRawQueue()` now defaults to the optional-peer-safe `BullMQRawQueue` surface. Callers using additional BullMQ methods should request the full type explicitly with `getRawQueue<import('bullmq').Queue>(jobType)`.
 - BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
+- BullMQ upgrades from v0.2 require a coordinated stop-and-restart cutover; mixed v0.2/v0.3 producers or workers on the same queues are unsupported.
 - Outbox-to-jobs delivery is at-least-once with duplicate enqueue suppression; it is not an exactly-once execution guarantee.
 
 ### Documentation

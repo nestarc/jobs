@@ -486,6 +486,30 @@ describe('BullMQBackend with Redis', () => {
     ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
   });
 
+  it('does not adopt an unrelated v0.3 explicit job as legacy idempotency state', async () => {
+    const { namespace, jobType } = testIdentity('v3-explicit-idempotency-collision');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+
+    await expect(
+      jobs.enqueueDetailed(jobType, { source: 'explicit' }, { jobId: 'collision-key' }),
+    ).resolves.toMatchObject({ status: 'created', jobId: 'collision-key' });
+    await expect(
+      jobs.enqueueDetailed(
+        jobType,
+        { source: 'idempotent' },
+        { jobId: 'expected-new', idempotencyKey: 'collision-key' },
+      ),
+    ).resolves.toMatchObject({ status: 'created', jobId: 'expected-new' });
+    await expect(
+      jobs.enqueueDetailed(jobType, {}, { idempotencyKey: 'collision-key' }),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: 'expected-new' });
+    expect(
+      await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+    ).toBe(2);
+  });
+
   it('backfills composite identities and avoids tenant delimiter collisions', async () => {
     const { namespace, jobType } = testIdentity('identity-backfill');
     const instance = backend(namespace, jobType);
@@ -616,6 +640,133 @@ describe('BullMQBackend with Redis', () => {
       ).toBe(1);
     } finally {
       mutableQueue.add = originalAdd;
+    }
+  });
+
+  it('adopts an in-flight reservation when the identity lock lease is lost', async () => {
+    const { namespace, jobType } = testIdentity('lost-identity-lease');
+    const firstBackend = backend(namespace, jobType);
+    const secondBackend = backend(namespace, jobType);
+    const firstJobs = service(firstBackend, jobType);
+    const secondJobs = service(secondBackend, jobType);
+    const rawQueue = firstBackend.getRawQueue<Queue>(jobType);
+    const mutableQueue = rawQueue as unknown as {
+      add(name: string, data: unknown, options?: unknown): Promise<unknown>;
+    };
+    const originalAdd = mutableQueue.add.bind(mutableQueue);
+    let releaseFirstAdd: () => void = () => undefined;
+    const firstAddRelease = new Promise<void>((resolve) => {
+      releaseFirstAdd = resolve;
+    });
+    let markFirstAddBlocked: () => void = () => undefined;
+    const firstAddBlocked = new Promise<void>((resolve) => {
+      markFirstAddBlocked = resolve;
+    });
+    mutableQueue.add = async (name, data, options) => {
+      mutableQueue.add = originalAdd;
+      markFirstAddBlocked();
+      await firstAddRelease;
+      return await originalAdd(name, data, options);
+    };
+
+    const firstEnqueue = firstJobs.enqueueDetailed(
+      jobType,
+      { producer: 'first' },
+      { dedupe: { key: 'lost-lease', mode: 'until_completed' } },
+    );
+    try {
+      await firstAddBlocked;
+      const redis = await rawQueue.client;
+      const lockKeys = await redis.keys(`${rawQueue.toKey('nestarc:identity:dedupe:*')}:lock`);
+      expect(lockKeys).toHaveLength(1);
+      await redis.del(...lockKeys);
+
+      const second = await secondJobs.enqueueDetailed(
+        jobType,
+        { producer: 'second' },
+        { dedupe: { key: 'lost-lease', mode: 'until_completed' } },
+      );
+      releaseFirstAdd();
+      const first = await firstEnqueue;
+
+      expect([first.status, second.status].sort()).toEqual(['created', 'deduped']);
+      expect(first.jobId).toBe(second.jobId);
+      expect(
+        await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+      ).toBe(1);
+    } finally {
+      releaseFirstAdd();
+      mutableQueue.add = originalAdd;
+      await Promise.allSettled([firstEnqueue]);
+    }
+  });
+
+  it('does not overwrite a peer identity mapping when the lease is lost before reservation', async () => {
+    const { namespace, jobType } = testIdentity('lost-lease-before-reservation');
+    const firstBackend = backend(namespace, jobType);
+    const secondBackend = backend(namespace, jobType);
+    const firstJobs = service(firstBackend, jobType);
+    const secondJobs = service(secondBackend, jobType);
+    const rawQueue = firstBackend.getRawQueue<Queue>(jobType);
+    const redis = await rawQueue.client;
+    const mutableRedis = redis as unknown as {
+      set(key: string, value: string, ...args: unknown[]): Promise<unknown>;
+    };
+    const originalSet = mutableRedis.set.bind(mutableRedis);
+    let releaseReservation: () => void = () => undefined;
+    const reservationRelease = new Promise<void>((resolve) => {
+      releaseReservation = resolve;
+    });
+    let markReservationBlocked: () => void = () => undefined;
+    const reservationBlocked = new Promise<void>((resolve) => {
+      markReservationBlocked = resolve;
+    });
+    let blocked = false;
+    mutableRedis.set = async (key, value, ...args) => {
+      const isIdentityReservation =
+        key.includes('nestarc:identity:dedupe:') && args.length === 1 && args[0] === 'NX';
+      if (isIdentityReservation && !blocked) {
+        blocked = true;
+        markReservationBlocked();
+        await reservationRelease;
+      }
+      return await originalSet(key, value, ...args);
+    };
+
+    const firstEnqueue = firstJobs.enqueueDetailed(
+      jobType,
+      { producer: 'first' },
+      { dedupe: { key: 'reservation-race', mode: 'until_completed' } },
+    );
+    try {
+      await reservationBlocked;
+      const lockKeys = await redis.keys(`${rawQueue.toKey('nestarc:identity:dedupe:*')}:lock`);
+      expect(lockKeys).toHaveLength(1);
+      await redis.del(...lockKeys);
+
+      const second = await secondJobs.enqueueDetailed(
+        jobType,
+        { producer: 'second' },
+        { dedupe: { key: 'reservation-race', mode: 'until_completed' } },
+      );
+      expect(second.status).toBe('created');
+
+      releaseReservation();
+      await expect(firstEnqueue).rejects.toMatchObject({ code: 'jobs_identity_conflict' });
+      expect(
+        await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+      ).toBe(1);
+      await expect(
+        secondJobs.enqueueDetailed(
+          jobType,
+          { producer: 'third' },
+          { dedupe: { key: 'reservation-race', mode: 'until_completed' } },
+        ),
+      ).resolves.toMatchObject({ status: 'deduped', jobId: second.jobId });
+    } finally {
+      releaseReservation();
+      mutableRedis.set = originalSet;
+      await Promise.allSettled([firstEnqueue]);
     }
   });
 

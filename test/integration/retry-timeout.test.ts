@@ -75,6 +75,31 @@ describe('v0.2 retry and timeout', () => {
     expect(scheduler.snapshot()).toEqual([expect.objectContaining({ waiting: 0, inflight: 0 })]);
   });
 
+  it('handles a synchronous context runner failure without stranding active work', async () => {
+    const backend = new InMemoryBackend();
+    const registry = new HandlerRegistry();
+    registry.register('task', async () => undefined);
+    const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    const worker = new FairWorker({
+      jobType: 'task',
+      backend,
+      scheduler,
+      registry,
+      contextRunner: () => {
+        throw new Error('context setup failed');
+      },
+    });
+    const jobId = await backend.enqueue('task', {}, {});
+    scheduler.onEnqueue(jobId, '__default__');
+
+    await expect(worker.tick()).resolves.toBe(true);
+    await expect(backend.getJob(jobId)).resolves.toMatchObject({
+      status: 'dead_letter',
+      error: { message: 'context setup failed' },
+    });
+    expect(scheduler.snapshot()).toEqual([expect.objectContaining({ waiting: 0, inflight: 0 })]);
+  });
+
   it('clears retry scheduling fields when the final attempt is exhausted', async () => {
     let now = new Date('2026-08-16T00:00:00.000Z');
     const { backend, scheduler, worker } = setupWorker(
@@ -125,5 +150,38 @@ describe('v0.2 retry and timeout', () => {
       status: 'dead_letter',
       error: { reason: 'timeout' },
     });
+  });
+
+  it('snapshots the started event date before invoking lifecycle observers', async () => {
+    const backend = new InMemoryBackend();
+    const registry = new HandlerRegistry();
+    registry.register('task', async () => undefined);
+    const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    let finishStartedAt: Date | undefined;
+    let succeededDurationMs: number | undefined;
+    const worker = new FairWorker({
+      jobType: 'task',
+      backend,
+      scheduler,
+      registry,
+      contextRunner: async (_ctx, fn) => fn(),
+      onFinish: (event) => {
+        finishStartedAt = event.startedAt;
+      },
+      events: {
+        onEvent: (event) => {
+          if (event.type === 'job.started') event.at.setTime(0);
+          if (event.type === 'job.succeeded') succeededDurationMs = event.durationMs;
+        },
+      },
+    });
+    const jobId = await backend.enqueue('task', {}, {});
+    scheduler.onEnqueue(jobId, '__default__');
+
+    await worker.tick();
+
+    expect(finishStartedAt?.getTime()).not.toBe(0);
+    expect(succeededDurationMs).toBeDefined();
+    expect(succeededDurationMs!).toBeLessThan(10_000);
   });
 });

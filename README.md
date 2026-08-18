@@ -173,12 +173,25 @@ export class AppModule {}
 
 On BullMQ in `0.3.0`, jobs are delivered FIFO by BullMQ's worker. Context and metadata are persisted in Redis and restored after restart, but tenant fairness is not applied.
 
+### Upgrading BullMQ deployments from 0.2
+
+BullMQ deployments must not run `0.2.x` and `0.3.x` producers or workers against the same queues at the same time. Version 0.3 uses a new persisted envelope, generated idempotency IDs, and worker-side backoff strategy that version 0.2 does not understand.
+
+Use a coordinated upgrade:
+
+1. Stop all 0.2 producers and workers.
+2. Deploy 0.3 to every producer and worker.
+3. Resume production only after every process runs 0.3.
+
+Version 0.3 workers can consume jobs that were already queued by version 0.2, and they adopt an existing v0.2 raw idempotency job when it is present. This backward-read support does not make mixed-version rolling operation safe.
+
 ## Typed job contracts
 
-The optional TypeScript contract layer preserves existing string-based APIs. Job defaults are applied at runtime, with enqueue options taking precedence.
+The optional TypeScript contract layer preserves existing string-based APIs. Job defaults are applied at runtime, with enqueue options taking precedence. Pass the definitions through the `jobs` option of `JobsModule.forInMemory()` or `JobsModule.forBullMQ()` to enable those runtime defaults.
 
 ```ts
-import { defineJobs, InjectJobs, job, type TypedJobsService } from '@nestarc/jobs';
+import { Module } from '@nestjs/common';
+import { defineJobs, InjectJobs, job, JobsModule, type TypedJobsService } from '@nestarc/jobs';
 
 export const appJobs = defineJobs({
   'email.send': job<{ messageId: string }>()
@@ -202,6 +215,17 @@ class Mailer {
     );
   }
 }
+
+@Module({
+  imports: [
+    JobsModule.forInMemory({
+      jobs: appJobs,
+      jobTypes: Object.keys(appJobs),
+    }),
+  ],
+  providers: [Mailer],
+})
+export class MailJobsModule {}
 ```
 
 ## Context propagation
@@ -537,7 +561,7 @@ The npm trusted publisher is configured for:
 
 - [Historical v0.1 PRD](docs/prd.md)
 - [Historical v0.1 technical spec](docs/spec.md)
-- [v0.2.0 technical spec](docs/spec-v0.2.md)
+- [Historical v0.2.0 draft proposal](docs/spec-v0.2.md)
 - [v0.3.0 stabilization contract](docs/spec-v0.3.md)
 
 ## License

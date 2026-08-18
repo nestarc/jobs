@@ -112,7 +112,15 @@ export class JobsService {
       throw this.unsupported('deadLetter');
     }
     const replayedJobId = await this.deps.backend.replayDeadLetter(jobId, options);
-    const record = await this.deps.backend.getJob(replayedJobId);
+    let record: JobRecord | null = null;
+    if (this.deps.backend.capabilities().statusQuery) {
+      try {
+        record = await this.deps.backend.getJob(replayedJobId);
+      } catch {
+        // Replay is already committed. Status enrichment must not turn that
+        // successful side effect into an apparent failure that callers retry.
+      }
+    }
     if (record) {
       const tenantId = (record.context as JobContext | undefined)?.tenantId ?? '__default__';
       this.schedulers.get(record.type)?.onEnqueue(replayedJobId, tenantId);

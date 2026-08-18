@@ -49,15 +49,17 @@ export class FairWorker {
     };
     notifyLifecycleObserver(() => this.opts.onStart?.(snapshotLifecycleValue(event)));
     notifyLifecycleObserver(() =>
-      this.opts.events?.onEvent?.({
-        type: 'job.started',
-        jobId: picked.jobId,
-        jobType: this.opts.jobType,
-        tenantId: picked.tenantId,
-        attempt: envelope.attempts,
-        at: startedAt,
-        metadata: snapshotLifecycleValue(envelope.metadata),
-      }),
+      this.opts.events?.onEvent?.(
+        snapshotLifecycleValue({
+          type: 'job.started',
+          jobId: picked.jobId,
+          jobType: this.opts.jobType,
+          tenantId: picked.tenantId,
+          attempt: envelope.attempts,
+          at: startedAt,
+          metadata: envelope.metadata,
+        }),
+      ),
     );
 
     const controller = new AbortController();
@@ -68,11 +70,13 @@ export class FairWorker {
       configurable: true,
     });
     let timeout: NodeJS.Timeout | undefined;
-    const invoke = this.opts.contextRunner(executionContext, () =>
-      this.opts.registry.invoke(
-        this.opts.jobType,
-        envelope.payload as Record<string, unknown>,
-        executionContext,
+    const invoke = Promise.resolve().then(() =>
+      this.opts.contextRunner(executionContext, () =>
+        this.opts.registry.invoke(
+          this.opts.jobType,
+          envelope.payload as Record<string, unknown>,
+          executionContext,
+        ),
       ),
     );
     const work = envelope.timeoutMs

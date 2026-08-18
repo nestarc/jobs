@@ -31,13 +31,19 @@ Unsupported timeout, history, dead-letter, and manual-drain operations fail with
 - `scheduledFor` takes precedence over `delayMs`, which takes precedence over `delay`. Past times run without delay.
 - The public fixed/exponential backoff policy is evaluated by the worker, including `maxDelayMs` and symmetric bounded `jitter`.
 - Context, user metadata, schedule, idempotency key, dedupe key, and backoff policy are stored in a versioned job envelope. v0.2 envelopes remain readable.
-- Redis identity mappings scope `idempotencyKey` and dedupe keys to a job type. Generated idempotent IDs also include queue identity, so status IDs remain unique across registered queues. Explicit `jobId` values retain their public value without bypassing idempotency or `until_completed` dedupe. During an in-place upgrade, a v0.2 job whose raw ID equals the idempotency key is adopted into the mapping instead of duplicated.
+- Redis identity mappings scope `idempotencyKey` and dedupe keys to a job type. Generated idempotent IDs also include queue identity, so status IDs remain unique across registered queues. Explicit `jobId` values retain their public value without bypassing idempotency or `until_completed` dedupe. After a coordinated upgrade, a pre-existing v0.2 job whose raw ID equals the idempotency key is adopted into the mapping instead of duplicated.
 - Both dedupe modes use the same Redis identity namespace and lock. The mode and TTL stored by the current identity remain authoritative until release, even if a later producer supplies different options. `while_active` releases only on a terminal state; `ttlMs` never permits a duplicate while the original job is queued, delayed, or active. `until_completed` may create a new identity only after its stored `ttlMs` expires on a terminal record, with concurrent producers serialized by the identity mapping.
 - When any supplied identity matches an existing job, unused idempotency/dedupe identities are bound to that same job and retained through in-memory DLQ replay. If supplied identities already resolve to different jobs, enqueue fails with `jobs_identity_conflict` instead of replacing either active mapping. Tenant-scoped identity components use unambiguous structured encoding.
 - If a BullMQ add response is lost after Redis commits the job, enqueue reconciles the reserved job and token before changing identity state. An indeterminate reconciliation keeps the reservation for a later producer to verify instead of risking duplicate work.
 - A delayed retry reports its Redis due time as both `scheduledFor` and `nextAttemptAt`; the original requested schedule is restored after the job reaches a terminal state.
 - Nest 10 and 11 shutdown stop new consumption, wait for active handlers (including their follow-up enqueue calls) before feature providers are destroyed, and close workers and queues. Calling close repeatedly is safe.
 - Lifecycle observers are best-effort and receive snapshots; throwing, rejecting, or mutating callback inputs cannot change enqueue results, handler outcomes, or persisted job state. BullMQ success/failure events are emitted from the matching post-transition worker event, after result serialization and the Redis state change.
+
+## Upgrade compatibility
+
+- v0.3 workers read jobs that were persisted by v0.2.
+- Mixed v0.2/v0.3 producers or workers on the same queues are unsupported. The v0.3 envelope, generated identity IDs, and custom backoff strategy are not understood by v0.2 workers and cannot coordinate atomically with v0.2 producers.
+- Upgrades must stop all v0.2 producers and workers before starting v0.3 processes. Backward reads preserve already queued v0.2 work after that coordinated cutover; they do not provide zero-downtime rolling compatibility.
 
 ## Outbox publisher
 

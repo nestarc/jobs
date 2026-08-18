@@ -14,6 +14,7 @@ import type {
 } from '../lifecycle';
 import { computeBackoffDelayMs } from '../retry';
 import { JobsError, JobsErrorCode } from '../errors';
+import { snapshotLifecycleValue } from '../lifecycle-observer';
 
 interface Slot {
   envelope: JobEnvelope;
@@ -97,6 +98,19 @@ export class InMemoryBackend implements JobsBackend {
     }
 
     const id = opts.jobId ?? randomUUID();
+    if (opts.jobId) {
+      const existingJobType = this.jobTypesById.get(id);
+      if (existingJobType && existingJobType !== jobType) {
+        throw new JobsError(
+          JobsErrorCode.IdentityConflict,
+          `job ID ${id} already belongs to ${existingJobType}`,
+        );
+      }
+      if (this.bucketOf(jobType).has(id)) {
+        this.backfillIdentityMappings(id, idempotencyMapKey, dedupeMapKey, opts.dedupe);
+        return { status: 'deduped', jobId: id, existingJobId: id };
+      }
+    }
     const enqueuedAt = this.now();
     const scheduledFor = opts.scheduledFor ?? this.resolveScheduledFor(enqueuedAt, opts);
     const state: JobStatus =
@@ -159,7 +173,7 @@ export class InMemoryBackend implements JobsBackend {
     if (!slot) return;
     slot.state = 'succeeded';
     slot.completedAt = this.now();
-    slot.terminalAt = slot.completedAt;
+    slot.terminalAt = new Date(slot.completedAt.getTime());
     slot.failedAt = undefined;
     slot.nextAttemptAt = undefined;
     slot.envelope.scheduledFor = slot.initialScheduledFor
@@ -198,7 +212,7 @@ export class InMemoryBackend implements JobsBackend {
     }
 
     slot.state = this.opts.deadLetter?.enabled === false ? 'failed' : 'dead_letter';
-    slot.terminalAt = slot.failedAt;
+    slot.terminalAt = slot.failedAt ? new Date(slot.failedAt.getTime()) : undefined;
     slot.nextAttemptAt = undefined;
     slot.envelope.scheduledFor = slot.initialScheduledFor
       ? new Date(slot.initialScheduledFor.getTime())
@@ -423,16 +437,27 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   private rebindReplayIdentities(slot: Slot, originalJobId: string, replayJobId: string): void {
+    const replaySlot = this.slotById(replayJobId);
     for (const mapKey of slot.identityLineage.idempotencyMapKeys) {
       const mappedJobId = this.idempotency.get(mapKey);
       if (!mappedJobId || mappedJobId === originalJobId || !this.isLiveReplayTarget(mappedJobId)) {
         this.idempotency.set(mapKey, replayJobId);
+      }
+      if (this.idempotency.get(mapKey) === replayJobId) {
+        replaySlot?.identityLineage.idempotencyMapKeys.add(mapKey);
       }
     }
     for (const [mapKey, policy] of slot.identityLineage.dedupePolicies) {
       const mappedJobId = this.dedupe.get(mapKey)?.jobId;
       if (!mappedJobId || mappedJobId === originalJobId || !this.isLiveReplayTarget(mappedJobId)) {
         this.dedupe.set(mapKey, { jobId: replayJobId, ...policy });
+      }
+      const rebound = this.dedupe.get(mapKey);
+      if (rebound?.jobId === replayJobId) {
+        replaySlot?.identityLineage.dedupePolicies.set(mapKey, {
+          mode: rebound.mode,
+          ttlMs: rebound.ttlMs,
+        });
       }
     }
   }
@@ -519,7 +544,7 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   private toRecord(slot: Slot): JobRecord {
-    return {
+    return snapshotLifecycleValue({
       id: slot.envelope.id,
       type: slot.envelope.jobType,
       status: slot.state,
@@ -537,7 +562,7 @@ export class InMemoryBackend implements JobsBackend {
       idempotencyKey: slot.envelope.idempotencyKey,
       dedupeKey: slot.envelope.dedupeKey,
       metadata: slot.envelope.metadata,
-    };
+    });
   }
 
   private recordHistory(

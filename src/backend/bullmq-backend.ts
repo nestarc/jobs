@@ -29,6 +29,7 @@ const CUSTOM_BACKOFF_TYPE = 'nestarc';
 const IDENTITY_LOCK_TTL_MS = 60_000;
 const IDENTITY_LOCK_WAIT_MS = 30_000;
 const IDENTITY_LOCK_RETRY_MS = 10;
+const IDENTITY_BIND_RETRY_LIMIT = 3;
 const COMPARE_AND_DELETE_SCRIPT =
   "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 
@@ -68,10 +69,16 @@ interface IdentityMapping {
   ttlMs?: number;
 }
 
+interface IdentityResolution {
+  existingJobId?: string;
+  reservedJobId?: string;
+}
+
 interface IdentityRedisClient {
   get(key: string): Promise<string | null>;
   zscore(key: string, member: string): Promise<string | null>;
   set(key: string, value: string): Promise<unknown>;
+  set(key: string, value: string, condition: 'NX'): Promise<'OK' | null>;
   set(
     key: string,
     value: string,
@@ -196,14 +203,15 @@ export class BullMQBackend implements JobsBackend {
     }
 
     return await this.withIdentityLocks(queue, identities, async (client) => {
-      const mappedJobId = await this.findExistingIdentityJob(queue, client, identities);
+      const resolution = await this.resolveIdentityMappings(queue, client, identities);
       const idempotencyIdentity = identities.find((identity) => identity.kind === 'idempotency');
       const legacyJobId =
         idempotencyIdentity && !(await client.get(idempotencyIdentity.mapKey))
           ? await this.findLegacyIdempotencyJob(queue, opts)
           : undefined;
-      const existingJobId = this.mergeIdentityCandidates(mappedJobId, legacyJobId);
+      const existingJobId = this.mergeIdentityCandidates(resolution.existingJobId, legacyJobId);
       if (existingJobId) {
+        this.mergeIdentityCandidates(existingJobId, resolution.reservedJobId);
         await this.backfillIdentityMappings(client, identities, existingJobId);
         return {
           status: 'deduped',
@@ -212,14 +220,12 @@ export class BullMQBackend implements JobsBackend {
         };
       }
 
-      const reservedJobId = this.resolveJobId(queue, opts);
+      const reservedJobId = resolution.reservedJobId ?? this.resolveJobId(queue, opts);
       // Reserve before Queue.add so a producer crash cannot leave a job without
-      // a durable identity mapping. A later producer clears a stale reservation.
-      await Promise.all(
-        identities.map((identity) =>
-          client.set(identity.mapKey, this.serializeIdentityMapping(identity, reservedJobId)),
-        ),
-      );
+      // a durable identity mapping. If the lock lease is lost while Queue.add is
+      // pending, a later producer adopts the same reservation/job ID so BullMQ's
+      // job-ID uniqueness still prevents duplicate work.
+      await this.reserveIdentityMappings(client, identities, reservedJobId);
       try {
         const result = await addJob(reservedJobId);
         if (result.jobId !== reservedJobId) {
@@ -495,12 +501,13 @@ export class BullMQBackend implements JobsBackend {
     return identities;
   }
 
-  private async findExistingIdentityJob(
+  private async resolveIdentityMappings(
     queue: Queue,
     client: IdentityRedisClient,
     identities: PersistentIdentity[],
-  ): Promise<string | undefined> {
+  ): Promise<IdentityResolution> {
     let foundJobId: string | undefined;
+    let reservedJobId: string | undefined;
     for (const identity of identities) {
       const rawMapping = await client.get(identity.mapKey);
       if (!rawMapping) continue;
@@ -508,7 +515,7 @@ export class BullMQBackend implements JobsBackend {
 
       const existing = await queue.getJob(mapping.jobId);
       if (!existing) {
-        await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, rawMapping);
+        reservedJobId = this.mergeIdentityCandidates(reservedJobId, mapping.jobId);
         continue;
       }
       if (identity.kind === 'idempotency') {
@@ -532,7 +539,15 @@ export class BullMQBackend implements JobsBackend {
       }
       foundJobId = this.mergeIdentityCandidates(foundJobId, mapping.jobId);
     }
-    return foundJobId;
+    return { existingJobId: foundJobId, reservedJobId };
+  }
+
+  private async reserveIdentityMappings(
+    client: IdentityRedisClient,
+    identities: PersistentIdentity[],
+    reservedJobId: string,
+  ): Promise<void> {
+    await this.bindIdentityMappings(client, identities, reservedJobId);
   }
 
   private async backfillIdentityMappings(
@@ -540,12 +555,36 @@ export class BullMQBackend implements JobsBackend {
     identities: PersistentIdentity[],
     jobId: string,
   ): Promise<void> {
-    await Promise.all(
-      identities.map(async (identity) => {
-        if (await client.get(identity.mapKey)) return;
-        await client.set(identity.mapKey, this.serializeIdentityMapping(identity, jobId));
-      }),
-    );
+    await this.bindIdentityMappings(client, identities, jobId);
+  }
+
+  private async bindIdentityMappings(
+    client: IdentityRedisClient,
+    identities: PersistentIdentity[],
+    jobId: string,
+  ): Promise<void> {
+    for (const identity of identities) {
+      const value = this.serializeIdentityMapping(identity, jobId);
+      let bound = false;
+      for (let attempt = 0; attempt < IDENTITY_BIND_RETRY_LIMIT; attempt += 1) {
+        if ((await client.set(identity.mapKey, value, 'NX')) === 'OK') {
+          bound = true;
+          break;
+        }
+
+        const rawMapping = await client.get(identity.mapKey);
+        if (!rawMapping) continue;
+        const mapping = this.parseIdentityMapping(identity, rawMapping);
+        this.mergeIdentityCandidates(jobId, mapping.jobId);
+        bound = true;
+        break;
+      }
+      if (!bound) {
+        // Preserve any earlier reservation. A later producer can safely adopt
+        // it, while deleting it here could orphan work another producer added.
+        throw new Error(`identity mapping changed while binding: ${identity.mapKey}`);
+      }
+    }
   }
 
   private async findLegacyIdempotencyJob(
@@ -554,7 +593,11 @@ export class BullMQBackend implements JobsBackend {
   ): Promise<string | undefined> {
     if (!opts.idempotencyKey) return undefined;
     const legacy = await queue.getJob(opts.idempotencyKey);
-    return legacy ? String(legacy.id) : undefined;
+    if (!legacy) return undefined;
+
+    const internal = this.decode(legacy.data as Record<string, unknown>).internal;
+    if (internal && internal.idempotencyKey !== opts.idempotencyKey) return undefined;
+    return String(legacy.id);
   }
 
   private mergeIdentityCandidates(

@@ -96,4 +96,39 @@ describe('JobsService', () => {
 
     expect(() => service.setTenantWeight('doThing', 't1', 2)).toThrow('jobs_fairness_misconfig');
   });
+
+  it.each([false, true])(
+    'does not report a committed replay as failed when statusQuery=%s',
+    async (statusQuery) => {
+      class ReplayBackend extends InMemoryBackend {
+        replayed = false;
+        getJobCalls = 0;
+
+        override capabilities() {
+          return { ...super.capabilities(), statusQuery };
+        }
+
+        override async replayDeadLetter(): Promise<string> {
+          this.replayed = true;
+          return 'replayed-job';
+        }
+
+        override async getJob(): Promise<never> {
+          this.getJobCalls += 1;
+          throw new Error('status query unavailable');
+        }
+      }
+
+      const backend = new ReplayBackend();
+      const service = new JobsService({
+        backend,
+        registry: new HandlerRegistry(),
+        jobTypes: ['doThing'],
+      });
+
+      await expect(service.replayDeadLetter('dead-job')).resolves.toBe('replayed-job');
+      expect(backend.replayed).toBe(true);
+      expect(backend.getJobCalls).toBe(statusQuery ? 1 : 0);
+    },
+  );
 });
