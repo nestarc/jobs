@@ -2,7 +2,7 @@ import { attachContext } from './context-serializer';
 import { JobsError, JobsErrorCode } from './errors';
 import type { JobsBackend } from './backend/jobs-backend.interface';
 import type { HandlerRegistry } from './handler-registry';
-import type { Scheduler } from './scheduler';
+import type { Scheduler, SchedulerEnqueueTiming } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
 import { notifyLifecycleObserver, snapshotLifecycleValue } from './lifecycle-observer';
@@ -39,21 +39,21 @@ export class JobsService {
 
   async enqueue(
     jobType: string,
-    payload: Record<string, unknown>,
-    opts: EnqueueOptions = {},
+    payload: object,
+    opts: EnqueueOptions<object, object> = {},
   ): Promise<string> {
     return (await this.enqueueDetailed(jobType, payload, opts)).jobId;
   }
 
   async enqueueDetailed(
     jobType: string,
-    payload: Record<string, unknown>,
-    opts: EnqueueOptions = {},
+    payload: object,
+    opts: EnqueueOptions<object, object> = {},
   ): Promise<EnqueueResult> {
     this.assertKnownJobType(jobType);
     assertValidJobId(opts.jobId);
     const defaults = this.jobDefaults(jobType);
-    const effectiveOpts: EnqueueOptions = {
+    const effectiveOpts: EnqueueOptions<object, object> = {
       ...opts,
       attempts: opts.attempts ?? defaults.attempts,
       backoff: opts.backoff ?? defaults.backoff,
@@ -61,14 +61,21 @@ export class JobsService {
     };
     this.assertEnqueueCapabilities(effectiveOpts);
 
-    const context = effectiveOpts.context ?? this.deps.contextExtractor?.() ?? {};
-    const envelope = attachContext(payload, context);
+    const context = (effectiveOpts.context ?? this.deps.contextExtractor?.() ?? {}) as JobContext;
+    const envelope = attachContext(payload as Record<string, unknown>, context);
+    const backendOpts: EnqueueOptions = {
+      ...effectiveOpts,
+      context,
+      metadata: effectiveOpts.metadata as Record<string, unknown> | undefined,
+    };
     let enqueueNotified = false;
     const notifyEnqueued = (result: EnqueueResult): void => {
       if (enqueueNotified || result.status !== 'created') return;
       enqueueNotified = true;
       const tenantId = (context.tenantId as string | undefined) ?? '__default__';
-      this.schedulers.get(jobType)?.onEnqueue(result.jobId, tenantId);
+      this.schedulers
+        .get(jobType)
+        ?.onEnqueue(result.jobId, tenantId, this.schedulerTiming(effectiveOpts));
       notifyLifecycleObserver(() =>
         this.deps.events?.onEvent?.({
           type: 'job.enqueued',
@@ -77,20 +84,15 @@ export class JobsService {
           tenantId: context.tenantId as string | undefined,
           attempt: 0,
           at: new Date(),
-          metadata: snapshotLifecycleValue(effectiveOpts.metadata),
+          metadata: snapshotLifecycleValue(backendOpts.metadata),
         }),
       );
     };
     const result = this.deps.backend.enqueueDetailed
-      ? await this.deps.backend.enqueueDetailed(
-          jobType,
-          envelope,
-          { ...effectiveOpts, context },
-          notifyEnqueued,
-        )
+      ? await this.deps.backend.enqueueDetailed(jobType, envelope, backendOpts, notifyEnqueued)
       : {
           status: 'created' as const,
-          jobId: await this.deps.backend.enqueue(jobType, envelope, { ...effectiveOpts, context }),
+          jobId: await this.deps.backend.enqueue(jobType, envelope, backendOpts),
         };
     notifyEnqueued(result);
     return result;
@@ -100,8 +102,10 @@ export class JobsService {
     return this.deps.backend.capabilities();
   }
 
-  getJob(jobId: string): Promise<JobRecord | null> {
-    return this.deps.backend.getJob(jobId);
+  getJob<TPayload = unknown, TContext = unknown>(
+    jobId: string,
+  ): Promise<JobRecord<TPayload, TContext> | null> {
+    return this.deps.backend.getJob(jobId) as Promise<JobRecord<TPayload, TContext> | null>;
   }
 
   async getJobHistory(jobId: string): Promise<JobHistoryEntry[]> {
@@ -168,7 +172,9 @@ export class JobsService {
         record.status === 'delayed' ||
         record.status === 'retrying'
       ) {
-        this.schedulers.get(record.type)?.onEnqueue(replayedJobId, schedulerTenantId);
+        this.schedulers.get(record.type)?.onEnqueue(replayedJobId, schedulerTenantId, {
+          scheduledFor: record.nextAttemptAt ?? record.scheduledFor,
+        });
       }
       notifyLifecycleObserver(() =>
         this.deps.events?.onEvent?.({
@@ -212,7 +218,20 @@ export class JobsService {
     if (!this.deps.backend.discardDeadLetter) {
       throw this.unsupported('deadLetter');
     }
-    await this.deps.backend.discardDeadLetter(jobId, reason);
+    const record = await this.deps.backend.discardDeadLetter(jobId, reason);
+    if (!record) return;
+    const tenantId = (record.context as JobContext | undefined)?.tenantId;
+    notifyLifecycleObserver(() =>
+      this.deps.events?.onEvent?.({
+        type: 'job.discarded',
+        jobId: record.id,
+        jobType: record.type,
+        tenantId,
+        attempt: record.attempt,
+        at: new Date(),
+        metadata: snapshotLifecycleValue(record.metadata),
+      }),
+    );
   }
 
   setTenantWeight(jobType: string, tenantId: string, weight: number): void {
@@ -250,7 +269,7 @@ export class JobsService {
     return scheduler;
   }
 
-  private assertEnqueueCapabilities(opts: EnqueueOptions): void {
+  private assertEnqueueCapabilities(opts: EnqueueOptions<object, object>): void {
     const capabilities = this.deps.backend.capabilities();
     if (
       (opts.delay !== undefined || opts.delayMs !== undefined || opts.scheduledFor) &&
@@ -270,6 +289,14 @@ export class JobsService {
     if ((opts.idempotencyKey || opts.dedupe) && !capabilities.idempotency) {
       throw this.unsupported('idempotency');
     }
+  }
+
+  private schedulerTiming(
+    opts: EnqueueOptions<object, object>,
+  ): SchedulerEnqueueTiming | undefined {
+    if (opts.scheduledFor !== undefined) return { scheduledFor: opts.scheduledFor };
+    const delayMs = opts.delayMs ?? opts.delay;
+    return delayMs === undefined ? undefined : { delayMs };
   }
 
   private jobDefaults(jobType: string): JobDefaults {

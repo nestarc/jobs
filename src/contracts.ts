@@ -11,6 +11,8 @@ import type { EnqueueOptions, JobContext } from './types';
 
 export const JOBS_SERVICE = Symbol.for('@nestarc/jobs:JobsService');
 
+export type EmptyJobPayload = Record<string, never>;
+
 export type JobDefinitions = Record<string, AnyJobDefinition>;
 
 export type AnyJobDefinition =
@@ -46,7 +48,7 @@ export type JobType<TJobs extends JobDefinitions> = Extract<keyof TJobs, string>
 export type JobPayload<
   TJobs extends JobDefinitions,
   TType extends JobType<TJobs>,
-> = TJobs[TType] extends { readonly __payload?: infer TPayload } ? TPayload : never;
+> = TJobs[TType] extends { readonly __payload?: infer TPayload } ? TPayload & object : never;
 
 export type JobContextOf<
   TJobs extends JobDefinitions,
@@ -58,7 +60,7 @@ export type JobContextOf<
 type DeclaredJobContext<
   TJobs extends JobDefinitions,
   TType extends JobType<TJobs>,
-> = TJobs[TType] extends { readonly __context?: infer TContext } ? TContext : JobContext;
+> = TJobs[TType] extends { readonly __context?: infer TContext } ? TContext & object : JobContext;
 
 export type JobResult<
   TJobs extends JobDefinitions,
@@ -87,13 +89,13 @@ export interface TypedJobsService<TJobs extends JobDefinitions> {
   enqueue<TType extends JobType<TJobs>>(
     type: TType,
     payload: JobPayload<TJobs, TType>,
-    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>>,
+    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>, object>,
   ): Promise<string>;
 
   enqueueDetailed<TType extends JobType<TJobs>>(
     type: TType,
     payload: JobPayload<TJobs, TType>,
-    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>>,
+    options?: EnqueueOptions<DeclaredJobContext<TJobs, TType>, object>,
   ): Promise<EnqueueResult>;
 
   getJob<TType extends JobType<TJobs> = JobType<TJobs>>(
@@ -118,7 +120,15 @@ type NonPlainObject =
   | ArrayBufferView
   | URL;
 
-type PlainObjectArguments<T extends object> = [Extract<T, NonPlainObject>] extends [never]
+type BroadObjectMember<T extends object> = T extends unknown
+  ? keyof T extends never
+    ? T
+    : never
+  : never;
+
+type PlainObjectArguments<T extends object> = [
+  Extract<T, NonPlainObject> | BroadObjectMember<T>,
+] extends [never]
   ? []
   : [error: 'job payload and context types must be plain objects'];
 

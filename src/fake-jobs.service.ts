@@ -7,7 +7,7 @@ import type { JobContext } from './types';
 import { FakeClock } from './fake-clock';
 import type { JobDefinitions } from './contracts';
 
-export interface FakeJobsOptions extends Partial<SchedulerOptions> {
+export interface FakeJobsOptions extends Omit<Partial<SchedulerOptions>, 'clock'> {
   jobTypes: string[];
   jobs?: JobDefinitions;
   now?: Date | string | number;
@@ -30,6 +30,7 @@ export class FakeJobsService {
       defaultWeight: opts.defaultWeight ?? 1,
       minSharePct: opts.minSharePct ?? 0.1,
       tenantCap: opts.tenantCap ?? 10,
+      clock: () => this.clock.now(),
     };
     for (const jobType of opts.jobTypes) {
       const scheduler = new Scheduler(schedOpts);

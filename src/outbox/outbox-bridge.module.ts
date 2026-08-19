@@ -23,6 +23,7 @@ export class JobsOutboxBridge {
   }
 
   private async dispatch(event: OutboxEvent): Promise<void> {
+    if (!Object.prototype.hasOwnProperty.call(this.opts.map, event.type)) return;
     const jobType = this.opts.map[event.type];
     if (!jobType) return;
     const tenantId = this.opts.tenantFrom?.(event) ?? event.tenantId;

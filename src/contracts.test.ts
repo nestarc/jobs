@@ -7,6 +7,7 @@ import {
   type TypedJobHandler,
   type TypedJobsService,
 } from './contracts';
+import { JobsService } from './jobs.service';
 import { SELF_DECLARED_DEPS_METADATA } from '@nestjs/common/constants';
 
 interface SendPayload {
@@ -15,6 +16,10 @@ interface SendPayload {
 
 interface TenantContext {
   tenantId: string;
+}
+
+interface EnqueueMetadata {
+  source: string;
 }
 
 const appJobs = defineJobs({
@@ -36,12 +41,17 @@ describe('job contracts', () => {
       job<Date>();
       // @ts-expect-error functions are not serializable job payload objects
       job<() => void>();
+      // @ts-expect-error the broad empty-object type accepts primitives
+      job<NonNullable<unknown>>();
+      // @ts-expect-error broad object types admit non-plain built-ins
+      job<object>();
       // @ts-expect-error every member of a payload union must be a plain object
       job<{ value: string } | Date>();
       // @ts-expect-error job contexts must be objects
       job<SendPayload>().context<string>();
       // @ts-expect-error every member of a context union must be a plain object
       job<SendPayload>().context<TenantContext | Map<string, string>>();
+      job<Record<string, never>>();
     };
     expect(compileOnly).toEqual(expect.any(Function));
   });
@@ -77,6 +87,29 @@ describe('job contracts', () => {
         context: { tenantId: 'tenant_1' },
       },
     );
+  });
+
+  it('accepts interface-typed values through the concrete service', () => {
+    const compileOnly = (
+      service: JobsService,
+      payload: SendPayload,
+      context: TenantContext,
+      metadata: EnqueueMetadata,
+    ) => {
+      void service.enqueue('email.send', payload, { context, metadata });
+      void service.enqueueDetailed('email.send', payload, { context, metadata });
+      const typed: TypedJobsService<AppJobs> = service;
+      void typed.enqueue('email.send', payload, { context, metadata });
+
+      // @ts-expect-error concrete payloads must still be non-null objects
+      void service.enqueue('email.send', 'invalid');
+      // @ts-expect-error concrete contexts must still be non-null objects
+      void service.enqueue('email.send', payload, { context: 42 });
+      // @ts-expect-error concrete metadata must still be a non-null object
+      void service.enqueue('email.send', payload, { metadata: 'invalid' });
+    };
+
+    expect(compileOnly).toEqual(expect.any(Function));
   });
 
   it('supports typed handler instances', async () => {

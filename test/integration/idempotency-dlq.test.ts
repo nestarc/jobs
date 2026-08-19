@@ -394,6 +394,45 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     expect(await service.getJob(jobId)).toMatchObject({ status: 'cancelled' });
   });
 
+  it('emits discarded only when a dead-letter transition commits', async () => {
+    const events: JobLifecycleEvent[] = [];
+    const { backend, service } = setup(events);
+    const jobId = await service.enqueue(
+      'report.generate',
+      { reportId: 'report_1' },
+      {
+        attempts: 1,
+        context: { tenantId: 'tenant_1' },
+        metadata: { source: 'operator' },
+      },
+    );
+    const queuedId = await service.enqueue('report.generate', { reportId: 'queued' });
+    await backend.moveToActive('report.generate', jobId);
+    await backend.fail('report.generate', jobId, 'boom');
+
+    await service.discardDeadLetter(jobId, 'handled manually');
+    await service.discardDeadLetter(jobId, 'already discarded');
+    await service.discardDeadLetter(queuedId, 'not a dead letter');
+    await service.discardDeadLetter('missing', 'not found');
+
+    expect(events.filter((event) => event.type === 'job.discarded')).toEqual([
+      expect.objectContaining({
+        type: 'job.discarded',
+        jobId,
+        jobType: 'report.generate',
+        tenantId: 'tenant_1',
+        attempt: 1,
+        at: expect.any(Date),
+        metadata: { source: 'operator' },
+      }),
+    ]);
+    await expect(service.getJobHistory(jobId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: 'cancelled', reason: 'handled manually' }),
+      ]),
+    );
+  });
+
   it('isolates replay payload, context, and metadata from the cancelled source record', async () => {
     const { backend, service } = setup();
     const originalId = await service.enqueue(

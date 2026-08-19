@@ -31,6 +31,6 @@ export interface JobsBackend {
   getJobHistory(jobId: string): Promise<JobHistoryEntry[]>;
   listDeadLetters?(filter?: DeadLetterFilter): Promise<JobRecord[]>;
   replayDeadLetter?(jobId: string, options?: ReplayOptions): Promise<string>;
-  discardDeadLetter?(jobId: string, reason?: string): Promise<void>;
+  discardDeadLetter?(jobId: string, reason?: string): Promise<void | JobRecord>;
   close(): Promise<void>;
 }

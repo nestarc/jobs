@@ -33,6 +33,8 @@ const IDENTITY_LOCK_RETRY_MS = 10;
 const IDENTITY_BIND_RETRY_LIMIT = 3;
 const COMPARE_AND_DELETE_SCRIPT =
   "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+const COMPARE_AND_PEXPIRE_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end";
 const ATOMIC_BIND_IDENTITIES_SCRIPT = `
 for index, key in ipairs(KEYS) do
   if redis.call('exists', key) == 1 then
@@ -140,12 +142,18 @@ export class BullMQBackend implements JobsBackend {
   private readonly workers = new Map<string, Worker>();
   private readonly activeHandlerScope = new AsyncLocalStorage<boolean>();
   private readonly inFlightEnqueues = new Set<Promise<EnqueueResult>>();
+  private readonly inFlightIdentityCleanups = new Set<Promise<void>>();
   private readonly enqueueBarriers = new Map<string, Promise<void>>();
   private closePromise: Promise<void> | null = null;
   private closing = false;
   private closed = false;
 
-  constructor(private readonly opts: BullMQBackendOptions) {}
+  constructor(private readonly opts: BullMQBackendOptions) {
+    const namespace = opts.namespace ?? 'nestarc';
+    if (namespace.includes('.')) {
+      throw new TypeError('BullMQ namespace must not contain "."');
+    }
+  }
 
   capabilities(): BackendCapabilities {
     return {
@@ -528,6 +536,7 @@ export class BullMQBackend implements JobsBackend {
 
   private notifyCompleted(jobType: string, job: Job, consumer: BullMQConsumerOptions): void {
     const { context, internal } = this.decode(job.data as Record<string, unknown>);
+    this.scheduleTerminalDedupeCleanup(jobType, job, internal);
     const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
     const startedAt = new Date(job.processedOn ?? job.timestamp);
     const finishedAt = new Date(job.finishedOn ?? Date.now());
@@ -566,10 +575,13 @@ export class BullMQBackend implements JobsBackend {
     const startedAt = new Date(job.processedOn ?? job.timestamp);
     const finishedAt = new Date(job.finishedOn ?? Date.now());
     const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt, finishedAt };
-    const { UnrecoverableError } = loadBullMQ();
-    const unrecoverable =
-      error instanceof UnrecoverableError || error.name === 'UnrecoverableError';
-    const willRetry = !unrecoverable && job.attemptsMade < (job.opts.attempts ?? 1);
+    // BullMQ sets finishedOn before emitting `failed` only when moveToFailed
+    // actually chose the terminal path. The attempts count alone is not enough:
+    // a custom backoff can return -1 and Job.discard() can stop retries early,
+    // while an indeterminate transition can emit `failed` without finishing.
+    const terminal = typeof job.finishedOn === 'number' && Number.isFinite(job.finishedOn);
+    const willRetry = !terminal;
+    if (!willRetry) this.scheduleTerminalDedupeCleanup(jobType, job, internal);
     notifyLifecycleObserver(() =>
       consumer.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
     );
@@ -585,6 +597,62 @@ export class BullMQBackend implements JobsBackend {
         metadata: snapshotLifecycleValue(internal?.metadata),
       }),
     );
+  }
+
+  private scheduleTerminalDedupeCleanup(
+    jobType: string,
+    job: Job,
+    internal: PersistedJobMetadata | undefined,
+  ): void {
+    if (!internal?.dedupeKey) return;
+    const queue = this.queues.get(this.queueName(jobType));
+    if (!queue) return;
+
+    const cleanup = this.cleanupTerminalDedupeMapping(
+      queue,
+      jobType,
+      String(job.id),
+      internal.dedupeKey,
+    );
+    this.inFlightIdentityCleanups.add(cleanup);
+    void cleanup
+      .catch(() => undefined)
+      .finally(() => this.inFlightIdentityCleanups.delete(cleanup));
+  }
+
+  private async cleanupTerminalDedupeMapping(
+    queue: Queue,
+    jobType: string,
+    jobId: string,
+    dedupeKey: string,
+  ): Promise<void> {
+    const client = (await queue.client) as unknown as IdentityRedisClient;
+    const mapKey = this.identityMapKey(queue, 'dedupe', dedupeKey);
+    const rawMapping = await client.get(mapKey);
+    if (!rawMapping) return;
+
+    let mapping: Partial<IdentityMapping>;
+    try {
+      mapping = JSON.parse(rawMapping) as Partial<IdentityMapping>;
+    } catch {
+      // Pre-release plain-string mappings do not carry enough policy data for
+      // eager cleanup. The existing enqueue-time reconciliation remains safe.
+      return;
+    }
+    if (mapping.jobId !== jobId || (mapping.jobType && mapping.jobType !== jobType)) return;
+
+    if (mapping.mode === 'while_active') {
+      await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, mapKey, rawMapping);
+      return;
+    }
+    if (
+      mapping.mode === 'until_completed' &&
+      typeof mapping.ttlMs === 'number' &&
+      Number.isFinite(mapping.ttlMs)
+    ) {
+      const ttlMs = Math.max(0, Math.ceil(mapping.ttlMs));
+      await client.eval(COMPARE_AND_PEXPIRE_SCRIPT, 1, mapKey, rawMapping, ttlMs);
+    }
   }
 
   private resolveJobId(queue: Queue, opts: EnqueueOptions): string {
@@ -1024,6 +1092,12 @@ export class BullMQBackend implements JobsBackend {
     // cleanup cannot strand a lock until its lease expires.
     while (this.inFlightEnqueues.size > 0) {
       await Promise.allSettled([...this.inFlightEnqueues]);
+    }
+
+    // Worker terminal events schedule best-effort dedupe release/expiry. Drain
+    // those operations before their queue connections are closed.
+    while (this.inFlightIdentityCleanups.size > 0) {
+      await Promise.allSettled([...this.inFlightIdentityCleanups]);
     }
 
     // Active handlers have drained. Reject later producer work before queues

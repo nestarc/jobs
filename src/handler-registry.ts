@@ -1,10 +1,7 @@
 import { JobsError, JobsErrorCode } from './errors';
 import type { JobContext } from './types';
 
-export type HandlerFn = (
-  payload: Record<string, unknown>,
-  context: JobContext,
-) => Promise<unknown>;
+export type HandlerFn = (payload: Record<string, unknown>, context: JobContext) => Promise<unknown>;
 
 export class HandlerRegistry {
   private readonly handlers = new Map<string, HandlerFn>();

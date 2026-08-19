@@ -33,6 +33,33 @@ describe('JobsService', () => {
     expect(snap.find((s) => s.tenantId === 't1')?.waiting).toBe(1);
   });
 
+  it('isolates queued state from producer and handler input mutation', async () => {
+    const { service, scheduler, backend } = setup();
+    const payload = { nested: { value: 'payload' } };
+    const context = { tenantId: 't1', nested: { value: 'context' } };
+    const metadata = { nested: { value: 'metadata' } };
+
+    const jobId = await service.enqueue('doThing', payload, { context, metadata });
+    payload.nested.value = 'producer-mutated';
+    context.tenantId = 't2';
+    context.nested.value = 'producer-mutated';
+    metadata.nested.value = 'producer-mutated';
+
+    expect(scheduler.snapshot()).toContainEqual(
+      expect.objectContaining({ tenantId: 't1', waiting: 1 }),
+    );
+    const active = await backend.moveToActive('doThing', jobId);
+    (active?.payload as typeof payload).nested.value = 'handler-mutated';
+    active!.context.tenantId = 't3';
+    (active?.metadata as typeof metadata).nested.value = 'handler-mutated';
+
+    await expect(service.getJob(jobId)).resolves.toMatchObject({
+      payload: { nested: { value: 'payload' } },
+      context: { tenantId: 't1', nested: { value: 'context' } },
+      metadata: { nested: { value: 'metadata' } },
+    });
+  });
+
   it('setTenantWeight updates the scheduler', async () => {
     const { service, scheduler } = setup();
     service.setTenantWeight('doThing', 't1', 5);

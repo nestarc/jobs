@@ -6,7 +6,7 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-08-18
+## [0.3.0] - 2026-08-19
 
 ### Added
 
@@ -21,7 +21,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Persisted BullMQ context, metadata, scheduling, idempotency, and dedupe lineage in a versioned Redis job envelope with backward reads for v0.2 jobs.
 - Added `scheduledFor` precedence and translated package backoff policies, including capped exponential delay and jitter, through a BullMQ worker strategy.
 - Registered BullMQ queues from declared job types so status lookup and work consumption survive application/backend restart.
-- Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal TTL renewal.
+- Added Redis-backed, job-type-scoped idempotency and global/tenant dedupe with serialized created-vs-deduped results, including terminal release and TTL start from BullMQ worker events with enqueue-time reconciliation as a fallback.
 - Preserved queued v0.2 idempotency state across a coordinated upgrade, including producers that supplied an explicit `jobId`, by adopting existing v0.2 jobs whose raw BullMQ ID is the producer idempotency key.
 - Backfilled every unused supplied identity after a deduped enqueue, retained the complete identity lineage through in-memory DLQ replay, and rejected conflicting pre-existing mappings.
 - Unified BullMQ dedupe modes under one persisted identity policy so mode or TTL changes cannot weaken an active dedupe window.
@@ -30,17 +30,21 @@ This project is currently pre-release. The changelog below starts from the curre
 - Made Nest 10 and 11 application shutdown drain active BullMQ work before feature-provider teardown, permit follow-up enqueue from those active handlers, and close workers and queues idempotently.
 - Applied typed job defaults at runtime and in `FakeJobsService`, with explicit enqueue options taking precedence.
 - Fixed in-memory deduped enqueue scheduler accounting and DLQ replay context/scheduler/identity restoration, including `resetAttempts` handling.
+- Kept delayed jobs and retries outside ready weighted dispatch until their due time, preventing future work from blocking ready tenants or accruing starvation credit, and preserved due-time/enqueue ordering.
+- Corrected long-run minimum-share scheduling, zero-weight idle-capacity use, stale credits after weight changes, and empty-tenant inflight release; weights and tenant caps now require safe integers while invalid shares fail explicitly.
 - Emitted BullMQ success/failure lifecycle events only after BullMQ commits the matching terminal transition, and reported the actual delayed retry time through `scheduledFor` and `nextAttemptAt`.
 - Preserved outbox tenant lineage in both job context and metadata.
 - Isolated lifecycle observer failures so telemetry callbacks cannot reject committed enqueue operations or corrupt handler state.
-- Snapshot lifecycle callback inputs and restored terminal in-memory scheduling fields so observers and exhausted retries cannot mutate or misrepresent persisted state.
-- Normalized invalid negative/non-finite backoff delays and limited strict capability validation to registered job types.
+- Snapshot lifecycle callback inputs and in-memory queue inputs/returned envelopes, and restored terminal scheduling fields so producers, handlers, observers, and exhausted retries cannot mutate or misrepresent persisted state.
+- Normalized invalid negative/non-finite backoff delays and final non-finite exponential/jitter results while preserving a finite `maxDelayMs` cap, and limited strict capability validation to registered job types.
 - Normalized arbitrary non-`Error` handler rejections without leaving in-memory work active or stopping the worker loop.
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
 - Aligned `TypedJobHandler` with the decorated runtime signature `handle(payload, context)` and restricted typed job payloads to non-null objects.
+- Accepted ordinary interface-typed payload, context, and metadata values through both `JobsService` and `TypedJobsService`, made the concrete service structurally compatible with the typed facade, and exported `EmptyJobPayload` plus the public backend `EnqueueCommitObserver` type.
 - Made explicit job IDs participate in composite identity conflict checks on both backends, and added namespace-wide BullMQ job-ID claims so IDs cannot silently collide across queues or with generated idempotency IDs.
 - Bound composite BullMQ identity reservations in one atomic Redis script and namespace hash slot, preventing process termination or lock lease loss from leaving partial mappings while remaining Redis Cluster compatible.
 - Prevented dead-letter replay from converging on terminal work or registering phantom scheduler entries.
+- Emitted `job.discarded` only after a dead-letter discard commits; repeated, missing, and non-dead-letter discard calls remain event-free no-ops.
 - Preserved Buffer, typed-array, function-property, and custom-prototype isolation in lifecycle snapshots.
 - Translated queued v0.2 BullMQ `{ type, delayMs }` backoff options to the v0.3 worker strategy before retry scheduling.
 - Rejected empty explicit job IDs before backend or scheduler state changes.
@@ -53,7 +57,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Allowed every job-type queue to adopt a pre-existing v0.2 job that shares the same raw idempotency ID, while retaining a legacy-only global claim against explicit ID reuse.
 - Revalidated legacy BullMQ jobs after identity lock acquisition and prevented reserved dedupe IDs from turning unrelated explicit IDs into permanent aliases.
 - Made lifecycle function/accessor snapshots non-executable and preserved isolated `Error.cause` and non-enumerable diagnostics.
-- Rejected mixed plain/non-plain payload and context unions at compile time, and treated inherited object property names as unmapped outbox events.
+- Rejected mixed plain/non-plain payload and context unions at compile time, and treated inherited object property names as unmapped in both first-party and legacy outbox adapters.
 
 ### Compatibility notes
 
@@ -65,6 +69,8 @@ This project is currently pre-release. The changelog below starts from the curre
 - `BullMQBackend.getRawQueue()` now defaults to the optional-peer-safe `BullMQRawQueue` surface. Callers using additional BullMQ methods should request the full type explicitly with `getRawQueue<import('bullmq').Queue>(jobType)`.
 - BullMQ distributed tenant fairness, durable transition history, cooperative timeout, and DLQ administration remain outside the 0.3 scope.
 - BullMQ upgrades from v0.2 require a coordinated stop-and-restart cutover; mixed v0.2/v0.3 producers or workers on the same queues are unsupported.
+- BullMQ namespace values may no longer contain `.`. Dotted job types remain supported, while
+  rejecting dotted namespaces keeps the v0.2-compatible `<namespace>.<jobType>` queue name unambiguous. Existing dotted-namespace deployments must drain or migrate their queues and choose a dot-free namespace before starting 0.3 because changing the namespace changes queue names and the identity keyspace.
 - In-memory idempotency and dedupe keys are now scoped per job type and honor terminal mode/TTL release. Calls suppressed globally in v0.2 may create distinct work after upgrading.
 - Decorated typed handlers now use `handle(payload, context)`, matching the runtime invocation used by existing untyped handlers. Implementations written against the previous `handle(job)` declaration must update their method signature.
 - Typed payloads and contexts must be plain objects. Arrays, functions, built-ins such as `Date` or

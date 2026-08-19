@@ -47,7 +47,10 @@ export interface DedupeOptions {
   mode?: 'while_active' | 'until_completed';
 }
 
-export interface EnqueueOptions<TContext = JobContext> {
+export interface EnqueueOptions<
+  TContext = JobContext,
+  TMetadata extends object = Record<string, unknown>,
+> {
   jobId?: string;
   context?: TContext;
   delay?: number;
@@ -58,5 +61,5 @@ export interface EnqueueOptions<TContext = JobContext> {
   timeoutMs?: number;
   idempotencyKey?: string;
   dedupe?: DedupeOptions;
-  metadata?: Record<string, unknown>;
+  metadata?: TMetadata;
 }

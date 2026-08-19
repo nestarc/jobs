@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Injectable, Module, type OnModuleDestroy } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { Queue } from 'bullmq';
+import { Backoffs, Job, Queue } from 'bullmq';
 import {
   BullMQBackend,
   createOutboxJobsPublisher,
@@ -93,6 +93,19 @@ describe('BullMQBackend with Redis', () => {
       }),
     );
     queues.clear();
+  });
+
+  it('rejects dotted namespaces without changing dotted job-type queue names', () => {
+    const namespace = `nestarc-namespace-${randomUUID()}`;
+    const jobType = 'group.work';
+    const collidingNamespace = `${namespace}.group`;
+
+    expect(`${namespace}.${jobType}`).toBe(`${collidingNamespace}.work`);
+    const instance = backend(namespace, jobType);
+    expect(instance.getRawQueue<Queue>(jobType).name).toBe(`${namespace}.${jobType}`);
+    expect(() => new BullMQBackend({ namespace: collidingNamespace, connection })).toThrow(
+      'BullMQ namespace must not contain "."',
+    );
   });
 
   it('persists schedule, context, metadata, and registered queue discovery across restart', async () => {
@@ -787,6 +800,71 @@ describe('BullMQBackend with Redis', () => {
     }
   });
 
+  it('retains an identity reservation when a committed add cannot be reconciled immediately', async () => {
+    const { namespace, jobType } = testIdentity('indeterminate-add');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const mutableQueue = rawQueue as unknown as {
+      add(name: string, data: unknown, options?: unknown): Promise<unknown>;
+      getJob(jobId: string): Promise<unknown>;
+    };
+    const originalAdd = mutableQueue.add.bind(mutableQueue);
+    const originalGetJob = mutableQueue.getJob.bind(mutableQueue);
+    let addCommitted = false;
+    let reconciliationFailed = false;
+    mutableQueue.add = async (name, data, options) => {
+      await originalAdd(name, data, options);
+      addCommitted = true;
+      throw new Error('simulated response loss after Redis commit');
+    };
+    mutableQueue.getJob = async (jobId) => {
+      if (addCommitted && !reconciliationFailed) {
+        reconciliationFailed = true;
+        throw new Error('simulated reconciliation lookup failure');
+      }
+      return await originalGetJob(jobId);
+    };
+    const options = {
+      dedupe: { key: 'indeterminate', mode: 'until_completed' as const },
+    };
+
+    try {
+      await expect(jobs.enqueueDetailed(jobType, { sequence: 1 }, options)).rejects.toThrow(
+        'simulated response loss after Redis commit',
+      );
+      expect(reconciliationFailed).toBe(true);
+
+      const redis = (await rawQueue.client) as unknown as {
+        get(key: string): Promise<string | null>;
+        keys(pattern: string): Promise<string[]>;
+      };
+      const reservationKeys = (
+        await redis.keys(rawQueue.toKey('*nestarc:identity:dedupe:*'))
+      ).filter((key) => !key.endsWith(':lock'));
+      expect(reservationKeys).toHaveLength(1);
+      const rawReservation = await redis.get(reservationKeys[0]);
+      expect(rawReservation).not.toBeNull();
+      const reservation = JSON.parse(rawReservation!) as { jobId?: unknown };
+      expect(reservation).toEqual(expect.objectContaining({ jobId: expect.any(String) }));
+      const reservedJobId = reservation.jobId as string;
+      await expect(originalGetJob(reservedJobId)).resolves.not.toBeNull();
+
+      mutableQueue.add = originalAdd;
+      mutableQueue.getJob = originalGetJob;
+      await expect(jobs.enqueueDetailed(jobType, { sequence: 2 }, options)).resolves.toMatchObject({
+        status: 'deduped',
+        jobId: reservedJobId,
+      });
+      expect(
+        await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+      ).toBe(1);
+    } finally {
+      mutableQueue.add = originalAdd;
+      mutableQueue.getJob = originalGetJob;
+    }
+  });
+
   it('adopts an in-flight reservation when the identity lock lease is lost', async () => {
     const { namespace, jobType } = testIdentity('lost-identity-lease');
     const firstBackend = backend(namespace, jobType);
@@ -1048,6 +1126,267 @@ describe('BullMQBackend with Redis', () => {
         { dedupe: { key: 'ttl', mode: 'until_completed', ttlMs: 0 } },
       ),
     ).resolves.toMatchObject({ status: 'deduped', jobId: retained.jobId });
+  });
+
+  it('releases or expires created dedupe mappings at the terminal transition', async () => {
+    const { namespace, jobType } = testIdentity('terminal-dedupe-cleanup');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const redis = (await rawQueue.client) as unknown as {
+      get(key: string): Promise<string | null>;
+      keys(pattern: string): Promise<string[]>;
+      pttl(key: string): Promise<number>;
+    };
+    const identityPattern = rawQueue.toKey('*nestarc:identity:dedupe:*');
+    const mappingKeyFor = async (jobId: string): Promise<string | undefined> => {
+      for (const key of await redis.keys(identityPattern)) {
+        const rawMapping = await redis.get(key);
+        if (!rawMapping) continue;
+        try {
+          if ((JSON.parse(rawMapping) as { jobId?: unknown }).jobId === jobId) return key;
+        } catch {
+          continue;
+        }
+      }
+      return undefined;
+    };
+
+    const completed = await jobs.enqueueDetailed(
+      jobType,
+      { outcome: 'completed' },
+      { dedupe: { key: 'completed', mode: 'while_active' } },
+    );
+    const failed = await jobs.enqueueDetailed(
+      jobType,
+      { outcome: 'failed' },
+      { dedupe: { key: 'failed', mode: 'while_active' } },
+    );
+    const retained = await jobs.enqueueDetailed(
+      jobType,
+      { outcome: 'retained' },
+      { dedupe: { key: 'retained', mode: 'until_completed', ttlMs: 5_000 } },
+    );
+
+    await expect(mappingKeyFor(completed.jobId)).resolves.toBeDefined();
+    await expect(mappingKeyFor(failed.jobId)).resolves.toBeDefined();
+    await expect(mappingKeyFor(retained.jobId)).resolves.toBeDefined();
+
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async (payload) => {
+      if (payload.outcome === 'failed') throw new Error('terminal failure');
+      return null;
+    });
+    instance.startConsumer([jobType], consumer(registry));
+
+    await waitFor(async () => {
+      const [completedRecord, failedRecord, retainedRecord] = await Promise.all([
+        instance.getJob(completed.jobId),
+        instance.getJob(failed.jobId),
+        instance.getJob(retained.jobId),
+      ]);
+      return (
+        completedRecord?.status === 'succeeded' &&
+        failedRecord?.status === 'failed' &&
+        retainedRecord?.status === 'succeeded'
+      );
+    });
+    await waitFor(async () => {
+      const [completedKey, failedKey, retainedKey] = await Promise.all([
+        mappingKeyFor(completed.jobId),
+        mappingKeyFor(failed.jobId),
+        mappingKeyFor(retained.jobId),
+      ]);
+      if (completedKey || failedKey || !retainedKey) return false;
+      const ttlMs = await redis.pttl(retainedKey);
+      return ttlMs > 0 && ttlMs <= 5_000;
+    });
+
+    await expect(mappingKeyFor(completed.jobId)).resolves.toBeUndefined();
+    await expect(mappingKeyFor(failed.jobId)).resolves.toBeUndefined();
+    const retainedKey = await mappingKeyFor(retained.jobId);
+    expect(retainedKey).toBeDefined();
+    const ttlMs = await redis.pttl(retainedKey!);
+    expect(ttlMs).toBeGreaterThan(0);
+    expect(ttlMs).toBeLessThanOrEqual(5_000);
+  });
+
+  it('treats a custom backoff -1 result as terminal for events and dedupe cleanup', async () => {
+    const { namespace, jobType } = testIdentity('terminal-custom-backoff');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const redis = (await rawQueue.client) as unknown as {
+      get(key: string): Promise<string | null>;
+      keys(pattern: string): Promise<string[]>;
+    };
+    const identityPattern = rawQueue.toKey('*nestarc:identity:dedupe:*');
+    const mappingExistsFor = async (jobId: string): Promise<boolean> => {
+      for (const key of await redis.keys(identityPattern)) {
+        const rawMapping = await redis.get(key);
+        if (!rawMapping) continue;
+        try {
+          if ((JSON.parse(rawMapping) as { jobId?: unknown }).jobId === jobId) return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    };
+    const events: JobLifecycleEvent[] = [];
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => {
+      throw new Error('stop retrying');
+    });
+    const job = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        attempts: 3,
+        backoff: { type: 'fixed', delayMs: 100 },
+        dedupe: { key: 'custom-backoff', mode: 'while_active' },
+      },
+    );
+    await expect(mappingExistsFor(job.jobId)).resolves.toBe(true);
+    const calculate = jest.spyOn(Backoffs, 'calculate').mockReturnValue(-1);
+
+    try {
+      instance.startConsumer(
+        [jobType],
+        consumer(registry, { onEvent: (event) => events.push(event) }),
+      );
+      await waitFor(
+        async () =>
+          (await instance.getJob(job.jobId))?.status === 'failed' &&
+          events.at(-1)?.type === 'job.failed',
+      );
+      await waitFor(async () => !(await mappingExistsFor(job.jobId)));
+
+      expect(await instance.getJob(job.jobId)).toMatchObject({ status: 'failed', attempt: 1 });
+      expect(events.map((event) => event.type)).toEqual(['job.started', 'job.failed']);
+    } finally {
+      calculate.mockRestore();
+    }
+  });
+
+  it('treats a discarded failure as terminal for events and dedupe cleanup', async () => {
+    const { namespace, jobType } = testIdentity('terminal-discarded');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const redis = (await rawQueue.client) as unknown as {
+      get(key: string): Promise<string | null>;
+      keys(pattern: string): Promise<string[]>;
+    };
+    const identityPattern = rawQueue.toKey('*nestarc:identity:dedupe:*');
+    const mappingExistsFor = async (jobId: string): Promise<boolean> => {
+      for (const key of await redis.keys(identityPattern)) {
+        const rawMapping = await redis.get(key);
+        if (!rawMapping) continue;
+        try {
+          if ((JSON.parse(rawMapping) as { jobId?: unknown }).jobId === jobId) return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    };
+    const events: JobLifecycleEvent[] = [];
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => {
+      throw new Error('discard this failure');
+    });
+    const job = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        attempts: 3,
+        backoff: { type: 'fixed', delayMs: 100 },
+        dedupe: { key: 'discarded', mode: 'while_active' },
+      },
+    );
+    await expect(mappingExistsFor(job.jobId)).resolves.toBe(true);
+    const originalMoveToFailed = Job.prototype.moveToFailed;
+    const moveToFailed = jest.spyOn(Job.prototype, 'moveToFailed').mockImplementation(function <
+      E extends Error,
+    >(this: Job, error: E, token: string, fetchNext?: boolean) {
+      this.discard();
+      return originalMoveToFailed.call(this, error, token, fetchNext);
+    });
+
+    try {
+      instance.startConsumer(
+        [jobType],
+        consumer(registry, { onEvent: (event) => events.push(event) }),
+      );
+      await waitFor(
+        async () =>
+          (await instance.getJob(job.jobId))?.status === 'failed' &&
+          events.at(-1)?.type === 'job.failed',
+      );
+      await waitFor(async () => !(await mappingExistsFor(job.jobId)));
+
+      expect(await instance.getJob(job.jobId)).toMatchObject({ status: 'failed', attempt: 1 });
+      expect(events.map((event) => event.type)).toEqual(['job.started', 'job.failed']);
+    } finally {
+      moveToFailed.mockRestore();
+    }
+  });
+
+  it('preserves dedupe when a failed event has no terminal transition marker', async () => {
+    const { namespace, jobType } = testIdentity('indeterminate-failed-transition');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const redis = (await rawQueue.client) as unknown as {
+      get(key: string): Promise<string | null>;
+      keys(pattern: string): Promise<string[]>;
+    };
+    const identityPattern = rawQueue.toKey('*nestarc:identity:dedupe:*');
+    const mappingExistsFor = async (jobId: string): Promise<boolean> => {
+      for (const key of await redis.keys(identityPattern)) {
+        const rawMapping = await redis.get(key);
+        if (!rawMapping) continue;
+        try {
+          if ((JSON.parse(rawMapping) as { jobId?: unknown }).jobId === jobId) return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    };
+    const events: JobLifecycleEvent[] = [];
+    const registry = new HandlerRegistry();
+    registry.register(jobType, async () => {
+      const error = new Error('transition outcome is indeterminate');
+      error.name = 'UnrecoverableError';
+      throw error;
+    });
+    const job = await jobs.enqueueDetailed(
+      jobType,
+      {},
+      {
+        attempts: 1,
+        dedupe: { key: 'indeterminate-failed-transition', mode: 'while_active' },
+      },
+    );
+    await expect(mappingExistsFor(job.jobId)).resolves.toBe(true);
+    const moveToFailed = jest
+      .spyOn(Job.prototype, 'moveToFailed')
+      .mockImplementation(async () => undefined);
+
+    try {
+      instance.startConsumer(
+        [jobType],
+        consumer(registry, { onEvent: (event) => events.push(event) }),
+      );
+      await waitFor(async () => events.length >= 2);
+
+      expect(events.map((event) => event.type)).toEqual(['job.started', 'job.retry_scheduled']);
+      await expect(mappingExistsFor(job.jobId)).resolves.toBe(true);
+    } finally {
+      moveToFailed.mockRestore();
+    }
   });
 
   it('preserves outbox identity and lineage through Redis restart and redelivery', async () => {

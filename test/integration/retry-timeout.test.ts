@@ -4,7 +4,12 @@ function setupWorker(handler: jest.Mock, now = () => new Date()) {
   const backend = new InMemoryBackend({ now });
   const registry = new HandlerRegistry();
   registry.register('task', handler);
-  const scheduler = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+  const scheduler = new Scheduler({
+    defaultWeight: 1,
+    minSharePct: 0,
+    tenantCap: 10,
+    clock: now,
+  });
   const worker = new FairWorker({
     jobType: 'task',
     backend,
@@ -128,6 +133,43 @@ describe('v0.2 retry and timeout', () => {
       nextAttemptAt: undefined,
       scheduledFor: undefined,
     });
+  });
+
+  it('does not let a future retry block ready work from another tenant', async () => {
+    let now = new Date('2026-08-19T00:00:00.000Z');
+    let retryCalls = 0;
+    const handled: string[] = [];
+    const handler = jest.fn(async (payload: Record<string, unknown>) => {
+      const kind = payload.kind as string;
+      if (kind === 'retry' && retryCalls++ === 0) throw new Error('temporary');
+      handled.push(kind);
+    });
+    const { backend, scheduler, worker } = setupWorker(handler, () => new Date(now));
+    const moveToActive = jest.spyOn(backend, 'moveToActive');
+    const retryId = await backend.enqueue(
+      'task',
+      { kind: 'retry' },
+      { attempts: 2, backoff: { type: 'fixed', delayMs: 1_000 } },
+    );
+    scheduler.onEnqueue(retryId, 'retry-tenant');
+
+    await expect(worker.tick()).resolves.toBe(true);
+    expect(await backend.getJob(retryId)).toMatchObject({
+      status: 'delayed',
+      nextAttemptAt: new Date('2026-08-19T00:00:01.000Z'),
+    });
+
+    const readyId = await backend.enqueue('task', { kind: 'ready' }, {});
+    scheduler.onEnqueue(readyId, 'ready-tenant');
+    await expect(worker.tick()).resolves.toBe(true);
+    expect(handled).toEqual(['ready']);
+    await expect(worker.tick()).resolves.toBe(false);
+    expect(moveToActive).toHaveBeenCalledTimes(2);
+
+    now = new Date('2026-08-19T00:00:01.000Z');
+    await expect(worker.tick()).resolves.toBe(true);
+    expect(handled).toEqual(['ready', 'retry']);
+    expect(moveToActive).toHaveBeenCalledTimes(3);
   });
 
   it('passes an abort signal and fails timed out jobs', async () => {

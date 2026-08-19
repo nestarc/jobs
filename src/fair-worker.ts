@@ -33,8 +33,14 @@ export class FairWorker {
     if (!envelope) {
       this.opts.scheduler.onAck(picked.jobId);
       const record = await this.opts.backend.getJob(picked.jobId);
-      if (record?.status === 'queued' || record?.status === 'delayed') {
-        this.opts.scheduler.onEnqueue(picked.jobId, picked.tenantId);
+      if (
+        record?.status === 'queued' ||
+        record?.status === 'delayed' ||
+        record?.status === 'retrying'
+      ) {
+        this.opts.scheduler.onEnqueue(picked.jobId, picked.tenantId, {
+          scheduledFor: record.nextAttemptAt ?? record.scheduledFor,
+        });
       }
       return false;
     }
@@ -125,8 +131,14 @@ export class FairWorker {
       const reason = (error as Error & { reason?: string }).reason ?? error.message;
       const record = await this.opts.backend.fail(this.opts.jobType, picked.jobId, reason);
       this.opts.scheduler.onAck(picked.jobId);
-      if (record?.status === 'queued' || record?.status === 'delayed') {
-        this.opts.scheduler.onEnqueue(picked.jobId, picked.tenantId);
+      if (
+        record?.status === 'queued' ||
+        record?.status === 'delayed' ||
+        record?.status === 'retrying'
+      ) {
+        this.opts.scheduler.onEnqueue(picked.jobId, picked.tenantId, {
+          scheduledFor: record.nextAttemptAt ?? record.scheduledFor,
+        });
       }
       notifyLifecycleObserver(() =>
         this.opts.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
@@ -151,7 +163,9 @@ export class FairWorker {
   }
 
   private eventTypeForFailure(status: string | undefined): JobLifecycleEventType {
-    if (status === 'queued' || status === 'delayed') return 'job.retry_scheduled';
+    if (status === 'queued' || status === 'delayed' || status === 'retrying') {
+      return 'job.retry_scheduled';
+    }
     if (status === 'dead_letter') return 'job.dead_lettered';
     return 'job.failed';
   }

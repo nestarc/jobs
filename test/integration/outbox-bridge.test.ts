@@ -84,4 +84,22 @@ describe('JobsOutboxBridge', () => {
 
     expect(await fake.backend.peekWaiting('handleErasure')).toEqual([]);
   });
+
+  it('treats inherited object property names as unmapped event types', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['handleErasure'] });
+    const source = new FakeOutboxSource();
+    fake.registry.register('handleErasure', async () => null);
+
+    new JobsOutboxBridge({
+      jobs: fake.service,
+      source,
+      map: { 'data_subject.erasure_requested': 'handleErasure' },
+    });
+
+    for (const type of ['toString', 'constructor', '__proto__']) {
+      await expect(source.emit({ type, payload: {}, tenantId: 't1' })).resolves.toBeUndefined();
+    }
+
+    expect(await fake.backend.peekWaiting('handleErasure')).toEqual([]);
+  });
 });

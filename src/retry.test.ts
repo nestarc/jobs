@@ -17,6 +17,7 @@ describe('computeBackoffDelayMs', () => {
     expect(
       computeBackoffDelayMs({ type: 'exponential', delayMs: Number.NaN, maxDelayMs: 250 }, 1),
     ).toBe(0);
+    expect(computeBackoffDelayMs({ type: 'exponential', delayMs: Number.MAX_VALUE }, 2)).toBe(0);
   });
 
   it('bounds jitter to the documented symmetric range', () => {
@@ -25,6 +26,11 @@ describe('computeBackoffDelayMs', () => {
 
     expect(computeBackoffDelayMs({ type: 'fixed', delayMs: 100, jitter: 0.25 }, 1)).toBe(75);
     expect(computeBackoffDelayMs({ type: 'fixed', delayMs: 100, jitter: 0.25 }, 1)).toBe(125);
+
+    random.mockReturnValueOnce(1);
+    expect(computeBackoffDelayMs({ type: 'fixed', delayMs: Number.MAX_VALUE, jitter: 1 }, 1)).toBe(
+      0,
+    );
 
     random.mockRestore();
   });

@@ -122,6 +122,136 @@ describe('Scheduler', () => {
     expect(tiny).toBeGreaterThanOrEqual(Math.floor(20 * 0.2));
   });
 
+  it('maintains the configured minimum share over a long run', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0.1, tenantCap: 1 });
+    s.setWeight('big', 1_000);
+    s.setWeight('tiny', 0);
+    for (let i = 0; i < 1_000; i++) s.onEnqueue(`b${i}`, 'big');
+    for (let i = 0; i < 1_000; i++) s.onEnqueue(`t${i}`, 'tiny');
+
+    let tinyPicks = 0;
+    for (let i = 0; i < 1_000; i++) {
+      const picked = s.pickNext();
+      expect(picked).not.toBeNull();
+      if (picked?.tenantId === 'tiny') tinyPicks += 1;
+      s.onAck(picked!.jobId);
+    }
+
+    expect(tinyPicks).toBeGreaterThanOrEqual(100);
+  });
+
+  it('uses idle capacity for zero-weight work covered by minimum share', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0.2, tenantCap: 1 });
+    s.setWeight('tiny', 0);
+    s.onEnqueue('big', 'big');
+    s.onEnqueue('tiny', 'tiny');
+
+    const first = s.pickNext();
+    expect(first?.tenantId).toBe('big');
+    s.onAck(first!.jobId);
+
+    expect(s.pickNext()).toEqual({ jobId: 'tiny', tenantId: 'tiny' });
+  });
+
+  it('keeps future work out of WRR until it becomes due', () => {
+    let now = new Date('2026-08-19T00:00:00.000Z');
+    const s = new Scheduler({
+      defaultWeight: 1,
+      minSharePct: 0.5,
+      tenantCap: 1,
+      clock: () => new Date(now),
+    });
+    s.onEnqueue('future', 'future-tenant', { delayMs: 1_000 });
+    s.onEnqueue('future', 'duplicate-tenant');
+    s.onEnqueue('ready-1', 'ready-tenant');
+    s.onEnqueue('ready-2', 'ready-tenant');
+
+    const first = s.pickNext();
+    expect(first).toEqual({ jobId: 'ready-1', tenantId: 'ready-tenant' });
+    s.onAck(first!.jobId);
+    const second = s.pickNext();
+    expect(second).toEqual({ jobId: 'ready-2', tenantId: 'ready-tenant' });
+    s.onAck(second!.jobId);
+    expect(s.pickNext()).toBeNull();
+    expect(s.snapshot().find((shard) => shard.tenantId === 'future-tenant')).toMatchObject({
+      waiting: 1,
+      starvationTokens: 0,
+    });
+
+    now = new Date('2026-08-19T00:00:01.000Z');
+    expect(s.pickNext()).toEqual({ jobId: 'future', tenantId: 'future-tenant' });
+  });
+
+  it('preserves enqueue order for work with the same future due time', () => {
+    let now = new Date('2026-08-19T00:00:00.000Z');
+    const s = new Scheduler({
+      defaultWeight: 1,
+      minSharePct: 0,
+      tenantCap: 10,
+      clock: () => new Date(now),
+    });
+    s.onEnqueue('first', 'tenant', { delayMs: 1_000 });
+    s.onEnqueue('second', 'tenant', { delayMs: 1_000 });
+
+    now = new Date('2026-08-19T00:00:01.000Z');
+    expect(s.pickNext()?.jobId).toBe('first');
+    expect(s.pickNext()?.jobId).toBe('second');
+  });
+
+  it('promotes future work in due-time order', () => {
+    let now = new Date('2026-08-19T00:00:00.000Z');
+    const s = new Scheduler({
+      defaultWeight: 1,
+      minSharePct: 0,
+      tenantCap: 10,
+      clock: () => new Date(now),
+    });
+    s.onEnqueue('later', 'tenant', { delayMs: 2_000 });
+    s.onEnqueue('earlier', 'tenant', { delayMs: 1_000 });
+
+    now = new Date('2026-08-19T00:00:01.000Z');
+    expect(s.pickNext()?.jobId).toBe('earlier');
+    expect(s.pickNext()).toBeNull();
+
+    now = new Date('2026-08-19T00:00:02.000Z');
+    expect(s.pickNext()?.jobId).toBe('later');
+  });
+
+  it('clears stale credits when lowering a tenant weight to zero', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
+    s.setWeight('tenant', 1_000);
+    s.onEnqueue('first', 'tenant');
+    s.onEnqueue('second', 'tenant');
+    const first = s.pickNext();
+    s.onAck(first!.jobId);
+
+    s.setWeight('tenant', 0);
+
+    expect(s.pickNext()).toBeNull();
+  });
+
+  it('releases an inflight slot for the empty tenant id', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
+    s.onEnqueue('first', '');
+    s.onEnqueue('second', '');
+    const first = s.pickNext();
+    s.onAck(first!.jobId);
+
+    expect(s.pickNext()?.jobId).toBe('second');
+  });
+
+  it('treats non-finite enqueue delays and invalid dates as immediately ready', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 10 });
+    s.onEnqueue('positive-infinity', 'tenant', { delayMs: Number.POSITIVE_INFINITY });
+    s.onEnqueue('negative-infinity', 'tenant', { delayMs: Number.NEGATIVE_INFINITY });
+    s.onEnqueue('nan', 'tenant', { delayMs: Number.NaN });
+    s.onEnqueue('invalid-date', 'tenant', { scheduledFor: new Date(Number.NaN) });
+
+    expect(
+      [s.pickNext(), s.pickNext(), s.pickNext(), s.pickNext()].map((pick) => pick?.jobId),
+    ).toEqual(['positive-infinity', 'negative-infinity', 'nan', 'invalid-date']);
+  });
+
   it('rejects non-positive defaultWeight', () => {
     expect(() => new Scheduler({ defaultWeight: 0, minSharePct: 0, tenantCap: 1 })).toThrow(
       JobsError,
@@ -133,4 +263,57 @@ describe('Scheduler', () => {
       JobsError,
     );
   });
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    1.5,
+    0.5,
+    0,
+    -1,
+  ])('rejects invalid defaultWeight %p', (defaultWeight) => {
+    expect(() => new Scheduler({ defaultWeight, minSharePct: 0, tenantCap: 1 })).toThrow(JobsError);
+  });
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    1.5,
+    0.5,
+    0,
+    -1,
+  ])('rejects invalid tenantCap %p', (tenantCap) => {
+    expect(() => new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap })).toThrow(JobsError);
+  });
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    1.5,
+    0.5,
+    -1,
+  ])('rejects invalid tenant weight %p', (weight) => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
+    expect(() => s.setWeight('tenant', weight)).toThrow(JobsError);
+  });
+
+  it('allows zero as a runtime tenant weight', () => {
+    const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
+    expect(() => s.setWeight('tenant', 0)).not.toThrow();
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects non-finite minSharePct %p',
+    (minSharePct) => {
+      expect(() => new Scheduler({ defaultWeight: 1, minSharePct, tenantCap: 1 })).toThrow(
+        JobsError,
+      );
+    },
+  );
 });

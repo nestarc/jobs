@@ -55,4 +55,19 @@ describe('lifecycle snapshots', () => {
     snapshot.diagnostic.code = 'changed';
     expect((error as Error & { diagnostic: { code: string } }).diagnostic.code).toBe('E_OUTER');
   });
+
+  it('isolates typed arrays and data views', () => {
+    const bytes = new Uint16Array([10, 20]);
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint32(0, 42);
+
+    const snapshot = snapshotLifecycleValue({ bytes, view });
+    snapshot.bytes[0] = 99;
+    snapshot.view.setUint32(0, 7);
+
+    expect(snapshot.bytes).toBeInstanceOf(Uint16Array);
+    expect(snapshot.view).toBeInstanceOf(DataView);
+    expect([...bytes]).toEqual([10, 20]);
+    expect(view.getUint32(0)).toBe(42);
+  });
 });

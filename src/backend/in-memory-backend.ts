@@ -118,7 +118,9 @@ export class InMemoryBackend implements JobsBackend {
       // identity above so conflicts cannot be hidden by an early dedupe return.
     }
     const enqueuedAt = this.now();
-    const scheduledFor = opts.scheduledFor ?? this.resolveScheduledFor(enqueuedAt, opts);
+    const scheduledFor = opts.scheduledFor
+      ? new Date(opts.scheduledFor.getTime())
+      : this.resolveScheduledFor(enqueuedAt, opts);
     const state: JobStatus =
       scheduledFor && scheduledFor.getTime() > enqueuedAt.getTime() ? 'delayed' : 'queued';
 
@@ -129,15 +131,15 @@ export class InMemoryBackend implements JobsBackend {
       envelope: {
         id,
         jobType,
-        payload,
-        context,
+        payload: snapshotLifecycleValue(payload),
+        context: snapshotLifecycleValue(context),
         enqueuedAt,
         attempts: 0,
         maxAttempts: Math.max(1, opts.attempts ?? 1),
         scheduledFor,
         timeoutMs: opts.timeoutMs,
-        backoff: opts.backoff,
-        metadata: opts.metadata ?? {},
+        backoff: snapshotLifecycleValue(opts.backoff),
+        metadata: snapshotLifecycleValue(opts.metadata ?? {}),
         idempotencyKey,
         dedupeKey,
       },
@@ -161,7 +163,7 @@ export class InMemoryBackend implements JobsBackend {
   async peekWaiting(jobType: string): Promise<JobEnvelope[]> {
     return [...this.bucketOf(jobType).values()]
       .filter((slot) => this.isWaiting(slot))
-      .map((slot) => ({ ...slot.envelope }));
+      .map((slot) => snapshotLifecycleValue(slot.envelope));
   }
 
   async moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null> {
@@ -173,7 +175,7 @@ export class InMemoryBackend implements JobsBackend {
     slot.startedAt = this.now();
     slot.nextAttemptAt = undefined;
     this.recordHistory(jobId, 'active', slot.envelope.attempts);
-    return { ...slot.envelope };
+    return snapshotLifecycleValue(slot.envelope);
   }
 
   async ack(jobType: string, jobId: string): Promise<JobRecord | void> {
@@ -325,7 +327,7 @@ export class InMemoryBackend implements JobsBackend {
     return newJobId;
   }
 
-  async discardDeadLetter(jobId: string, reason = 'discarded'): Promise<void> {
+  async discardDeadLetter(jobId: string, reason = 'discarded'): Promise<void | JobRecord> {
     const slot = this.slotById(jobId);
     if (!slot || slot.state !== 'dead_letter') return;
     slot.state = 'cancelled';
@@ -335,6 +337,7 @@ export class InMemoryBackend implements JobsBackend {
       ? new Date(slot.initialScheduledFor.getTime())
       : undefined;
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
+    return this.toRecord(slot);
   }
 
   async close(): Promise<void> {
