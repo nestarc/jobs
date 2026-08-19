@@ -118,9 +118,9 @@ type NonPlainObject =
   | ArrayBufferView
   | URL;
 
-type PlainObjectArguments<T extends object> = T extends NonPlainObject
-  ? [error: 'job payload and context types must be plain objects']
-  : [];
+type PlainObjectArguments<T extends object> = [Extract<T, NonPlainObject>] extends [never]
+  ? []
+  : [error: 'job payload and context types must be plain objects'];
 
 export function job<TPayload extends object>(
   ..._invalid: PlainObjectArguments<TPayload>

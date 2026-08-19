@@ -16,13 +16,7 @@ export function snapshotLifecycleValue<T>(value: T): T {
 }
 
 export function snapshotLifecycleError(error: Error): Error {
-  const snapshot = snapshotLifecycleValue(error);
-  if (snapshot instanceof Error) return snapshot;
-
-  const copy = new Error(error.message);
-  copy.name = error.name;
-  copy.stack = error.stack;
-  return Object.assign(copy, snapshot);
+  return cloneLifecycleValue(error, new WeakMap<object, unknown>());
 }
 
 function cloneLifecycleValue<T>(value: T, seen: WeakMap<object, unknown>): T {
@@ -33,13 +27,25 @@ function cloneLifecycleValue<T>(value: T, seen: WeakMap<object, unknown>): T {
   const cached = seen.get(value);
   if (cached) return cached as T;
 
+  if (value instanceof Error) {
+    const copy = new Error(value.message);
+    seen.set(value, copy);
+    copyOwnProperties(value, copy, seen);
+    copy.name = value.name;
+    return copy as T;
+  }
+
   if (typeof value === 'function') {
-    const original = value as unknown as (...args: unknown[]) => unknown;
-    const copy = function (this: unknown, ...args: unknown[]) {
-      return Reflect.apply(original, this, args);
+    const copy = function () {
+      throw new TypeError('lifecycle snapshot functions are not executable');
     };
     seen.set(value, copy);
-    copyOwnProperties(value, copy, seen, new Set(['length', 'name', 'arguments', 'caller']));
+    copyOwnProperties(
+      value,
+      copy,
+      seen,
+      new Set(['length', 'name', 'arguments', 'caller', 'prototype']),
+    );
     return copy as T;
   }
 
@@ -109,7 +115,12 @@ function copyOwnProperties(
     if (skipped.has(key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(source, key);
     if (!descriptor) continue;
-    if ('value' in descriptor) descriptor.value = cloneLifecycleValue(descriptor.value, seen);
+    if ('value' in descriptor) {
+      descriptor.value = cloneLifecycleValue(descriptor.value, seen);
+    } else {
+      if (descriptor.get) descriptor.get = () => undefined;
+      if (descriptor.set) descriptor.set = () => undefined;
+    }
     Object.defineProperty(target, key, descriptor);
   }
 }

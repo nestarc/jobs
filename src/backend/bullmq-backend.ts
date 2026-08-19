@@ -33,6 +33,17 @@ const IDENTITY_LOCK_RETRY_MS = 10;
 const IDENTITY_BIND_RETRY_LIMIT = 3;
 const COMPARE_AND_DELETE_SCRIPT =
   "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+const ATOMIC_BIND_IDENTITIES_SCRIPT = `
+for index, key in ipairs(KEYS) do
+  if redis.call('exists', key) == 1 then
+    return 0
+  end
+end
+for index, key in ipairs(KEYS) do
+  redis.call('set', key, ARGV[index])
+end
+return 1
+`;
 
 type BullMQModule = typeof import('bullmq');
 
@@ -70,6 +81,7 @@ type PersistentIdentity =
       mapKey: string;
       jobType: string;
       claim: string;
+      sharedAcrossJobTypes?: boolean;
     };
 
 interface IdentityMapping {
@@ -246,7 +258,7 @@ export class BullMQBackend implements JobsBackend {
     const proposedJobId = this.resolveJobId(queue, opts);
     if (opts.jobId) await this.assertNoKnownCrossQueueJob(queue, opts.jobId);
     const legacyJobId = await this.findLegacyIdempotencyJob(queue, opts);
-    const identities = this.persistentIdentities(
+    const lockIdentities = this.persistentIdentities(
       queue,
       jobType,
       opts,
@@ -263,15 +275,26 @@ export class BullMQBackend implements JobsBackend {
     try {
       const result = await this.withIdentityLocks<EnqueueResult>(
         queue,
-        identities,
+        lockIdentities,
         async (client) => {
+          const confirmedLegacyJobId = legacyJobId
+            ? await this.findLegacyIdempotencyJob(queue, opts)
+            : undefined;
+          const identities = this.persistentIdentities(
+            queue,
+            jobType,
+            opts,
+            dedupeKey,
+            proposedJobId,
+            confirmedLegacyJobId,
+          );
           const resolution = await this.resolveIdentityMappings(queue, client, identities);
           const idempotencyIdentity = identities.find(
             (identity) => identity.kind === 'idempotency',
           );
           const adoptedLegacyJobId =
             idempotencyIdentity && !(await client.get(idempotencyIdentity.mapKey))
-              ? legacyJobId
+              ? confirmedLegacyJobId
               : undefined;
           const explicitJobId =
             opts.jobId && (await queue.getJob(opts.jobId)) ? opts.jobId : undefined;
@@ -299,12 +322,17 @@ export class BullMQBackend implements JobsBackend {
           // a durable identity mapping. If the lock lease is lost while Queue.add is
           // pending, a later producer adopts the same reservation/job ID so BullMQ's
           // job-ID uniqueness still prevents duplicate work.
-          await this.reserveIdentityMappings(client, identities, reservedJobId);
+          const reservationIdentities = identities.filter(
+            (identity) =>
+              identity.kind !== 'jobId' ||
+              identity.mapKey === this.globalJobIdMapKey(reservedJobId),
+          );
+          await this.reserveIdentityMappings(client, reservationIdentities, reservedJobId);
           try {
             const result = await addJob(reservedJobId);
             if (result.jobId !== reservedJobId) {
               await Promise.all(
-                identities.map((identity) =>
+                reservationIdentities.map((identity) =>
                   client.set(
                     identity.mapKey,
                     this.serializeIdentityMapping(identity, result.jobId),
@@ -328,7 +356,7 @@ export class BullMQBackend implements JobsBackend {
               }
 
               await Promise.allSettled(
-                identities.map((identity) =>
+                reservationIdentities.map((identity) =>
                   client.eval(
                     COMPARE_AND_DELETE_SCRIPT,
                     1,
@@ -632,7 +660,8 @@ export class BullMQBackend implements JobsBackend {
         kind: 'jobId',
         mapKey: this.globalJobIdMapKey(legacyJobId),
         jobType,
-        claim: `legacy-idempotency:${this.hash(`${queue.name}\u0000${opts.idempotencyKey}`)}`,
+        claim: `legacy-idempotency:${this.hash(opts.idempotencyKey)}`,
+        sharedAcrossJobTypes: true,
       });
     }
     if (opts.idempotencyKey) {
@@ -751,51 +780,54 @@ export class BullMQBackend implements JobsBackend {
     identities: PersistentIdentity[],
     jobId: string,
   ): Promise<void> {
-    const newlyBound: Array<{ identity: PersistentIdentity; value: string }> = [];
-    try {
+    if (identities.length === 0) return;
+
+    for (let attempt = 0; attempt < IDENTITY_BIND_RETRY_LIMIT; attempt += 1) {
+      const missing: Array<{ identity: PersistentIdentity; value: string }> = [];
       for (const identity of identities) {
         const value = this.serializeIdentityMapping(identity, jobId);
-        let bound = false;
-        for (let attempt = 0; attempt < IDENTITY_BIND_RETRY_LIMIT; attempt += 1) {
-          if ((await client.set(identity.mapKey, value, 'NX')) === 'OK') {
-            newlyBound.push({ identity, value });
-            bound = true;
-            break;
-          }
-
-          const rawMapping = await client.get(identity.mapKey);
-          if (!rawMapping) continue;
-          const mapping = this.parseIdentityMapping(identity, rawMapping);
-          if (identity.kind === 'jobId') {
-            if (mapping.claim && mapping.claim !== identity.claim) {
-              throw new JobsError(
-                JobsErrorCode.IdentityConflict,
-                `job ID ${jobId} is already claimed by a different identity`,
-              );
-            }
-            if (mapping.jobType && mapping.jobType !== identity.jobType) {
-              throw new JobsError(
-                JobsErrorCode.IdentityConflict,
-                `job ID ${jobId} already belongs to ${mapping.jobType}`,
-              );
-            }
-          }
-          this.mergeIdentityCandidates(jobId, mapping.jobId);
-          bound = true;
-          break;
+        const rawMapping = await client.get(identity.mapKey);
+        if (!rawMapping) {
+          missing.push({ identity, value });
+          continue;
         }
-        if (!bound) {
-          throw new Error(`identity mapping changed while binding: ${identity.mapKey}`);
-        }
+        this.assertCompatibleIdentityMapping(identity, rawMapping, jobId);
       }
-    } catch (error) {
-      await Promise.allSettled(
-        newlyBound.map(({ identity, value }) =>
-          client.eval(COMPARE_AND_DELETE_SCRIPT, 1, identity.mapKey, value),
-        ),
+      if (missing.length === 0) return;
+
+      const bound = await client.eval(
+        ATOMIC_BIND_IDENTITIES_SCRIPT,
+        missing.length,
+        ...missing.map(({ identity }) => identity.mapKey),
+        ...missing.map(({ value }) => value),
       );
-      throw error;
+      if (Number(bound) === 1) return;
     }
+
+    throw new Error('identity mappings changed while binding');
+  }
+
+  private assertCompatibleIdentityMapping(
+    identity: PersistentIdentity,
+    rawMapping: string,
+    jobId: string,
+  ): void {
+    const mapping = this.parseIdentityMapping(identity, rawMapping);
+    if (identity.kind === 'jobId') {
+      if (mapping.claim && mapping.claim !== identity.claim) {
+        throw new JobsError(
+          JobsErrorCode.IdentityConflict,
+          `job ID ${jobId} is already claimed by a different identity`,
+        );
+      }
+      if (mapping.jobType && mapping.jobType !== identity.jobType) {
+        throw new JobsError(
+          JobsErrorCode.IdentityConflict,
+          `job ID ${jobId} already belongs to ${mapping.jobType}`,
+        );
+      }
+    }
+    this.mergeIdentityCandidates(jobId, mapping.jobId);
   }
 
   private async findLegacyIdempotencyJob(
@@ -875,12 +907,17 @@ export class BullMQBackend implements JobsBackend {
   }
 
   private identityMapKey(queue: Queue, kind: PersistentIdentity['kind'], value: string): string {
-    return queue.toKey(`nestarc:identity:${kind}:${this.hash(value)}`);
+    return queue.toKey(`${this.identityHashTag()}:nestarc:identity:${kind}:${this.hash(value)}`);
   }
 
   private globalJobIdMapKey(jobId: string): string {
     const namespace = this.opts.namespace ?? 'nestarc';
-    return `bull:${namespace}:nestarc:identity:jobId:${this.hash(jobId)}`;
+    return `bull:${namespace}:${this.identityHashTag()}:nestarc:identity:jobId:${this.hash(jobId)}`;
+  }
+
+  private identityHashTag(): string {
+    const namespace = this.opts.namespace ?? 'nestarc';
+    return `{nestarc-jobs:${this.hash(namespace)}}`;
   }
 
   private serializeIdentityMapping(identity: PersistentIdentity, jobId: string): string {
@@ -888,7 +925,11 @@ export class BullMQBackend implements JobsBackend {
       identity.kind === 'dedupe'
         ? { jobId, jobType: identity.jobType, mode: identity.mode, ttlMs: identity.ttlMs }
         : identity.kind === 'jobId'
-          ? { jobId, jobType: identity.jobType, claim: identity.claim }
+          ? {
+              jobId,
+              jobType: identity.sharedAcrossJobTypes ? undefined : identity.jobType,
+              claim: identity.claim,
+            }
           : { jobId, jobType: identity.jobType };
     return JSON.stringify(mapping);
   }

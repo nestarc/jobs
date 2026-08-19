@@ -36,8 +36,12 @@ describe('job contracts', () => {
       job<Date>();
       // @ts-expect-error functions are not serializable job payload objects
       job<() => void>();
+      // @ts-expect-error every member of a payload union must be a plain object
+      job<{ value: string } | Date>();
       // @ts-expect-error job contexts must be objects
       job<SendPayload>().context<string>();
+      // @ts-expect-error every member of a context union must be a plain object
+      job<SendPayload>().context<TenantContext | Map<string, string>>();
     };
     expect(compileOnly).toEqual(expect.any(Function));
   });

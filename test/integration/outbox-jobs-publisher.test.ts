@@ -121,6 +121,20 @@ describe('createOutboxJobsPublisher', () => {
     expect(await fake.backend.peekWaiting('invoice.process')).toEqual([]);
   });
 
+  it('treats inherited object property names as unmapped events', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    const Publisher = createOutboxJobsPublisher({
+      map: { 'invoice.issued': 'invoice.process' },
+      unmapped: 'ignore',
+    });
+    const publisher = new Publisher(fake.service);
+
+    for (const eventType of ['toString', 'constructor', '__proto__']) {
+      await expect(publisher.publish({ ...record, eventType })).resolves.toBeUndefined();
+    }
+    expect(await fake.backend.peekWaiting('invoice.process')).toEqual([]);
+  });
+
   it('allows an explicit system mapping while keeping identity fields invariant', async () => {
     const fake = new FakeJobsService({ jobTypes: ['system.reindex'] });
     const Publisher = createOutboxJobsPublisher({

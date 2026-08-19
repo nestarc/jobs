@@ -39,7 +39,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Updated peer support to NestJS 10/11, Node 20/22/24, and BullMQ 5.74.1 or newer within major 5.
 - Aligned `TypedJobHandler` with the decorated runtime signature `handle(payload, context)` and restricted typed job payloads to non-null objects.
 - Made explicit job IDs participate in composite identity conflict checks on both backends, and added namespace-wide BullMQ job-ID claims so IDs cannot silently collide across queues or with generated idempotency IDs.
-- Rolled back partial BullMQ identity reservations when a multi-identity bind fails, preventing stale mappings after lock lease loss.
+- Bound composite BullMQ identity reservations in one atomic Redis script and namespace hash slot, preventing process termination or lock lease loss from leaving partial mappings while remaining Redis Cluster compatible.
 - Prevented dead-letter replay from converging on terminal work or registering phantom scheduler entries.
 - Preserved Buffer, typed-array, function-property, and custom-prototype isolation in lifecycle snapshots.
 - Translated queued v0.2 BullMQ `{ type, delayMs }` backoff options to the v0.3 worker strategy before retry scheduling.
@@ -49,6 +49,11 @@ This project is currently pre-release. The changelog below starts from the curre
 - Drained producer enqueue operations before BullMQ queue connections close and ordered same-process
   enqueue lifecycle callbacks before worker start callbacks.
 - Isolated in-memory replay payload, context, and metadata from the cancelled source record.
+- Preserved the current terminal dedupe policy when DLQ replay replaces its mapping, so replay cannot shorten an unexpired `until_completed` window.
+- Allowed every job-type queue to adopt a pre-existing v0.2 job that shares the same raw idempotency ID, while retaining a legacy-only global claim against explicit ID reuse.
+- Revalidated legacy BullMQ jobs after identity lock acquisition and prevented reserved dedupe IDs from turning unrelated explicit IDs into permanent aliases.
+- Made lifecycle function/accessor snapshots non-executable and preserved isolated `Error.cause` and non-enumerable diagnostics.
+- Rejected mixed plain/non-plain payload and context unions at compile time, and treated inherited object property names as unmapped outbox events.
 
 ### Compatibility notes
 

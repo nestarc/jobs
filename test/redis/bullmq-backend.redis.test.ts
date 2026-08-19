@@ -517,6 +517,76 @@ describe('BullMQBackend with Redis', () => {
     ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
   });
 
+  it('adopts the same v0.2 idempotency key independently across job type queues', async () => {
+    const namespace = `nestarc-legacy-multi-type-${randomUUID()}`;
+    const firstType = 'type.a';
+    const secondType = 'type.b';
+    const first = backend(namespace, firstType);
+    const second = backend(namespace, secondType);
+    const firstQueue = first.getRawQueue<Queue>(firstType);
+    const secondQueue = second.getRawQueue<Queue>(secondType);
+    const legacyIdempotencyKey = 'shared-v0.2-business-key';
+    await firstQueue.add(firstType, { source: 'v0.2-a' }, { jobId: legacyIdempotencyKey });
+    await secondQueue.add(secondType, { source: 'v0.2-b' }, { jobId: legacyIdempotencyKey });
+
+    await expect(
+      service(first, firstType).enqueueDetailed(
+        firstType,
+        { source: 'v0.3-a' },
+        { idempotencyKey: legacyIdempotencyKey },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
+    await expect(
+      service(second, secondType).enqueueDetailed(
+        secondType,
+        { source: 'v0.3-b' },
+        { idempotencyKey: legacyIdempotencyKey },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: legacyIdempotencyKey });
+    await expect(firstQueue.getJob(legacyIdempotencyKey)).resolves.toMatchObject({
+      data: { source: 'v0.2-a' },
+    });
+    await expect(secondQueue.getJob(legacyIdempotencyKey)).resolves.toMatchObject({
+      data: { source: 'v0.2-b' },
+    });
+  });
+
+  it('revalidates a v0.2 idempotency job after acquiring identity locks', async () => {
+    const { namespace, jobType } = testIdentity('legacy-idempotency-removal-race');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const rawQueue = instance.getRawQueue<Queue>(jobType);
+    const legacyIdempotencyKey = 'removed-v0.2-business-key';
+    await rawQueue.add(jobType, { source: 'v0.2' }, { jobId: legacyIdempotencyKey });
+    const mutableQueue = rawQueue as unknown as {
+      getJob(jobId: string): Promise<Awaited<ReturnType<Queue['getJob']>>>;
+    };
+    const originalGetJob = mutableQueue.getJob.bind(mutableQueue);
+    let removed = false;
+    mutableQueue.getJob = async (jobId) => {
+      const job = await originalGetJob(jobId);
+      if (jobId === legacyIdempotencyKey && job && !removed) {
+        removed = true;
+        await job.remove();
+      }
+      return job;
+    };
+
+    try {
+      await expect(
+        jobs.enqueueDetailed(
+          jobType,
+          { source: 'v0.3' },
+          { jobId: 'replacement-id', idempotencyKey: legacyIdempotencyKey },
+        ),
+      ).resolves.toMatchObject({ status: 'created', jobId: 'replacement-id' });
+      expect(await originalGetJob(legacyIdempotencyKey)).toBeUndefined();
+      expect(await originalGetJob('replacement-id')).toBeDefined();
+    } finally {
+      mutableQueue.getJob = originalGetJob;
+    }
+  });
+
   it('claims an adopted v0.2 job ID across every queue in the namespace', async () => {
     const namespace = `nestarc-legacy-global-${randomUUID()}`;
     const legacyType = 'type.a';
@@ -754,14 +824,17 @@ describe('BullMQBackend with Redis', () => {
         keys(pattern: string): Promise<string[]>;
         del(...keys: string[]): Promise<number>;
       };
-      const lockKeys = await redis.keys(`${rawQueue.toKey('nestarc:identity:dedupe:*')}:lock`);
+      const lockKeys = await redis.keys(`${rawQueue.toKey('*nestarc:identity:dedupe:*')}:lock`);
       expect(lockKeys).toHaveLength(1);
       await redis.del(...lockKeys);
 
       const second = await secondJobs.enqueueDetailed(
         jobType,
         { producer: 'second' },
-        { dedupe: { key: 'lost-lease', mode: 'until_completed' } },
+        {
+          jobId: 'reservation-recovery-id',
+          dedupe: { key: 'lost-lease', mode: 'until_completed' },
+        },
       );
       releaseFirstAdd();
       const first = await firstEnqueue;
@@ -771,6 +844,16 @@ describe('BullMQBackend with Redis', () => {
       expect(
         await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
       ).toBe(1);
+      await expect(
+        secondJobs.enqueueDetailed(
+          jobType,
+          { producer: 'explicit-only' },
+          { jobId: 'reservation-recovery-id' },
+        ),
+      ).resolves.toMatchObject({ status: 'created', jobId: 'reservation-recovery-id' });
+      expect(
+        await rawQueue.getJobCountByTypes('waiting', 'delayed', 'active', 'completed', 'failed'),
+      ).toBe(2);
     } finally {
       releaseFirstAdd();
       mutableQueue.add = originalAdd;
@@ -790,9 +873,9 @@ describe('BullMQBackend with Redis', () => {
       del(...keys: string[]): Promise<number>;
     };
     const mutableRedis = redis as unknown as {
-      set(key: string, value: string, ...args: unknown[]): Promise<unknown>;
+      eval(script: string, numberOfKeys: number, ...args: unknown[]): Promise<unknown>;
     };
-    const originalSet = mutableRedis.set.bind(mutableRedis);
+    const originalEval = mutableRedis.eval.bind(mutableRedis);
     let releaseReservation: () => void = () => undefined;
     const reservationRelease = new Promise<void>((resolve) => {
       releaseReservation = resolve;
@@ -802,15 +885,14 @@ describe('BullMQBackend with Redis', () => {
       markReservationBlocked = resolve;
     });
     let blocked = false;
-    mutableRedis.set = async (key, value, ...args) => {
-      const isIdentityReservation =
-        key.includes('nestarc:identity:dedupe:') && args.length === 1 && args[0] === 'NX';
+    mutableRedis.eval = async (script, numberOfKeys, ...args) => {
+      const isIdentityReservation = script.includes("redis.call('exists', key)");
       if (isIdentityReservation && !blocked) {
         blocked = true;
         markReservationBlocked();
         await reservationRelease;
       }
-      return await originalSet(key, value, ...args);
+      return await originalEval(script, numberOfKeys, ...args);
     };
 
     const firstEnqueue = firstJobs.enqueueDetailed(
@@ -820,7 +902,7 @@ describe('BullMQBackend with Redis', () => {
     );
     try {
       await reservationBlocked;
-      const lockKeys = await redis.keys(`${rawQueue.toKey('nestarc:identity:dedupe:*')}:lock`);
+      const lockKeys = await redis.keys(`${rawQueue.toKey('*nestarc:identity:dedupe:*')}:lock`);
       expect(lockKeys).toHaveLength(1);
       await redis.del(...lockKeys);
 
@@ -845,12 +927,12 @@ describe('BullMQBackend with Redis', () => {
       ).resolves.toMatchObject({ status: 'deduped', jobId: second.jobId });
     } finally {
       releaseReservation();
-      mutableRedis.set = originalSet;
+      mutableRedis.eval = originalEval;
       await Promise.allSettled([firstEnqueue]);
     }
   });
 
-  it('rolls back partial composite reservations after identity lock lease loss', async () => {
+  it('binds composite reservations atomically after identity lock lease loss', async () => {
     const { namespace, jobType } = testIdentity('partial-reservation-rollback');
     const firstBackend = backend(namespace, jobType);
     const secondBackend = backend(namespace, jobType);
@@ -860,9 +942,9 @@ describe('BullMQBackend with Redis', () => {
     const redis = (await rawQueue.client) as unknown as {
       keys(pattern: string): Promise<string[]>;
       del(...keys: string[]): Promise<number>;
-      set(key: string, value: string, ...args: unknown[]): Promise<unknown>;
+      eval(script: string, numberOfKeys: number, ...args: unknown[]): Promise<unknown>;
     };
-    const originalSet = redis.set.bind(redis);
+    const originalEval = redis.eval.bind(redis);
     let releaseDedupeReservation: () => void = () => undefined;
     const dedupeReservationRelease = new Promise<void>((resolve) => {
       releaseDedupeReservation = resolve;
@@ -872,15 +954,15 @@ describe('BullMQBackend with Redis', () => {
       markDedupeReservationBlocked = resolve;
     });
     let blocked = false;
-    redis.set = async (key, value, ...args) => {
-      const isDedupeReservation =
-        key.includes('nestarc:identity:dedupe:') && args.length === 1 && args[0] === 'NX';
-      if (isDedupeReservation && !blocked) {
+    redis.eval = async (script, numberOfKeys, ...args) => {
+      const isCompositeReservation =
+        script.includes("redis.call('exists', key)") && numberOfKeys > 1;
+      if (isCompositeReservation && !blocked) {
         blocked = true;
         markDedupeReservationBlocked();
         await dedupeReservationRelease;
       }
-      return await originalSet(key, value, ...args);
+      return await originalEval(script, numberOfKeys, ...args);
     };
 
     const composite = {
@@ -905,9 +987,15 @@ describe('BullMQBackend with Redis', () => {
       await expect(
         firstJobs.enqueueDetailed(jobType, { producer: 'retry' }, composite),
       ).resolves.toMatchObject({ status: 'deduped', jobId: second.jobId });
+      const identityKeys = await redis.keys(`bull:${namespace}*nestarc:identity:*`);
+      const hashTags = identityKeys
+        .map((key) => key.match(/\{[^}]+\}/)?.[0])
+        .filter((value): value is string => value !== undefined);
+      expect(identityKeys.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(hashTags).size).toBe(1);
     } finally {
       releaseDedupeReservation();
-      redis.set = originalSet;
+      redis.eval = originalEval;
       await Promise.allSettled([firstEnqueue]);
     }
   });
@@ -1215,7 +1303,7 @@ describe('BullMQBackend with Redis', () => {
       keys(pattern: string): Promise<string[]>;
     };
 
-    await expect(client.keys(`bull:${namespace}:nestarc:identity:jobId:*`)).resolves.toEqual([]);
+    await expect(client.keys(`bull:${namespace}:*nestarc:identity:jobId:*`)).resolves.toEqual([]);
   });
 
   it('waits for active work on close and leaves waiting work durable for another worker', async () => {

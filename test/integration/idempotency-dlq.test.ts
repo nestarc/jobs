@@ -602,6 +602,54 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     ]);
   });
 
+  it('preserves the current terminal dedupe policy when replay replaces its mapping', async () => {
+    let now = new Date('2026-08-16T00:00:00.000Z');
+    const backend = new InMemoryBackend({ now: () => now });
+    const service = new JobsService({
+      backend,
+      registry: new HandlerRegistry(),
+      jobTypes: ['report.generate'],
+    });
+    const originalId = await service.enqueue(
+      'report.generate',
+      {},
+      { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 10 } },
+    );
+    await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure');
+
+    now = new Date('2026-08-16T00:00:00.020Z');
+    const terminalTarget = await service.enqueueDetailed(
+      'report.generate',
+      {},
+      { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 1_000 } },
+    );
+    await backend.moveToActive('report.generate', terminalTarget.jobId);
+    await backend.ack('report.generate', terminalTarget.jobId);
+
+    const replayedId = await service.replayDeadLetter(originalId);
+    await backend.moveToActive('report.generate', replayedId);
+    await backend.ack('report.generate', replayedId);
+
+    now = new Date('2026-08-16T00:00:00.031Z');
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 5 } },
+      ),
+    ).resolves.toMatchObject({ status: 'deduped', jobId: replayedId });
+
+    now = new Date('2026-08-16T00:00:01.021Z');
+    await expect(
+      service.enqueueDetailed(
+        'report.generate',
+        {},
+        { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 5 } },
+      ),
+    ).resolves.toMatchObject({ status: 'created' });
+  });
+
   it('preserves converged identity lineage through a later replay generation', async () => {
     let now = new Date('2026-08-16T00:00:00.000Z');
     const backend = new InMemoryBackend({ now: () => now });

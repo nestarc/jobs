@@ -460,9 +460,14 @@ export class InMemoryBackend implements JobsBackend {
       }
     }
     for (const [mapKey, policy] of slot.identityLineage.dedupePolicies) {
-      const mappedJobId = this.dedupe.get(mapKey)?.jobId;
+      const current = this.dedupe.get(mapKey);
+      const mappedJobId = current?.jobId;
       if (!mappedJobId || mappedJobId === originalJobId || !this.isLiveReplayTarget(mappedJobId)) {
-        this.dedupe.set(mapKey, { jobId: replayJobId, ...policy });
+        const reboundPolicy =
+          current && mappedJobId !== originalJobId
+            ? { mode: current.mode, ttlMs: current.ttlMs }
+            : policy;
+        this.dedupe.set(mapKey, { jobId: replayJobId, ...reboundPolicy });
       }
       const rebound = this.dedupe.get(mapKey);
       if (rebound?.jobId === replayJobId) {

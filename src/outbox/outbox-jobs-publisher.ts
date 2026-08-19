@@ -54,11 +54,11 @@ export function createOutboxJobsPublisher(
     constructor(@Inject(JOBS_SERVICE) private readonly jobs: JobsService) {}
 
     async publish(record: OutboxRecord): Promise<void> {
-      const configuredTarget = publisherOptions.map[record.eventType];
-      if (!configuredTarget) {
+      if (!Object.prototype.hasOwnProperty.call(publisherOptions.map, record.eventType)) {
         if (publisherOptions.unmapped === 'ignore') return;
         throw new Error(`No jobs mapping exists for outbox event "${record.eventType}"`);
       }
+      const configuredTarget = publisherOptions.map[record.eventType];
 
       const target: OutboxJobTarget =
         typeof configuredTarget === 'string' ? { job: configuredTarget } : configuredTarget;

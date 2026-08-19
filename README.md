@@ -183,7 +183,7 @@ Use a coordinated upgrade:
 2. Deploy 0.3 to every producer and worker.
 3. Resume production only after every process runs 0.3.
 
-Version 0.3 workers can consume jobs that were already queued by version 0.2, and they adopt an existing v0.2 raw idempotency job when it is present. This backward-read support does not make mixed-version rolling operation safe.
+Version 0.3 workers can consume jobs that were already queued by version 0.2, and they adopt an existing v0.2 raw idempotency job when it is present. If v0.2 used the same raw idempotency key in multiple job-type queues, each queue adopts its own job while a shared legacy claim continues to block a new explicit job from reusing that raw ID. Direct status lookup by that duplicated legacy raw ID remains inherently ambiguous and returns the first matching registered queue; queue processing and job-type-scoped idempotent enqueue remain independent. This backward-read support does not make mixed-version rolling operation safe.
 
 ## Typed job contracts
 
