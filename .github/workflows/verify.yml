@@ -32,6 +32,27 @@ jobs:
       - run: npm ci
       - run: npm test -- --runInBand
 
+  module-lifecycle:
+    name: Module lifecycle (Nest ${{ matrix.nest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nest: [10, 11]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Select Nest 11
+        if: matrix.nest == 11
+        run: >-
+          npm install --no-save --package-lock=false
+          @nestjs/common@^11.0.0 @nestjs/core@^11.0.0 @nestjs/testing@^11.0.0
+      - run: npm test -- --runInBand test/integration/jobs.module.in-memory.test.ts
+
   redis-integration:
     name: Redis (Node ${{ matrix.node }}, Nest ${{ matrix.nest }})
     runs-on: ubuntu-latest
@@ -99,7 +120,7 @@ jobs:
             echo "BullMQ must remain optional for core consumers"
             exit 1
           fi
-          node -e "require('reflect-metadata'); const {Test}=require('@nestjs/testing'); const {JobsModule,JobsService,HandlerRegistry}=require('@nestarc/jobs'); (async()=>{const app=await Test.createTestingModule({imports:[JobsModule.forInMemory({jobTypes:['smoke']})]}).compile(); app.get(HandlerRegistry).register('smoke',async()=>null); await app.get(JobsService).enqueue('smoke',{}); await app.close()})().catch(error=>{console.error(error);process.exit(1)})"
+          node -e "require('reflect-metadata'); const {Test}=require('@nestjs/testing'); const {JobsModule,JobsService,HandlerRegistry}=require('@nestarc/jobs'); (async()=>{const app=await Test.createTestingModule({imports:[JobsModule.forInMemory({jobTypes:['smoke']})]}).compile(); app.get(HandlerRegistry).register('smoke',async()=>null); await app.init(); await app.get(JobsService).enqueue('smoke',{}); await app.close()})().catch(error=>{console.error(error);process.exit(1)})"
           node -e "require('fs').writeFileSync('index.ts', \"import { defineJobs, job, TypedJobsService } from '@nestarc/jobs'; const defs = defineJobs({ smoke: job<{ value: string }>().defaults({ attempts: 2 }) }); declare const jobs: TypedJobsService<typeof defs>; void jobs.enqueue('smoke', { value: 'ok' });\")"
           npx tsc --strict --skipLibCheck false --noEmit --target ES2022 --module commonjs --moduleResolution node index.ts
 

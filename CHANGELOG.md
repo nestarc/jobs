@@ -6,6 +6,15 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-23
+
+### Changed
+
+- Deferred `@JobHandler()` discovery to application bootstrap and start in-memory/BullMQ consumers
+  only after registration completes, so parent-module handlers observe initialized dependencies.
+- Made request/transient-scoped decorator handlers and non-static dependency trees fail explicitly
+  during bootstrap instead of being skipped or bound to an unstable provider instance.
+
 ## [0.3.0] - 2026-08-19
 
 ### Added

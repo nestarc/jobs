@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Injectable, Module, type OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Module,
+  type OnModuleDestroy,
+  type OnModuleInit,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Backoffs, Job, Queue } from 'bullmq';
 import {
@@ -61,6 +66,34 @@ class NestedShutdownLeafModule {}
 
 @Module({ imports: [NestedShutdownLeafModule] })
 class NestedShutdownFeatureModule {}
+
+@Injectable()
+class RedisReadyDependency implements OnModuleInit {
+  moduleReady = false;
+
+  onModuleInit(): void {
+    this.moduleReady = true;
+  }
+}
+
+@Injectable()
+class RedisInjectedHandler {
+  static handledBy: RedisInjectedHandler | undefined;
+  readonly calls: Array<{ moduleReady: boolean }> = [];
+
+  constructor(private readonly dependency: RedisReadyDependency) {}
+
+  @JobHandler('injected.module.job')
+  async handle(): Promise<void> {
+    RedisInjectedHandler.handledBy = this;
+    this.calls.push({
+      moduleReady: this.dependency.moduleReady,
+    });
+  }
+}
+
+@Module({ providers: [RedisReadyDependency], exports: [RedisReadyDependency] })
+class RedisDependencyModule {}
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {
@@ -1759,6 +1792,7 @@ describe('BullMQBackend with Redis', () => {
     }).compile();
     const jobs = app.get(JobsService);
     await jobs.enqueue(jobType, {});
+    await app.init();
     await waitFor(() => moduleHandlerEntered);
 
     let closed = false;
@@ -1787,6 +1821,7 @@ describe('BullMQBackend with Redis', () => {
     }).compile();
     const jobs = app.get(JobsService);
     const jobId = await jobs.enqueue(jobType, {});
+    await app.init();
     await waitFor(() => nestedHandlerEntered);
 
     let closed = false;
@@ -1806,6 +1841,40 @@ describe('BullMQBackend with Redis', () => {
     ]);
     const peer = backend(namespace, jobType);
     expect(await peer.getJob(jobId)).toMatchObject({ status: 'succeeded' });
+  });
+
+  it('discovers an injected feature handler before starting the BullMQ consumer', async () => {
+    RedisInjectedHandler.handledBy = undefined;
+    const namespace = `nestarc-injected-module-${randomUUID()}`;
+    const jobType = 'injected.module.job';
+    const instance = backend(namespace, jobType, 1);
+
+    @Module({
+      imports: [
+        JobsModule.forBullMQ({ backend: instance, jobTypes: [jobType] }),
+        RedisDependencyModule,
+      ],
+      providers: [RedisInjectedHandler],
+      exports: [RedisInjectedHandler],
+    })
+    class RedisFeatureModule {}
+
+    const app = await Test.createTestingModule({ imports: [RedisFeatureModule] }).compile();
+    const jobs = app.get(JobsService);
+    const registry = app.get(HandlerRegistry);
+    const handler = app.get(RedisInjectedHandler);
+    const jobId = await jobs.enqueue(jobType, {});
+
+    expect(registry.list()).toEqual([]);
+    expect(handler.calls).toEqual([]);
+
+    await app.init();
+    await waitFor(async () => (await jobs.getJob(jobId))?.status === 'succeeded');
+
+    expect(registry.list()).toEqual([jobType]);
+    expect(handler.calls).toEqual([{ moduleReady: true }]);
+    expect(RedisInjectedHandler.handledBy).toBe(handler);
+    await app.close();
   });
 
   function backend(namespace: string, jobType: string, workerConcurrency?: number): BullMQBackend {

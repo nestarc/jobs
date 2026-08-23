@@ -3,9 +3,10 @@ import {
   Inject,
   Injectable,
   Module,
+  OnApplicationBootstrap,
   OnModuleDestroy,
-  OnModuleInit,
   Provider,
+  Scope,
 } from '@nestjs/common';
 import { createRequire } from 'node:module';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
@@ -26,6 +27,7 @@ import { JobsError, JobsErrorCode } from './errors';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
+const BULLMQ_CONSUMER_CONFIG = Symbol('BULLMQ_CONSUMER_CONFIG');
 
 const IN_MEMORY_WORKER_IDLE_MS = 10;
 const requireModule = createRequire(__filename);
@@ -33,14 +35,35 @@ const BULLMQ_SHUTDOWN_DISTANCE =
   nestCoreMajorVersion() >= 11 ? Number.MIN_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
 
 @Injectable()
-class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
+class HandlerDiscovery {
+  private complete = false;
+
+  constructor(
+    private readonly registry: HandlerRegistry,
+    private readonly discovery: DiscoveryService,
+    private readonly scanner: MetadataScanner,
+  ) {}
+
+  discover(): void {
+    if (this.complete) return;
+    registerHandlers(this.registry, this.discovery, this.scanner);
+    this.complete = true;
+  }
+}
+
+@Injectable()
+class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
   private running = false;
   private loop: Promise<void> | null = null;
 
-  constructor(@Inject(JOBS_WORKERS) private readonly workers: FairWorker[]) {}
+  constructor(
+    @Inject(JOBS_WORKERS) private readonly workers: FairWorker[],
+    private readonly handlerDiscovery: HandlerDiscovery,
+  ) {}
 
-  onModuleInit(): void {
+  onApplicationBootstrap(): void {
     if (this.running) return;
+    this.handlerDiscovery.discover();
     this.running = true;
     this.loop = this.run();
   }
@@ -64,11 +87,25 @@ class InMemoryWorkersHost implements OnModuleInit, OnModuleDestroy {
   }
 }
 
+interface BullMQConsumerConfig {
+  jobTypes: string[];
+  contextRunner: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
+  onJobStart?: (event: JobEvent) => void;
+  onJobFinish?: (event: JobEvent) => void;
+  onJobFail?: (event: JobEvent, error: Error) => void;
+  events?: JobEventsOptions;
+}
+
 @Injectable()
-class BullMQWorkersHost implements OnModuleDestroy {
+class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
+  private started = false;
+
   constructor(
-    @Inject(JOBS_BACKEND) private readonly backend: JobsBackend,
+    @Inject(JOBS_BACKEND) private readonly backend: BullMQBackend,
     @Inject(JOBS_WORKERS) private readonly _workers: unknown[],
+    @Inject(BULLMQ_CONSUMER_CONFIG) private readonly consumerConfig: BullMQConsumerConfig,
+    private readonly handlerDiscovery: HandlerDiscovery,
+    private readonly registry: HandlerRegistry,
     discovery: DiscoveryService,
   ) {
     // Nest 10 destroys modules in descending distance order, while Nest 11
@@ -79,6 +116,20 @@ class BullMQWorkersHost implements OnModuleDestroy {
         provider.host.distance = BULLMQ_SHUTDOWN_DISTANCE;
       }
     }
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.started) return;
+    this.handlerDiscovery.discover();
+    this.backend.startConsumer(this.consumerConfig.jobTypes, {
+      registry: this.registry,
+      contextRunner: this.consumerConfig.contextRunner,
+      onStart: this.consumerConfig.onJobStart,
+      onFinish: this.consumerConfig.onJobFinish,
+      onFail: this.consumerConfig.onJobFail,
+      events: this.consumerConfig.events,
+    });
+    this.started = true;
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -122,17 +173,56 @@ function registerHandlers(
 ): void {
   for (const provider of discovery.getProviders()) {
     const instance = provider.instance;
-    if (!instance || typeof instance !== 'object') continue;
-    const prototype = Object.getPrototypeOf(instance);
-    scanner.scanFromPrototype(instance, prototype, (method) => {
-      const jobType = Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]);
-      if (jobType) {
-        registry.register(jobType, (payload, ctx) =>
-          prototype[method].call(instance, payload, ctx),
-        );
-      }
-    });
+    const instanceIsObject =
+      instance !== null && (typeof instance === 'object' || typeof instance === 'function');
+    const metatypePrototype =
+      typeof provider.metatype === 'function' && 'prototype' in provider.metatype
+        ? provider.metatype.prototype
+        : undefined;
+    const prototype = instanceIsObject ? Object.getPrototypeOf(instance) : metatypePrototype;
+    if (!prototype) continue;
+
+    const handlers = scanner
+      .getAllMethodNames(prototype)
+      .map((method) => ({
+        jobType: Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]) as
+          | string
+          | undefined,
+        method,
+      }))
+      .filter((handler): handler is { jobType: string; method: string } =>
+        Boolean(handler.jobType),
+      );
+    if (handlers.length === 0) continue;
+
+    if (
+      provider.scope === Scope.REQUEST ||
+      provider.scope === Scope.TRANSIENT ||
+      !provider.isDependencyTreeStatic()
+    ) {
+      throw new TypeError(
+        `@JobHandler() provider ${providerName(provider.token)} must use singleton scope; ` +
+          'request/transient-scoped handlers and non-static dependency trees are unsupported',
+      );
+    }
+    if (!instanceIsObject) {
+      throw new Error(
+        `@JobHandler() provider ${providerName(provider.token)} has no initialized singleton instance`,
+      );
+    }
+
+    for (const { jobType, method } of handlers) {
+      const handler = (instance as Record<string, unknown>)[method];
+      if (typeof handler !== 'function') continue;
+      registry.register(jobType, (payload, ctx) => handler.call(instance, payload, ctx));
+    }
   }
+}
+
+function providerName(token: unknown): string {
+  if (typeof token === 'function' && token.name) return token.name;
+  if (typeof token === 'symbol') return token.description ?? token.toString();
+  return String(token);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -220,16 +310,11 @@ export class JobsModule {
         inject: [HandlerRegistry],
       },
       { provide: JOBS_SERVICE, useExisting: JobsService },
+      HandlerDiscovery,
       {
         provide: JOBS_WORKERS,
-        useFactory: (
-          service: JobsService,
-          registry: HandlerRegistry,
-          discovery: DiscoveryService,
-          scanner: MetadataScanner,
-        ) => {
-          registerHandlers(registry, discovery, scanner);
-          return options.jobTypes.map(
+        useFactory: (service: JobsService, registry: HandlerRegistry) =>
+          options.jobTypes.map(
             (jobType) =>
               new FairWorker({
                 jobType,
@@ -242,9 +327,8 @@ export class JobsModule {
                 onFail: options.onJobFail,
                 events: options.events,
               }),
-          );
-        },
-        inject: [JobsService, HandlerRegistry, DiscoveryService, MetadataScanner],
+          ),
+        inject: [JobsService, HandlerRegistry],
       },
       InMemoryWorkersHost,
     ];
@@ -282,25 +366,21 @@ export class JobsModule {
         inject: [HandlerRegistry],
       },
       { provide: JOBS_SERVICE, useExisting: JobsService },
+      HandlerDiscovery,
+      {
+        provide: BULLMQ_CONSUMER_CONFIG,
+        useValue: {
+          jobTypes: options.jobTypes,
+          contextRunner: runner,
+          onJobStart: options.onJobStart,
+          onJobFinish: options.onJobFinish,
+          onJobFail: options.onJobFail,
+          events: options.events,
+        } satisfies BullMQConsumerConfig,
+      },
       {
         provide: JOBS_WORKERS,
-        useFactory: (
-          registry: HandlerRegistry,
-          discovery: DiscoveryService,
-          scanner: MetadataScanner,
-        ) => {
-          registerHandlers(registry, discovery, scanner);
-          options.backend.startConsumer(options.jobTypes, {
-            registry,
-            contextRunner: runner,
-            onStart: options.onJobStart,
-            onFinish: options.onJobFinish,
-            onFail: options.onJobFail,
-            events: options.events,
-          });
-          return [];
-        },
-        inject: [HandlerRegistry, DiscoveryService, MetadataScanner],
+        useValue: [],
       },
       BullMQWorkersHost,
     ];

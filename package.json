@@ -1,6 +1,6 @@
 {
   "name": "@nestarc/jobs",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Typed, tenant-aware NestJS jobs with deterministic in-memory fairness, BullMQ durability, and outbox integration.",
   "license": "MIT",
   "author": "nestarc",

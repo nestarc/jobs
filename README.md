@@ -264,6 +264,11 @@ Notes:
 ## Handler discovery
 
 `JobsModule` scans Nest providers for methods decorated with `@JobHandler(jobType)`.
+Discovery runs during Nest application bootstrap, after provider construction and all
+`onModuleInit()` hooks have completed. The in-memory polling loop and BullMQ consumers start only
+after discovery finishes, so jobs queued before `app.init()` remain queued until handlers are
+registered. In tests or standalone application contexts, call `app.init()`; `compile()` alone does
+not start consumers.
 
 ```ts
 import { Injectable } from '@nestjs/common';
@@ -279,6 +284,11 @@ export class EmailHandler implements TypedJobHandler<AppJobs, 'email.send'> {
   }
 }
 ```
+
+Decorator handlers must be singleton providers with a static dependency tree. Request-scoped and
+transient handlers (including singleton handlers that depend on a request-scoped tree) fail during
+bootstrap with an actionable error. Use the public `HandlerRegistry.register()` API when handler
+resolution must be managed dynamically.
 
 If no handler is registered for a job type, the library throws `jobs_handler_not_found`.
 
