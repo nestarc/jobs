@@ -15,7 +15,7 @@ This package provides:
 
 ## Status
 
-Current package version: `0.3.0`
+Current package version: `0.3.1`
 
 ### Backend matrix
 
@@ -65,6 +65,27 @@ Peer expectations:
 - `@nestarc/outbox ^0.2.0` when using `createOutboxJobsPublisher()`
 - `reflect-metadata`
 - `rxjs`
+
+### Nest 11 + Prisma 7 Outbox consumer gate
+
+Jobs does not have a direct Prisma peer. Prisma compatibility for the first-party publisher is
+therefore verified against the actual `@nestarc/outbox` package artifact. The existing
+`@nestarc/outbox ^0.2.0` peer accepts the Prisma 7-ready `0.2.1` patch without requiring a Jobs
+release.
+
+Run the strict tarball consumer with an explicit candidate or published artifact:
+
+```bash
+OUTBOX_PACKAGE=/absolute/path/nestarc-outbox-0.2.1.tgz \
+  npm run test:consumer:modern
+```
+
+The gate refuses npm force/legacy peer bypasses, installs exact NestJS `11.2.1` and Prisma
+`7.10.0`, compiles against the real Outbox transport types with `skipLibCheck` disabled, and runs
+an Outbox-to-Jobs enqueue smoke test. CI can run the same gate through the `modern_outbox_package`
+manual workflow input once the artifact is reachable from the runner. Normal CI detects and starts
+requiring exact `@nestarc/outbox@0.2.1` as soon as that release is published; Jobs releases require
+it unconditionally.
 
 ## Choose a backend
 

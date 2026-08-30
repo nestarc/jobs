@@ -3,6 +3,13 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      modern_outbox_package:
+        description: Exact @nestarc/outbox npm spec or tarball URL; blank auto-detects 0.2.1
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -11,3 +18,5 @@ concurrency:
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
+    with:
+      modern_outbox_package: ${{ inputs.modern_outbox_package || '' }}
