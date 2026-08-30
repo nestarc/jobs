@@ -23,16 +23,18 @@ jobs:
       - name: Detect the exact published prerequisite
         id: registry
         run: |
+          ERROR_FILE="${RUNNER_TEMP}/outbox-registry-error.log"
           set +e
-          OUTPUT="$(npm view @nestarc/outbox@0.2.1 version 2>&1)"
+          OUTPUT="$(npm view @nestarc/outbox@0.2.1 version 2>"${ERROR_FILE}")"
           STATUS="$?"
           set -e
           if [ "${STATUS}" -eq 0 ] && [ "${OUTPUT}" = "0.2.1" ]; then
             echo "published=true" >> "${GITHUB_OUTPUT}"
-          elif printf '%s' "${OUTPUT}" | grep -q 'E404'; then
+          elif [ "${STATUS}" -ne 0 ] && grep -q 'E404' "${ERROR_FILE}"; then
             echo "published=false" >> "${GITHUB_OUTPUT}"
             echo "::notice::@nestarc/outbox@0.2.1 is not published; modern consumer gate is waiting for the external prerequisite"
           else
+            cat "${ERROR_FILE}" >&2
             printf '%s\n' "${OUTPUT}" >&2
             if [ "${STATUS}" -eq 0 ]; then
               echo "Unexpected registry version for @nestarc/outbox@0.2.1" >&2
