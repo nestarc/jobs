@@ -31,6 +31,7 @@
     "test": "jest",
     "test:redis": "jest --config jest.redis.config.ts --runInBand --detectOpenHandles",
     "test:coverage": "jest --config jest.coverage.config.ts --runInBand",
+    "test:consumer:modern": "node scripts/test-modern-outbox-consumer.js",
     "test:watch": "jest --watch",
     "bench": "ts-node bench/jobs.bench.ts",
     "lint": "eslint src test --ext .ts",

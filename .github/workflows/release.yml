@@ -12,6 +12,8 @@ permissions:
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
+    with:
+      modern_outbox_package: '@nestarc/outbox@0.2.1'
 
   publish:
     needs: verify

@@ -2,8 +2,45 @@ name: Verify
 
 on:
   workflow_call:
+    inputs:
+      modern_outbox_package:
+        description: Exact @nestarc/outbox npm spec or tarball URL for the modern consumer gate
+        required: false
+        type: string
+        default: ''
 
 jobs:
+  modern-outbox-availability:
+    name: Modern Outbox 0.2.1 availability
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.registry.outputs.published }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Detect the exact published prerequisite
+        id: registry
+        run: |
+          set +e
+          OUTPUT="$(npm view @nestarc/outbox@0.2.1 version 2>&1)"
+          STATUS="$?"
+          set -e
+          if [ "${STATUS}" -eq 0 ] && [ "${OUTPUT}" = "0.2.1" ]; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          elif printf '%s' "${OUTPUT}" | grep -q 'E404'; then
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::@nestarc/outbox@0.2.1 is not published; modern consumer gate is waiting for the external prerequisite"
+          else
+            printf '%s\n' "${OUTPUT}" >&2
+            if [ "${STATUS}" -eq 0 ]; then
+              echo "Unexpected registry version for @nestarc/outbox@0.2.1" >&2
+              exit 1
+            fi
+            exit "${STATUS}"
+          fi
+
   quality:
     runs-on: ubuntu-latest
     steps:
@@ -123,6 +160,24 @@ jobs:
           node -e "require('reflect-metadata'); const {Test}=require('@nestjs/testing'); const {JobsModule,JobsService,HandlerRegistry}=require('@nestarc/jobs'); (async()=>{const app=await Test.createTestingModule({imports:[JobsModule.forInMemory({jobTypes:['smoke']})]}).compile(); app.get(HandlerRegistry).register('smoke',async()=>null); await app.init(); await app.get(JobsService).enqueue('smoke',{}); await app.close()})().catch(error=>{console.error(error);process.exit(1)})"
           node -e "require('fs').writeFileSync('index.ts', \"import { defineJobs, job, TypedJobsService } from '@nestarc/jobs'; const defs = defineJobs({ smoke: job<{ value: string }>().defaults({ attempts: 2 }) }); declare const jobs: TypedJobsService<typeof defs>; void jobs.enqueue('smoke', { value: 'ok' });\")"
           npx tsc --strict --skipLibCheck false --noEmit --target ES2022 --module commonjs --moduleResolution node index.ts
+
+  modern-outbox-consumer:
+    name: Modern Outbox consumer (Nest 11.2.1, Prisma 7.10.0)
+    needs: modern-outbox-availability
+    if: >-
+      inputs.modern_outbox_package != '' ||
+      needs.modern-outbox-availability.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:consumer:modern
+        env:
+          OUTBOX_PACKAGE: ${{ inputs.modern_outbox_package || '@nestarc/outbox@0.2.1' }}
 
   coverage:
     runs-on: ubuntu-latest
