@@ -222,7 +222,77 @@ jobs:
       - run: mkdir package-artifact
       - run: npm pack --pack-destination package-artifact
       - run: tar -tf package-artifact/nestarc-jobs-*.tgz
-      - run: npm publish ./package-artifact/nestarc-jobs-*.tgz --dry-run
+      - name: Validate packed artifact
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir jobs-package-smoke
+          cd jobs-package-smoke
+          npm init -y
+          npm install \
+            --strict-peer-deps \
+            --legacy-peer-deps=false \
+            --force=false \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --save-exact \
+            "${GITHUB_WORKSPACE}"/package-artifact/nestarc-jobs-*.tgz \
+            @nestjs/common@11.2.1 \
+            @nestjs/core@11.2.1 \
+            reflect-metadata@0.2.2 \
+            rxjs@7.8.2
+          npm ls @nestarc/jobs @nestjs/common @nestjs/core reflect-metadata rxjs --all
+          if npm ls @nestarc/outbox >/dev/null 2>&1; then
+            echo "The optional Outbox peer must not be installed by the Jobs artifact"
+            exit 1
+          fi
+          if npm ls bullmq >/dev/null 2>&1; then
+            echo "The optional BullMQ peer must not be installed by the Jobs artifact"
+            exit 1
+          fi
+          node - <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          require('reflect-metadata');
+          const manifestPath = require.resolve('@nestarc/jobs/package.json');
+          const packageDir = path.dirname(manifestPath);
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          const sourceManifest = JSON.parse(
+            fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, 'package.json'), 'utf8'),
+          );
+
+          assert.equal(manifest.name, '@nestarc/jobs');
+          assert.equal(manifest.version, sourceManifest.version);
+          assert.equal(manifest.main, 'dist/index.js');
+          assert.equal(manifest.types, 'dist/index.d.ts');
+          assert.equal(manifest.peerDependencies?.['@nestarc/outbox'], '^0.2.0');
+          assert.equal(manifest.peerDependencies?.['@nestjs/common'], '^10.0.0 || ^11.0.0');
+          assert.equal(manifest.peerDependencies?.['@nestjs/core'], '^10.0.0 || ^11.0.0');
+          assert.equal(manifest.peerDependencies?.bullmq, '^5.74.1');
+          assert.equal(manifest.peerDependenciesMeta?.['@nestarc/outbox']?.optional, true);
+          assert.equal(manifest.peerDependenciesMeta?.bullmq?.optional, true);
+
+          for (const relativePath of [
+            'dist/index.js',
+            'dist/index.d.ts',
+            'README.md',
+            'CHANGELOG.md',
+            'LICENSE',
+            'docs/prd.md',
+            'docs/spec.md',
+            'docs/spec-v0.2.md',
+            'docs/spec-v0.3.md',
+          ]) {
+            assert.equal(fs.existsSync(path.join(packageDir, relativePath)), true, relativePath);
+          }
+
+          const api = require('@nestarc/jobs');
+          assert.equal(typeof api.JobsModule?.forInMemory, 'function');
+          assert.equal(typeof api.FakeJobsService, 'function');
+          assert.equal(typeof api.createOutboxJobsPublisher, 'function');
+          NODE
       - uses: actions/upload-artifact@v4
         with:
           name: package-tarball
