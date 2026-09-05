@@ -4,7 +4,8 @@
 - 대상 계획: [2026-09-02-p0-p4-maintenance-work-plan.md](./2026-09-02-p0-p4-maintenance-work-plan.md)
 - 검토 HEAD: `92932075a61e0433742c0ce370b7a0f37d1294a6`
 - fetch 후 origin/main: `405e799367023bb5e868588c85e4ff1fca51d4c0`
-- 판정: **로컬 구현 후보의 기존 검증은 재현됨. 전체 작업 완료 및 릴리스 준비 완료는 아님.**
+- 최종 판정: **R1–R4 및 Jobs 0.4.0 공개 릴리스 완료. M22/TEN-ECO-NEXT와 M24 실제 신고 수신은 외부 후속이며 P4는 BACKLOG 유지.**
+- 최종 실행일: 2026-09-05 (Asia/Seoul). §1–4는 최초 검토 기록이고, 최신 완료 상태는 §6을 따른다.
 
 ## 1. 완료 범위
 
@@ -141,3 +142,35 @@ main의 실제 effective rules/branch protection을 읽어 필요한 PR/check/fo
 - 저장소 SECURITY.md의 지원 버전·신고 경로를 실제 0.4 게시/활성화 상태로 갱신했다. 이미 게시된 0.4.0 tarball의 SECURITY.md에는 게시 전 0.3/source-candidate 문구가 남아 있으므로 최신 보안 정책은 저장소 SECURITY.md를 따른다. 이 문서 정정 때문에 immutable 태그/registry bytes를 변경하지 않는다.
 
 복구 workflow의 최종 실행 결과는 후속 완료 기록에서 확인한다.
+
+
+## 6. 최종 완료 기록 — 2026-09-05
+
+### 완료 범위
+
+| 항목 | 최종 결과 |
+| --- | --- |
+| R1 / JOBS-PLAN-01 | DONE. [PR #2](https://github.com/nestarc/jobs/pull/2)를 보호된 main에 squash merge. Release source `563612539401f49fa6b1ab0c9c265f79e8f61741`. 원격 main의 TEN-M21 squash 계보를 보존했고 force-push 없음. |
+| R2 | DONE. package/lock/CHANGELOG 0.4.0 확정, 새 annotated `v0.4.0` 태그. 기존 0.3.1 재게시 또는 태그 이동 없음. |
+| R3 / M12 | DONE. main PR·20개 exact Actions check·force-push/삭제 금지, v* 불변성, 관리자 tag 생성, npm 환경 v* 제한 및 admin bypass 금지 적용. 최종 실제 API 검사 PASS. OIDC publish 성공으로 `nestarc/jobs` / `release.yml` / `npm` trusted publisher 동작을 증명했다. |
+| R4 | fixed. main `protected=true`만인 입력과 원래 불완전 protection 재현 입력을 거부. 모든 필수 effective rule 및 check, 비활성·무관·bypass 규칙과 API 증거 누락을 검사한다. 정상 0-review PR 보호는 허용. 정책/복구 테스트 총 13건 PASS. |
+| M17 / JOBS-REL-01 | DONE. npm latest **0.4.0**, 동일 원본 tarball의 registry SRI/provenance/source lineage 검증 및 **22 registry signatures / 1 attestation PASS**. [GitHub Release v0.4.0](https://github.com/nestarc/jobs/releases/tag/v0.4.0)는 2026-09-05 14:15:55 KST 공개, draft/prerelease 모두 false. |
+| Release 후속 실패 | 원본 run은 npm 게시 뒤 서명 fixture의 floating Nest 12 ERESOLVE로 최종 failure. [PR #8](https://github.com/nestarc/jobs/pull/8), main `555b1cca2fe4d0c906913df6221fb35ce5a987c0`에서 exact peer 고정·원본 artifact 전용 recovery 추가. [최종 복구 run 33946723677](https://github.com/nestarc/jobs/actions/runs/33946723677)의 verify-published/release 모두 PASS. 재게시·태그 이동·검증 생략 없음. |
+| M24 | 활성화 및 관리자 수신함 접근 확인. `enabled=true`, 사용자 승인 후 식별자/상태 결과 `[]`. 실제 신고가 없어 전달·수신 acceptance는 EXTERNAL. |
+| M22 / TEN-ECO-NEXT | EXTERNAL 유지. upstream Outbox stop/drain·shutdown retry budget 보호와 PostgreSQL+Redis fully-published crash/restart 계약의 두 패키지 증거는 이번 Jobs 릴리스에서 새로 만들지 않았다. |
+| P4 B01–B08 | 명세대로 BACKLOG, 이번 릴리스 acceptance 제외. |
+
+### 최종 검증 및 artifact 증거
+
+- Release source의 protected-main CI [33946073721](https://github.com/nestarc/jobs/actions/runs/33946073721), 원본 Release의 전체 Verify, 복구 PR의 필수 CI 및 최종 복구 workflow PASS. 원본 Release 전체 run을 green으로 표기하지 않는다.
+- 로컬 unit **30 suites / 254 tests**, Redis coverage **32 suites / 302 tests** PASS. coverage statements/branches/functions/lines **92.51 / 87.50 / 97.82 / 94.54%**, 모든 threshold PASS. lint/typecheck/build PASS.
+- 실제 Release가 생성한 동일 tarball로 Node 22/24 × Nest 10.4.22/11.2.1 core, Outbox 0.2.1/0.3.0 소비자 PASS. Outbox 두 버전은 로컬에서도 해당 원본 artifact로 strict install/compile/runtime PASS.
+- actual producer SIGKILL before-reserve/after-reserve/after-add, 각 real 60초 lease 만료, stalled worker 및 SAVE 후 전용 Redis disconnect/restart PASS. 전원 손실 durability 증거로 확대하지 않는다.
+- benchmark: enqueue overhead **14.8µs**, e2e **32.2µs**, single-tenant **32,299 jobs/s**, 100-tenant **30,685 jobs/s**. 고정 머신 회귀 budget이 아닌 이번 실행 baseline이다.
+- Production audit **0**, full audit **4 moderate / 0 high / 0 critical**. 기존 Nest 10 개발 fixture 예외(@ksyq12, 만료 2026-10-05)를 유지한다.
+- 단일 배포 artifact는 §5의 **89,723 bytes**, SHA-256 `326a84b7dc47e778bbb75104dbe443f0857ffc3bba71f8b04be34d26a2f80aa1`, SRI `sha512-3OzypjcJmx5f1ImRyXZACU3F0z+PpXPCEwhU8CtIB7b03nqX2T0WCNOcLJFpWG2JK4UvIgfWs8jQjaedFktw9w==`. 복구 workflow는 이 원본 run artifact를 다운로드했으며 새 pack을 하지 않았다.
+- 기계 판독 기록: [maintenance-release-evidence-2026-09-05.json](./maintenance-release-evidence-2026-09-05.json). 로컬 로그 경로/SHA-256 및 public run/PR/Release 링크를 포함한다.
+
+### 인계
+
+R1–R4와 Jobs 릴리스를 재실행하지 않는다. 이후 작업은 M22 upstream lifecycle 보완, TEN-ECO-NEXT fully-published 검증, M24 실제 private-report 수신 증거다. 새로운 실제 취약점 보고 없이 임의의 테스트 취약점 신고를 만들지 않았다. 기존 handler 계획은 시작 HEAD 대비 동일하게 보존했다. 로컬 기존 `main@9293207`도 보존하고 작업 폴더는 공개 main 기반 `codex/jobs-040-completed`로 정리했다.
