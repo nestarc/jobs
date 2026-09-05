@@ -37,3 +37,10 @@ The user authorized the maintenance review's complete execution, including repos
 Read-only REST tokens omit `bypass_actors`. The verifier uses GraphQL `RepositoryRuleset.bypassActors` with an explicit count and node identity for that case, rejecting missing/inconsistent/error responses. [CI job 101251539506](https://github.com/nestarc/jobs/actions/runs/33945801951/job/101251539506) proved `Contents: read` / `Metadata: read`, omitted REST bypass metadata and a successful GraphQL count of 0. Verification receives no extra secret or administration permission. See [GitHub's rules API](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch) and [GraphQL repository types](https://docs.github.com/en/graphql/reference/repos).
 
 npm trusted publishing will be verified by the final `release.yml` OIDC publish/provenance result, following the user's instruction; interactive npm login is not required. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).
+
+
+## Final publication evidence
+
+[Original Release run 33946102143](https://github.com/nestarc/jobs/actions/runs/33946102143) passed repository/artifact policy and published 0.4.0 through the existing npm OIDC trusted publisher. The final signature-fixture install failed on floating Nest 12 resolution; [PR #8](https://github.com/nestarc/jobs/pull/8) pins supported peers and adds publication-only recovery. [Recovery run 33946723677](https://github.com/nestarc/jobs/actions/runs/33946723677) downloaded the original run's tarball, verified bytes/provenance and registry signatures, then created [v0.4.0](https://github.com/nestarc/jobs/releases/tag/v0.4.0). No package was republished and no tag was moved. The recovery workflow has read-only verification plus contents-write release creation, with no OIDC/publish grant.
+
+After explicit user approval, administrator advisory metadata access returned an empty array. Reporting is enabled and inbox access works; delivery of an actual report remains unverified. The existing owner remains unchanged.

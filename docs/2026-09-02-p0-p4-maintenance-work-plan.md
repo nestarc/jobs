@@ -1,13 +1,16 @@
 # `@nestarc/jobs` v0.3.1 이후 P0–P4 유지보수 작업 계획
 
-- 상태: `ACTIVE`
+- 상태: `ACTIVE` — Jobs 0.4.0 공개 릴리스 완료, 외부 후속 M22/M24/TEN-ECO-NEXT 유지
 - 작성일: 2026-09-02 (Asia/Seoul)
-- 공개 main 기준: `origin/main@405e799367023bb5e868588c85e4ff1fca51d4c0`
-- 공개 release 기준: `v0.3.1@7a173442caea6d7d50b09c9fe01a643cd1afb288`
+- 공개 main 기준: `origin/main@555b1cca2fe4d0c906913df6221fb35ce5a987c0`
+- 공개 release 기준: `v0.4.0@563612539401f49fa6b1ab0c9c265f79e8f61741`
 - 조사 checkout: `codex/ten-m21-jobs-modern@d3d757e6a7285fa890cea23978954adade950073`
-- tree hash: 조사 checkout과 공개 main 모두 `19c88ba35be9f80ca81af563fe2ee722766e9da3`
-- 패키지: `@nestarc/jobs@0.3.1`
+- 최초 조사 tree hash: 당시 checkout과 당시 공개 main(405e799) 모두 `19c88ba35be9f80ca81af563fe2ee722766e9da3`
+- 패키지: `@nestarc/jobs@0.4.0`
 - 목적: 조사에서 확인한 P0–P4 작업을 **한 세션에 한 작업, 한 PR** 단위로 나누고, 새 세션이 이미 끝난 handler/TEN-M21 작업이나 과거 계획을 다시 실행하지 않도록 한다.
+
+> [!NOTE]
+> **2026-09-05 최종 릴리스 인계:** 사용자의 유지보수 검토 문서 전체 실행 요청으로 계획/구현을 PR #2에서 함께 통합했고 npm 0.4.0 및 GitHub Release를 공개했다. 아래 과거 bootstrap 대기·local-only·0.3.1 candidate 및 Next exact action 기록은 역사다. 최신 상태와 원본 workflow 실패 및 복구의 정확한 증거는 [릴리스 검토 §6](./2026-09-05-maintenance-release-review.md#6-최종-완료-기록--2026-09-05)을 따른다. 새 별도 리뷰어는 요구하지 않았다.
 
 > [!IMPORTANT]
 > 새 작업은 fetch한 `origin/main`에서 시작한다. 조사 checkout은 공개 main과 tree가 같지만 commit lineage가 다르다. npm `0.3.1` tag는 현재 main보다 앞선 release commit이므로 현재 source tree와 게시 tarball을 같은 bytes로 간주하지 않는다.
@@ -199,7 +202,7 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 
 | 순서 | ID             | 우선순위 | 상태       | 크기 | 선행                                                          | 작업                                                                |
 | ---: | -------------- | -------- | ---------- | ---- | ------------------------------------------------------------- | ------------------------------------------------------------------- |
-|    0 | `JOBS-PLAN-01` | 문서     | `EXTERNAL`    | S    | 없음                                                          | 이 계획만 별도 PR로 review/merge                                    |
+|    0 | `JOBS-PLAN-01` | 문서     | `DONE`    | S    | 없음                                                          | 이 계획만 별도 PR로 review/merge                                    |
 |    1 | `JOBS-M01`     | P0       | `DONE`  | L    | `JOBS-M02`, `JOBS-M05`                                        | in-memory shutdown admission/drain 계약                             |
 |    2 | `JOBS-M02`     | P0       | `DONE`    | L    | 없음                                                          | activation-fenced state machine                                     |
 |    3 | `JOBS-M03`     | P0       | `DONE`     | M    | `JOBS-M04`                                                    | Outbox adapter tenant dedupe 격리                                   |
@@ -211,7 +214,7 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 |    9 | `JOBS-M09`     | P1       | `DONE`  | M    | `JOBS-M07` validator                                          | backend-portable recursive serialization                            |
 |   10 | `JOBS-M10`     | P1       | `DONE`    | M    | 없음                                                          | BullMQ producer/worker/both role                                    |
 |   11 | `JOBS-M11`     | P1       | `DONE`  | M    | `JOBS-M03`, `JOBS-M07`                                        | terminal record/identity retention                                  |
-|   12 | `JOBS-M12`     | P1       | `EXTERNAL`    | M    | 없음                                                          | release trust boundary/least privilege                              |
+|   12 | `JOBS-M12`     | P1       | `DONE`    | M    | 없음                                                          | release trust boundary/least privilege                              |
 |   13 | `JOBS-M13`     | P1       | `DONE`    | M    | 없음                                                          | advisory-safe BullMQ v5 floor                                       |
 |   14 | `JOBS-M17`     | P1       | `DONE`  | S    | `JOBS-M12`                                                    | published artifact identity 검증                                    |
 |   15 | `JOBS-M14`     | P2       | `DONE`  | S    | `JOBS-M02`                                                    | immutable history reads                                             |
@@ -230,10 +233,10 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 |   26 | `JOBS-M26`     | P3       | `DONE`  | M    | `JOBS-M02`, `JOBS-M06`, `JOBS-M11`, `JOBS-M16`                | model/property/soak/performance gates                               |
 |   27 | `JOBS-M27`     | P3       | `DONE` | M    | 없음                                                          | package exports/deep-import contract                                |
 |   28 | `JOBS-M28`     | P3       | `DONE`  | M    | `JOBS-M02–05`, `JOBS-M07`, `JOBS-M11`, `JOBS-M13`, `JOBS-M16` | BullMQ backend 내부 책임 분리                                       |
-|   29 | `JOBS-REL-01`  | release  | `BLOCKED`  | M    | `JOBS-M01–05`, `JOBS-M12–13`, `JOBS-M17`                      | next release version/CHANGELOG/tag/publish                          |
+|   29 | `JOBS-REL-01`  | release  | `DONE`  | M    | `JOBS-M01–05`, `JOBS-M12–13`, `JOBS-M17`                      | next release version/CHANGELOG/tag/publish                          |
 |   30 | `TEN-ECO-NEXT` | 외부     | `EXTERNAL` | L    | `OUT-REL-01`, `JOBS-REL-01`                                   | PostgreSQL Outbox → Redis/BullMQ fully-published crash/restart 검증 |
 
-공개 반영은 여전히 `JOBS-PLAN-01` review와 아래 외부 release gate를 필요로 한다. 이번 전체 실행은 로컬 후보로 끝내며, 기존 P0 merge lane은 core `JOBS-M02 → M05 → M01`, adapter `JOBS-M04 → M03`이다. 각 task는 별도 PR이며 merge 뒤 다음 task가 최신 main에 rebase한다. `JOBS-REL-01`이 최종 semver와 release evidence를 소유한다.
+2026-09-05 전체 실행 요청으로 계획·유지보수 구현을 PR #2에서 함께 공개 main에 반영했고 `JOBS-REL-01`을 완료했다. 실행 표의 DONE은 이번 공개 릴리스 증거를 포함한다. 남은 EXTERNAL과 P4 BACKLOG는 별도로 유지하며 최신 인계는 릴리스 검토 §6을 따른다.
 
 ### 2.1 파일과 첫 RED 행동
 
@@ -926,3 +929,12 @@ Outbox ── publisher record ──> Jobs Outbox adapter ──> Jobs backend/
 3. Jobs의 next version은 **0.4.0 minor** 결정이다. package/lock version은 아직 0.3.1이며 registry의 게시 bytes와 다르다. M12 외부 조건과 모든 merge가 끝난 release commit에서만 bump/CHANGELOG/tag 및 최종 pack-once publish를 수행한다. 이번 로컬 tgz를 직접 publish하지 않는다.
 4. M22의 upstream Outbox stop/drain 및 shutdown retry budget 계약을 확정한다. 그 뒤 Jobs 새 버전 게시와 함께 TEN-ECO-NEXT의 PostgreSQL + Redis fully-published 검증을 수행한다. 현재 Outbox latest 0.3.0의 존재만으로 이 cross-package 작업을 완료 처리하지 않는다.
 5. P4 B01–B08은 연구 backlog로 유지한다. BullMQ 6/Node 26 LTS/dual ESM/new backend/exactly-once fan-out을 이번 source 후보에 섞지 않는다.
+
+
+### 2026-09-05 — 0.4.0 공개 릴리스 완료 인계
+
+- JOBS-PLAN-01/M12/M17/JOBS-REL-01 DONE. PR #2 → release source `563612539401f49fa6b1ab0c9c265f79e8f61741`, annotated v0.4.0, npm latest 0.4.0.
+- Main/tag/npm 보호 정책 실제 적용 및 read-only effective-rule 검증 PASS. 원본 publish run 33946102143에서 OIDC publish 성공; signature fixture ERESOLVE를 PR #8에서 수정한 뒤 recovery run 33946723677이 원본 artifact의 registry bytes/provenance/signatures를 검증하고 GitHub Release 생성을 완료했다. 원본 run 전체가 green이라는 뜻은 아니다.
+- Source/Redis/coverage/Node 22·24/Nest 10·11/BullMQ floor·latest/Outbox 0.2.1·0.3.0/실제 chaos 및 benchmark 증거를 갱신했다. 정책/복구 회귀 총 13건 PASS.
+- M24 private reporting enabled=true와 관리자 inbox 접근을 확인했으나 실제 보고서 0건이어서 수신 acceptance는 EXTERNAL. M22 upstream stop/drain 및 TEN-ECO-NEXT 두 패키지 PostgreSQL+Redis 검증도 EXTERNAL. P4는 BACKLOG 유지.
+- 상세 결과와 다음 행동은 [릴리스 검토 문서](./2026-09-05-maintenance-release-review.md) 및 [release evidence JSON](./maintenance-release-evidence-2026-09-05.json)에 기록했다. 과거 로컬 0.3.1 tgz를 게시하거나 기존 v0.3.1/v0.4.0 태그를 이동하지 않는다.
