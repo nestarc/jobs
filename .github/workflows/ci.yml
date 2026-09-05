@@ -35,3 +35,13 @@ jobs:
       modern_outbox_package: ${{ inputs.modern_outbox_package || '@nestarc/outbox@0.3.0' }}
       modern_outbox_version: ${{ inputs.modern_outbox_version || (inputs.modern_outbox_package == '' && '0.3.0') || '' }}
       modern_outbox_integrity: ${{ inputs.modern_outbox_integrity || (inputs.modern_outbox_package == '' && 'sha512-rbPiDgQCNVtQifVf01we+vREYDDwccpezc5cSlaoa8VeIW3NxmGWrMe8ccwQRex/pF2MxlFW4K645SDbN27evQ==') || '' }}
+
+  policy-visibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check read-only ruleset evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/nestarc/jobs/rulesets/22319849 --jq '{id, bypass_actors}'
+          gh api graphql -f 'query=query { node(id:"RRS_lACqUmVwb3NpdG9yec5IJ4sAzgFUkuk") { ... on RepositoryRuleset { id name bypassActors(first:100) { totalCount nodes { id bypassMode } } } } }'
