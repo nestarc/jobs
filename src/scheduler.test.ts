@@ -18,7 +18,7 @@ describe('Scheduler', () => {
     s.setWeight('t2', 1);
     for (let i = 0; i < 100; i++) s.onEnqueue(`t1-${i}`, 't1');
     for (let i = 0; i < 100; i++) s.onEnqueue(`t2-${i}`, 't2');
-    const picks: string[] = [];
+    const picks: Array<string | undefined> = [];
     for (let i = 0; i < 40; i++) {
       const p = s.pickNext();
       if (!p) break;
@@ -111,7 +111,7 @@ describe('Scheduler', () => {
     s.setWeight('tiny', 0);
     for (let i = 0; i < 50; i++) s.onEnqueue(`b${i}`, 'big');
     for (let i = 0; i < 50; i++) s.onEnqueue(`t${i}`, 'tiny');
-    const picks: string[] = [];
+    const picks: Array<string | undefined> = [];
     for (let i = 0; i < 20; i++) {
       const p = s.pickNext();
       if (!p) break;
@@ -230,10 +230,10 @@ describe('Scheduler', () => {
     expect(s.pickNext()).toBeNull();
   });
 
-  it('releases an inflight slot for the empty tenant id', () => {
+  it('releases an inflight slot for the system shard', () => {
     const s = new Scheduler({ defaultWeight: 1, minSharePct: 0, tenantCap: 1 });
-    s.onEnqueue('first', '');
-    s.onEnqueue('second', '');
+    s.onEnqueue('first', undefined);
+    s.onEnqueue('second', undefined);
     const first = s.pickNext();
     s.onAck(first!.jobId);
 

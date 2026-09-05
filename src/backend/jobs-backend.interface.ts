@@ -24,9 +24,14 @@ export interface JobsBackend {
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult>;
   peekWaiting(jobType: string): Promise<JobEnvelope[]>;
-  moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null>;
-  ack(jobType: string, jobId: string): Promise<void | JobRecord>;
-  fail(jobType: string, jobId: string, reason: string): Promise<void | JobRecord>;
+  moveToActive(jobType: string, jobId: string, activationId?: string): Promise<JobEnvelope | null>;
+  ack(jobType: string, jobId: string, activationId: string): Promise<void | JobRecord>;
+  fail(
+    jobType: string,
+    jobId: string,
+    reason: string,
+    activationId: string,
+  ): Promise<void | JobRecord>;
   getJob(jobId: string): Promise<JobRecord | null>;
   getJobHistory(jobId: string): Promise<JobHistoryEntry[]>;
   listDeadLetters?(filter?: DeadLetterFilter): Promise<JobRecord[]>;

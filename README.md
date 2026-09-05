@@ -15,7 +15,7 @@ This package provides:
 
 ## Status
 
-Current package version: `0.3.1`
+Published package version: `0.3.1`. This source checkout contains the unreleased `0.4.0` maintenance candidate; manifest versioning and publication are gated separately.
 
 ### Backend matrix
 
@@ -59,10 +59,10 @@ npm install @nestarc/outbox
 
 Peer expectations:
 
-- Node.js `20`, `22`, or `24`
+- Node.js `22` or `24` for the 0.4 candidate (Node 20 support ends with the 0.3 line)
 - NestJS `^10` or `^11`
-- BullMQ `^5.74.1` when using `forBullMQ()`
-- `@nestarc/outbox ^0.2.0` when using `createOutboxJobsPublisher()`
+- BullMQ `^5.76.2` when using `forBullMQ()`
+- Optional `@nestarc/outbox ^0.2.1 || ^0.3.0` when using `createOutboxJobsPublisher()`; exact 0.2.1 and 0.3.0 consumer gates
 - `reflect-metadata`
 - `rxjs`
 
@@ -70,7 +70,7 @@ Peer expectations:
 
 Jobs does not have a direct Prisma peer. Prisma compatibility for the first-party publisher is
 therefore verified against the actual `@nestarc/outbox` package artifact. The existing
-`@nestarc/outbox ^0.2.0` peer accepts the Prisma 7-ready `0.2.1` patch without requiring a Jobs
+`@nestarc/outbox ^0.2.1 || ^0.3.0` peer retains the Prisma 7-ready `0.2.1` anchor; the separate candidate lane validates `0.3.0`. The anchor does not require a Jobs
 release.
 
 Run the strict tarball consumer with an explicit candidate or published artifact:
@@ -102,6 +102,43 @@ Important behavior:
 - workers start automatically when the Nest module initializes
 - tenant fairness is enforced by the in-process `Scheduler`
 - this backend is not distributed across multiple processes
+- shutdown closes admission first, then drains accepted active, queued, delayed, and retrying work before destroying feature dependencies
+- `shutdown: { timeoutMs: 30_000 }` sets the graceful drain deadline (30 seconds by default; positive integer up to 2,147,483,647)
+- enqueue (including dedupe acknowledgement) and dead-letter replay during/after shutdown reject with `jobs_backend_closed`
+
+If drain exceeds its deadline, `app.close()` rejects with `JobsShutdownError`
+(`code: 'jobs_shutdown_incomplete'`, `reason: 'deadline'`, `remainingJobIds`,
+`remainingCount`). Admission stays closed; records and identity mappings remain
+available while drain continues in the background. A later `app.close()` joins the
+same drain with a new deadline. Backend resources close exactly once after all
+accepted work and outstanding handler invocations finish. Successful close releases
+in-memory records and history. This is a pre-1.0 minor behavior change, planned for
+0.4.0; it does not add crash durability.
+
+A handler that ignores `ctx.signal` retains its slot until its actual promise
+settles. Timeout emits `job.timed_out` and aborts the signal immediately; the job
+stays active until settlement, then records timeout failure and schedules any retry.
+Late success cannot turn a timeout into success. A never-settling handler prevents
+graceful completion. Observe the shutdown error, arrange cooperative handler
+settlement, or explicitly terminate the process knowing that in-memory work is
+lost. Administrative cancellation changes logical state but cannot stop JavaScript
+or make shutdown treat an outstanding invocation as finished. Delivery remains
+at-least-once; side effects are not exactly-once.
+
+Stop upstream producers before closing Jobs. Handler follow-up enqueue during drain
+also rejects; applications that relied on it must move production before admission
+closes or handle the rejection. Nest shutdown ordering drains Jobs before feature
+provider destruction in Nest 10 and 11. A co-located Outbox poller must stop before
+Jobs admission closes; this change does not coordinate its separate shutdown hooks.
+
+For standalone `InMemoryBackend`/`FairWorker` use, call `beginClose()` to stop
+admission, drain workers (including future schedules), await `waitForIdle()` on
+all workers, then call `backend.close()`. `outstandingJobIds()` reports worker-owned
+invocations; `pendingJobIds()` reports backend nonterminal records. A direct backend
+`close()` cannot run handlers and rejects with `JobsShutdownError` and
+`reason: 'pending_jobs'` if nonterminal records remain. Explicitly cancel/disposition
+those records or finish processing them before retrying close. Backend-only close
+cannot observe externally owned handler promises, so their owner must await them.
 
 ### BullMQ backend
 
@@ -140,7 +177,7 @@ class ReportHandler {
     JobsModule.forInMemory({
       jobTypes: ['sendReport'],
       fairness: { defaultWeight: 1, minSharePct: 0.1 },
-      concurrency: { tenantCap: 10 },
+      concurrency: { poolSize: 10, tenantCap: 10, typeCap: 10 },
     }),
   ],
   providers: [ReportHandler],
@@ -193,7 +230,7 @@ const backend = new BullMQBackend({
 export class AppModule {}
 ```
 
-On BullMQ in `0.3.0`, jobs are delivered FIFO by BullMQ's worker. Context and metadata are persisted in Redis and restored after restart, but tenant fairness is not applied.
+On BullMQ, jobs are delivered FIFO by BullMQ's worker. Context and metadata are persisted in Redis and restored after restart, but tenant fairness is not applied.
 
 ### Upgrading BullMQ deployments from 0.2
 
@@ -381,7 +418,7 @@ const replayedJobId = await jobs.replayDeadLetter(failed[0].id);
 // await jobs.discardDeadLetter(failed[0].id, 'handled manually');
 ```
 
-In-memory replay preserves and rebinds the original idempotency/dedupe identity to the replayed job. Attempts reset by default; pass `{ resetAttempts: false }` to retain the recorded attempt count. A successful discard emits `job.discarded`; repeated, missing, or non-dead-letter discard calls are no-ops and emit nothing.
+In-memory replay preserves and rebinds the original idempotency/dedupe identity to the replayed job. Attempts reset by default for a new replay ID; pass `{ resetAttempts: false }` to retain the recorded attempt count. With `{ preserveOriginalId: true }`, the lifetime attempt count never resets. By default a fresh retry budget is added to that count (`maxAttempts` becomes the cumulative ceiling), and backoff starts at the first attempt of the replay generation. `resetAttempts: false` retains the previous ceiling and backoff position. A successful discard emits `job.discarded`; repeated, missing, or non-dead-letter discard calls are no-ops and emit nothing.
 
 Tenant-scoped dedupe requires a tenant id:
 
@@ -408,7 +445,37 @@ The in-memory backend uses a shard-based scheduler with:
 - per-tenant inflight caps
 - due-time promotion for delayed jobs and retries
 
-Future work stays outside weighted dispatch and starvation accounting until it is due, so it does not block ready work from the same or another tenant. Scheduler snapshots still include deferred work in each tenant's `waiting` count. `defaultWeight` and `tenantCap` must be positive safe integers, `minSharePct` must be finite and within `[0, 1]`, and runtime tenant weights must be non-negative safe integers (`0` is allowed); invalid values throw `jobs_fairness_misconfig`.
+In-memory automatic execution uses a bounded pool shared by every job type in one
+`JobsModule.forInMemory()` registration. `concurrency.poolSize` (default `10`) limits
+all outstanding invocations; `tenantCap` (default `10`) limits one tenant across
+all types; `typeCap` (default `poolSize`) limits each type. All three must be
+positive safe integers. Types take turns acquiring free slots; within a type,
+weighted tenant selection and minimum share apply only to eligible tenants.
+Weights govern dispatch opportunities, not elapsed CPU time, and cannot override
+any concurrency cap. Use `poolSize: 1` to preserve the earlier serial execution.
+These are local limits, independently applied by each module/process.
+
+A timed-out invocation retains every slot until its handler settles. Shutdown
+uses the same pool and limits while draining queued, delayed and retrying jobs.
+A backend worker-loop failure releases capacity after the invocation settles,
+stops automatic dispatch, and makes shutdown report `worker_error` with pending
+IDs. Backend state reconciliation/restart after that error remains an explicit
+recovery action. There is no automatic retry of an uncertain backend transition.
+
+BullMQ `workerConcurrency` (default `10`) is per job-type Worker in each backend
+instance: `N` registered types can execute up to `N × workerConcurrency` handlers
+per process. Multiple processes add their own workers. It has no shared Jobs
+pool, per-tenant fairness or cross-type global bound; the in-memory concurrency
+options do not apply to BullMQ. No distributed bound is implied.
+
+Missing tenant identity uses an internal Symbol shard, separate from every user
+string, including `__default__`. Contexts, lifecycle events, scheduler picks and
+snapshots expose the missing tenant as `undefined`. Enqueue, retry, replay and
+weight controls use this same identity. `setTenantWeight(type, undefined, weight)`
+controls the system shard; passing `'__default__'` controls that real tenant only.
+Tenant IDs follow the string contract below; no user string namespace is reserved.
+
+Future work stays outside weighted dispatch and starvation accounting until it is due, so it does not block ready work from the same or another tenant. Scheduler snapshots still include deferred work in each tenant's `waiting` count. `defaultWeight` and standalone scheduler `tenantCap` must be positive safe integers, `minSharePct` must be finite and within `[0, 1]`, and runtime tenant weights must be non-negative safe integers (`0` is allowed); invalid values throw `jobs_fairness_misconfig`.
 
 You can adjust weights at runtime:
 
@@ -422,6 +489,49 @@ For lower-level inspection:
 ```ts
 const snapshot = jobs.scheduler('sendReport').snapshot();
 ```
+
+### Enqueue validation and portable values (planned 0.4.0)
+
+`JobsService`, effective job defaults, and direct InMemory/BullMQ enqueue calls
+validate before storing jobs or reserving identities. Invalid options/configuration
+throw `JobsError` with `code: 'jobs_invalid_input'`; unsupported valid capabilities
+still throw `jobs_capability_unsupported`. Invalid recursive data uses
+`jobs_serialization_invalid`. Payload envelope keys `__nestarcCtx` and
+`__nestarcJob` remain reserved (`jobs_reserved_payload_key`). Direct backends take
+an envelope from `attachContext(payload, context)`; its context is authoritative.
+
+- Attempts and concurrency are positive safe integers. Delay (`delay`/`delayMs`),
+  dedupe TTL and backoff delay/maxDelay are finite milliseconds in `[0, 2147483647]`;
+  timeout is in `[1, 2147483647]`. Fractional durations are accepted; timers apply
+  their millisecond resolution. A valid `scheduledFor: Date` may be in the past,
+  or at most `2147483647` ms into the future. Precedence remains
+  `scheduledFor`, then `delayMs`, then `delay`.
+- Job types are non-blank strings of at most 256 UTF-16 code units, without `:`;
+  job IDs, idempotency/dedupe keys and tenant IDs are non-blank strings of at most
+  1024 code units. Values are preserved exactly, without trimming or coercion.
+  Registered job types must be unique; an empty registration remains valid.
+- Dedupe scope is exactly `global` or `tenant`, and mode is exactly `while_active`
+  or `until_completed`. Tenant scope requires a tenant. Generic omitted scope
+  remains global; the first-party Outbox adapter retains its tenant-safe default.
+  Backoff type is exactly `fixed` or `exponential`, with jitter in `[0, 1]`.
+  Exponential arithmetic saturates at the maximum timer delay instead of
+  overflowing into an immediate retry.
+- Payload, context and metadata roots are plain records. Nested plain records,
+  arrays, strings, booleans, null and finite numbers are supported. Valid Date
+  values normalize to ISO strings, object properties valued `undefined` are
+  omitted, array holes/undefined become null, and negative zero becomes zero.
+  Caller values are snapshotted before asynchronous admission.
+- Nested BigInt, functions, symbols/symbol keys, Map, Set, Buffer, custom class or
+  array prototypes, accessors, cycles, invalid Dates and nonfinite numbers are
+  rejected. Repeated references without cycles are allowed. Enumerable data is
+  traversed without calling getters or custom `toJSON`; non-enumerable properties
+  are excluded. Handler `context.signal` remains a non-enumerable runtime field.
+- The envelope and metadata each have a conservative 1 MiB UTF-8 traversal budget
+  (including keys/separators) and at most 64 nesting levels from their root.
+  Oversized or deeper inputs fail before admission. Convert binary/class values
+  explicitly and adapt handlers that previously expected nested Date instances
+  to receive ISO strings. The same normalized values reach both backends.
+
 
 ## First-party outbox publisher
 
@@ -450,6 +560,25 @@ OutboxModule.forRoot({
 ```
 
 The adapter sets both `jobId` and `idempotencyKey` to the outbox record ID. It preserves `tenantId`, `outboxEventId`, `correlationId` (falling back to the event ID), and optional `causationId` in context and metadata. Missing mappings, including inherited object property names, and missing required tenants fail closed by default. Delivery remains at-least-once; retain BullMQ terminal job records for at least the outbox retry and operator-recovery horizon.
+
+For tenant-bearing events, mapping-level `dedupe: { key }` defaults to `scope: 'tenant'`
+using the resolved tenant. Two tenants with the same key enqueue separate jobs. To intentionally
+collapse work across tenants of a job type, set `dedupe: { key, scope: 'global' }` explicitly.
+A `tenant: 'optional'` event without a tenant retains global dedupe; explicit tenant-scoped dedupe
+without a tenant fails closed. The generic `JobsService` dedupe default remains global.
+
+A successful `publish()` acknowledges enqueue or duplicate suppression. Outbox `SENT` does not
+mean the Jobs handler succeeded. A suppressed event may have no separate job under its record ID;
+the retained job keeps its original record ID as both `jobId` and `idempotencyKey`.
+
+Context fields `tenantId`, `outboxEventId`, `correlationId`, and `causationId` are source-owned.
+Metadata fields `source`, `outboxEventId`, `outboxEventType`, `tenantId`, `correlationId`,
+`causationId`, `aggregateType`, `aggregateId`, `partitionKey`, `outboxIdempotencyKey`,
+`outboxHeaders`, and `outboxOccurredAt` are also reserved. Mapping values for these fields are
+removed before source lineage is applied, including when a source value is absent. Other custom
+context and metadata fields are preserved. Only an explicit `target.tenant` function can remap
+the tenant. Source identity and lineage (including headers and occurrence time) are snapshotted
+before mapping callbacks run, so mutating a callback's record cannot replace canonical lineage.
 
 ## Legacy generic bridge
 
@@ -584,7 +713,7 @@ The library exposes these error codes through `JobsError`:
 ## Limitations
 
 - In-memory fairness is process-local and intended for single-process execution.
-- BullMQ fairness is not implemented in `0.3.0`.
+- BullMQ tenant fairness is not implemented.
 - BullMQ backend does not support pull-based fairness operations such as `peekWaiting()` or `moveToActive()`.
 - Fairness control APIs are unavailable on BullMQ in this release.
 - BullMQ durable history, timeout, and DLQ list/replay/discard are intentionally reported as unsupported.
@@ -607,7 +736,7 @@ Release flow:
 1. Update the package version and changelog, then run the local verification above with a clean worktree.
 2. Push the release commit to `main` and wait for its CI run to pass.
 3. Confirm the exact release commit is present on remote `main`.
-4. Create and push a matching tag such as `v0.3.0` from that commit.
+4. Create and push a matching `v<package-version>` tag from that commit.
 5. GitHub Actions runs the same Node/Nest/Redis/package verification used by pull requests, then publishes that verified tarball through trusted publishing and creates a GitHub release.
 
 The npm trusted publisher is configured for:
@@ -628,3 +757,104 @@ The npm trusted publisher is configured for:
 ## License
 
 MIT
+
+### Custom backend activation contract (planned 0.4.0)
+
+`FairWorker` requires `capabilities().activationFencing === true`. A custom backend
+must generate a fresh, opaque `activationId` on every successful `moveToActive`,
+return it on the envelope, and atomically validate it with the active state for
+`ack(jobType, jobId, activationId)` and
+`fail(jobType, jobId, reason, activationId)`. Direct in-memory `markFailed` takes
+the token before its optional error summary. Do not infer the token from the latest
+job state: carry the token from the invocation being completed. Legacy custom
+backends must implement this contract before opting into the capability; the worker
+fails at construction if the capability is absent. BullMQ keeps its own worker lock
+contract and does not use these manual completion APIs.
+
+| Current state | Operation | Result |
+| --- | --- | --- |
+| queued / due delayed | moveToActive | active, fresh token, attempt +1 |
+| future delayed / active / terminal / missing | moveToActive | null; no mutation |
+| active with matching token | ack | succeeded |
+| active with matching token | fail / markFailed | retry scheduled, failed, or dead letter according to budget |
+| missing / non-active / wrong type / stale or absent token | ack / fail / markFailed | `jobs_activation_conflict`; no history or budget mutation |
+| queued / delayed / active | markCancelled | cancelled; late completions conflict |
+| terminal | markCancelled | unchanged; no new history |
+| dead_letter | explicit replay / discard | new replay generation / cancelled |
+
+Duplicate and opposite terminal completions both conflict. Only explicit dead-letter
+administration can leave a terminal state; a same-ID replay creates a new activation
+and preserves monotonic attempt history. The public backend signature, lifecycle
+event union, same-ID replay accounting, and shutdown defaults require a 0.4.0 minor
+release. The package version is advanced by the separate release task.
+
+
+## Additional 0.4 maintenance contracts
+
+### Producer and worker applications
+
+```ts
+JobsModule.forBullMQ({ backend, jobTypes: ['invoice.process'], role: 'producer' });
+JobsModule.forBullMQ({ backend, jobTypes: ['invoice.process'], role: 'worker' });
+```
+
+The default role is `both`. Producer applications never create BullMQ Workers or discover handlers. Worker and both applications validate every intended handler at bootstrap. Register handlers before `app.init()`, or explicitly choose `dynamicRegistration: true` and arrange registration before any queued work can run. Worker-only JobsService rejects enqueue; use `both` for handlers that enqueue follow-up work. Every role closes its backend resources.
+
+In-memory backend faults retry the same activation and settled outcome after 50ms. `onWorkerError` observes faults without stopping all dispatch. A transport error after ack never triggers fail. Custom backends should honor the optional caller-supplied activation token in `moveToActive(type, id, token)` to reconcile activation response loss. Shutdown continues to report unresolved IDs if the backend remains unavailable.
+
+`FakeJobsService.drain()` and `drainUntilIdle()` reject with `jobs_drain_limit_exceeded` when their iteration budget leaves schedulable work. Future-delayed idle is successful; advance the FakeClock to make that work due. Cancelled scheduler entries no longer hide ready jobs behind them. History reads return independent entries, dates and errors.
+
+### Retention and operator cleanup
+
+Retention is disabled by default. Configure it on `InMemoryBackend`, `JobsModule.forInMemory`, or `BullMQBackend`:
+
+```ts
+retention: {
+  terminalAgeMs: 7 * 24 * 60 * 60 * 1000,
+  recoveryHorizonMs: 7 * 24 * 60 * 60 * 1000,
+  batchSize: 1000,
+}
+```
+
+Choose the horizon from the longest Outbox retry plus manual recovery window. It is a safety floor; cleanup never shortens it to meet a count target. Stop all producer processes and administrative retry/replay writers, wait for workers to become idle, then call `await backend.pruneTerminal({ producersStopped: true })` until it returns zero. The boolean is the operator's assertion about other processes. BullMQ pauses registered queues and restores their previous pause states; register every relevant job type first. Cleanup removes expired terminal payload/context/metadata/history and matching identities, preserving mappings rebound to live replay jobs. If cleanup fails, keep writers stopped and retry. Never combine this with raw BullMQ auto-removal.
+
+Cleanup cadence and incoming traffic determine the retained volume; a burst can exceed available memory even with an age policy. Operators own backlog alerts, PII minimization, external audit archives, backups and old legacy reservation migration. Resubmission after expiration can execute again. See [security policy](SECURITY.md) and [retention decision](docs/adr/2026-09-05-maintenance-decisions.md).
+
+### Outbox state and shutdown ownership
+
+| Observation | Meaning and owner |
+| --- | --- |
+| Outbox `SENT` | Outbox stored successful enqueue/dedupe acknowledgement; the job may still be waiting or may later fail. |
+| Jobs `succeeded` / `failed` / `dead_letter` | Jobs handler outcome, independent of the Outbox row. |
+| Enqueue committed but response lost | A stable-ID job may exist while Outbox remains PENDING/PROCESSING; retry the same source identity. |
+| Mapping `unmapped: 'ignore'` | Intentional acknowledgement without creating a job; Outbox may become SENT. |
+| Outbox claim recovery after process death | Outbox owns claim/lease recovery and retry budget. Jobs does not edit the source database. |
+| Jobs shutdown admission error | The source publisher did not receive acknowledgement. Stop source dispatch before closing Jobs; do not spin retries during shutdown. |
+
+A co-located Outbox poller must stop and settle all outstanding publisher callbacks **before** Nest closes Jobs. Default lifecycle phase ordering alone is insufficient: Jobs closes in `onModuleDestroy`, while the published Outbox poller stops in `onApplicationShutdown`. Arrange explicit shutdown orchestration before `app.close()`. A source shutdown timeout is not proof that callbacks settled; keep Jobs available while they settle, or terminate the unhealthy process so the source lease can recover. Do not repeatedly publish into closed Jobs and consume Outbox retry budget to FAILED. The required upstream stop/drain evidence is tracked in the maintenance plan and `TEN-ECO-NEXT`.
+
+`JobsOutboxBridge` is deprecated and compatibility-only. It has no canonical source event ID or lineage fencing. First-party Outbox users should migrate to `createOutboxJobsPublisher()`.
+
+All get/history/replay/discard APIs are trusted control-plane operations. For tenant-facing code, first authorize tenant membership, then filter the record:
+
+```ts
+await authorization.requireTenantAccess(principal, tenantId); // application-owned RBAC
+const job = await jobs.getJobForTenant(jobId, tenantId);
+if (!job) throw new NotFoundException();
+// Invoke replay/discard only after separately authorizing that administrative operation.
+```
+
+A mismatched or missing ID returns null. Never accept the caller's tenant string as proof of authorization. Jobs introduces no RBAC dependency.
+
+### Verification and exact candidates
+
+`npm run test:coverage` requires a real `REDIS_URL` and fails immediately without it. Coverage artifacts include a tuple/ref summary; the branch contract covers activation/timeout ownership, tenant dedupe/lineage, portable validation, role admission, retention horizons and backend response loss. Run `node scripts/coverage-evidence.js` with the same Redis environment after coverage.
+
+The 0.2.1 modern Outbox anchor is fixed. The separate candidate runner accepts a JSON manifest with `package`, exact `version` and expected SHA-512 `integrity`:
+
+```sh
+JOBS_TARBALL=/absolute/path/nestarc-jobs-0.3.1.tgz \
+  node scripts/test-outbox-candidate-consumer.js /absolute/path/outbox-candidate.json
+```
+
+Floating versions and mismatched digests fail. Set `JOBS_TARBALL` for core/modern runners to verify the same candidate bytes; CI consumers download the one package-smoke artifact. The exact v5 Redis matrix is BullMQ 5.76.2 and 5.81.4 using ioredis connections; newer node-redis/Bun adapters are not part of this support claim. `npm run test:policy` verifies workflow permissions and artifact identity policy. `npm run test:chaos` is opt-in and accepts only loopback disposable Redis; it kills only child processes it spawned. Redis restart additionally requires the exact owned compose project/container variables documented in the maintenance handoff. Keep chaos separate from other Redis runs.

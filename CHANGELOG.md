@@ -6,6 +6,58 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
+### Added
+
+- Explicit BullMQ producer/worker/both roles, bootstrap handler validation and a dynamic-registration escape.
+- Operator-driven terminal retention with recovery-horizon validation, bounded cleanup batches and identity-aware deletion.
+- Tenant-filtered status reads, worker error observers and same-activation backend response reconciliation.
+- Exact Outbox candidate manifests alongside the fixed 0.2.1 anchor; verified 0.3.0 peer support.
+- Real lease-expiry/producer-crash/stalled-worker/Redis-restart fixtures, seeded state-model tests and coverage tuple evidence.
+
+### Changed
+
+- Support Node 22/24; raise optional BullMQ floor to 5.76.2 and Outbox range to ^0.2.1 || ^0.3.0.
+- Upgrade Jest/ts-jest and ESLint/typescript-eslint, refresh compatible lock dependencies, and document remaining Nest 10 fixture audit exceptions.
+- Separate release verification, npm OIDC publication and GitHub Release grants; pin official Actions and require exact digest/provenance lineage for reruns.
+- Split BullMQ codec, identity leases, lifecycle observers and owned-resource cleanup into private modules; preserve current CommonJS/deep-import behavior.
+- Mark old implementation plans historical and deprecate the legacy Outbox bridge without runtime removal.
+
+### Fixed
+
+- Return deeply detached history snapshots and reject exhausted fake drains; continue through cancelled head entries.
+- Preserve settled handler outcomes across backend failures, avoid fail after an uncertain ack, and keep the automatic loop recoverable.
+
+
+- Default first-party Outbox mapping dedupe to tenant scope when a tenant is present;
+  require explicit global scope to suppress jobs across tenants. Preserve generic JobsService defaults.
+- Rebuild reserved Outbox context and metadata from a source snapshot, remove stale mapping
+  lineage when source fields are absent, and preserve canonical identity through callback mutation.
+
+### Changed
+
+- Run in-memory workers in a bounded pool (default 10), with module-wide pool and
+  tenant limits and per-type limits; preserve timeout ownership and shutdown drain.
+  Set `poolSize: 1` for prior serial behavior. Clarify BullMQ per-type worker limits.
+- Separate the internal system shard from all real tenant strings; expose absent
+  tenants as `undefined` in scheduler picks/snapshots and lifecycle events.
+- Reject invalid enqueue/default/configuration values before identity reservation
+  using `jobs_invalid_input`, and saturate exponential backoff at the timer maximum.
+- Normalize recursive payload/context/metadata to portable JSON semantics with
+  Date-to-ISO conversion, depth/size bounds and `jobs_serialization_invalid` for
+  unsupported values. Direct backends and service admission share the boundary.
+
+- Require opaque activation tokens for manual backend ack/fail/markFailed and an
+  activation-fencing capability for FairWorker; reject stale and illegal completion
+  with `jobs_activation_conflict`. Preserve lifetime attempt counts on same-ID replay.
+- Keep timed-out in-memory invocations owned until settlement, emit `job.timed_out`,
+  and defer retries and slot release until the original handler has finished.
+- Close in-memory admission before Nest shutdown drain, process accepted queued,
+  delayed, and retrying jobs, and close resources once before feature teardown.
+  The default 30-second deadline rejects with `JobsShutdownError` and remaining IDs
+  instead of reporting success; standalone close reports pending jobs without deletion.
+
 ## [0.3.1] - 2026-08-23
 
 ### Changed

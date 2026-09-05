@@ -1,3 +1,6 @@
+import type { RetentionOptions } from './retention';
+import { notifyLifecycleObserver } from './lifecycle-observer';
+import { ExecutionBudget } from './execution-budget';
 import {
   DynamicModule,
   Inject,
@@ -10,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { createRequire } from 'node:module';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
+import { assertJobConfiguration, assertPositiveInteger, invalidInput } from './enqueue-validation';
 import { JobsService } from './jobs.service';
 import { HandlerRegistry } from './handler-registry';
 import { Scheduler, SchedulerOptions } from './scheduler';
@@ -23,15 +27,18 @@ import type { JobContext, JobEvent } from './types';
 import { JOBS_SERVICE } from './contracts';
 import type { JobDefinitions } from './contracts';
 import type { JobEventsOptions } from './lifecycle';
-import { JobsError, JobsErrorCode } from './errors';
+import { JobsError, JobsErrorCode, JobsShutdownError } from './errors';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
 const BULLMQ_CONSUMER_CONFIG = Symbol('BULLMQ_CONSUMER_CONFIG');
+const IN_MEMORY_WORKER_ERROR = Symbol('IN_MEMORY_WORKER_ERROR');
+const IN_MEMORY_POOL_SIZE = Symbol('IN_MEMORY_POOL_SIZE');
+const IN_MEMORY_SHUTDOWN_TIMEOUT = Symbol('IN_MEMORY_SHUTDOWN_TIMEOUT');
 
 const IN_MEMORY_WORKER_IDLE_MS = 10;
 const requireModule = createRequire(__filename);
-const BULLMQ_SHUTDOWN_DISTANCE =
+const WORKER_SHUTDOWN_DISTANCE =
   nestCoreMajorVersion() >= 11 ? Number.MIN_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
 
 @Injectable()
@@ -55,39 +62,129 @@ class HandlerDiscovery {
 class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
   private running = false;
   private loop: Promise<void> | null = null;
+  private draining: Promise<void> | null = null;
+  private cursor = 0;
+  private loopFailure: { error: unknown } | null = null;
 
   constructor(
     @Inject(JOBS_WORKERS) private readonly workers: FairWorker[],
+    @Inject(JOBS_BACKEND) private readonly backend: InMemoryBackend,
+    @Inject(IN_MEMORY_POOL_SIZE) private readonly poolSize: number,
+    @Inject(IN_MEMORY_SHUTDOWN_TIMEOUT) private readonly shutdownTimeoutMs: number,
     private readonly handlerDiscovery: HandlerDiscovery,
-  ) {}
+    @Inject(IN_MEMORY_WORKER_ERROR)
+    private readonly workersErrorObserver: ((error: unknown) => void) | undefined,
+    discovery: DiscoveryService,
+  ) {
+    // Drain before feature dependencies are destroyed in either supported Nest major.
+    for (const provider of discovery.getProviders()) {
+      if (provider.token === InMemoryWorkersHost && provider.host) {
+        provider.host.distance = WORKER_SHUTDOWN_DISTANCE;
+      }
+    }
+  }
 
   onApplicationBootstrap(): void {
-    if (this.running) return;
+    if (this.running || this.backend.lifecycleState !== 'open') return;
     this.handlerDiscovery.discover();
     this.running = true;
-    this.loop = this.run();
+    this.loop = this.run().catch((error) => {
+      this.loopFailure = { error };
+      this.running = false;
+    });
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.backend.beginClose();
     this.running = false;
-    await this.loop;
+    this.draining ??= this.drain();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.draining,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new JobsShutdownError(
+                  this.workers.some((worker) => worker.pendingRecoveryJobIds().length)
+                    ? 'worker_error'
+                    : 'deadline',
+                  this.remainingJobIds(),
+                  this.loopFailure?.error,
+                ),
+              ),
+            this.shutdownTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private remainingJobIds(): string[] {
+    return [
+      ...new Set([
+        ...this.backend.pendingJobIds(),
+        ...this.workers.flatMap((worker) => [
+          ...worker.outstandingJobIds(),
+          ...worker.pendingRecoveryJobIds(),
+        ]),
+      ]),
+    ];
+  }
+
+  private async drain(): Promise<void> {
+    try {
+      await this.loop;
+      while (this.remainingJobIds().length) {
+        const picked = this.dispatch();
+        // Yield even under an immediate retry backlog so deadlines can run.
+        await sleep(picked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
+      }
+      await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
+      await this.backend.close();
+    } catch (error) {
+      throw new JobsShutdownError('worker_error', this.remainingJobIds(), error);
+    }
+  }
+
+  private dispatch(): boolean {
+    let picked = false;
+    // A synchronous tick reserves scheduler capacity before its first await.
+    // Rotate types per dispatch to avoid a busy type monopolizing newly free slots.
+    for (let slot = 0; slot < this.poolSize; slot++) {
+      let roundPicked = false;
+      for (let checked = 0; checked < this.workers.length; checked++) {
+        const worker = this.workers[this.cursor];
+        this.cursor = (this.cursor + 1) % this.workers.length;
+        const before = worker.outstandingJobIds().length;
+        void worker.tick().catch((error) => {
+          this.loopFailure = { error };
+          notifyLifecycleObserver(() => this.workersErrorObserver?.(error));
+        });
+        if (worker.outstandingJobIds().length > before) {
+          roundPicked = picked = true;
+          break;
+        }
+      }
+      if (!roundPicked) break;
+    }
+    return picked;
   }
 
   private async run(): Promise<void> {
     while (this.running) {
-      let anyPicked = false;
-      for (const worker of this.workers) {
-        if (!this.running) break;
-        if (await worker.tick()) anyPicked = true;
-      }
-      if (!anyPicked) {
-        await sleep(IN_MEMORY_WORKER_IDLE_MS);
-      }
+      const picked = this.dispatch();
+      await sleep(picked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
     }
   }
 }
 
 interface BullMQConsumerConfig {
+  role: 'producer' | 'worker' | 'both';
+  dynamicRegistration: boolean;
   jobTypes: string[];
   contextRunner: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
   onJobStart?: (event: JobEvent) => void;
@@ -113,14 +210,24 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     // active handlers drain before feature dependencies are destroyed.
     for (const provider of discovery.getProviders()) {
       if (provider.token === BullMQWorkersHost && provider.host) {
-        provider.host.distance = BULLMQ_SHUTDOWN_DISTANCE;
+        provider.host.distance = WORKER_SHUTDOWN_DISTANCE;
       }
     }
   }
 
   onApplicationBootstrap(): void {
     if (this.started) return;
+    if (this.consumerConfig.role === 'producer') {
+      this.started = true;
+      return;
+    }
     this.handlerDiscovery.discover();
+    if (!this.consumerConfig.dynamicRegistration) {
+      const registered = new Set(this.registry.list());
+      for (const type of this.consumerConfig.jobTypes) {
+        if (!registered.has(type)) throw new JobsError(JobsErrorCode.HandlerNotFound, type);
+      }
+    }
     this.backend.startConsumer(this.consumerConfig.jobTypes, {
       registry: this.registry,
       contextRunner: this.consumerConfig.contextRunner,
@@ -138,12 +245,18 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
 }
 
 export interface InMemoryOptions {
+  retention?: RetentionOptions;
+  /** Best-effort observer. Backend operation retries use a 50ms backoff. */
+  onWorkerError?: (error: unknown) => void;
+  /** Graceful drain deadline (default 30 seconds). Timeout rejects; draining continues. */
+  shutdown?: { timeoutMs?: number };
   jobTypes: string[];
   jobs?: JobDefinitions;
   global?: boolean;
   strictCapabilities?: boolean;
   events?: JobEventsOptions;
-  concurrency?: { tenantCap?: number };
+  /** Local module-wide invocation limits. Defaults: pool 10, tenant 10, type = pool. */
+  concurrency?: { poolSize?: number; tenantCap?: number; typeCap?: number };
   fairness?: { minSharePct?: number; defaultWeight?: number };
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
@@ -153,6 +266,10 @@ export interface InMemoryOptions {
 }
 
 export interface BullMQOptions {
+  /** Default both. Worker role rejects JobsService enqueue. Producer never consumes. */
+  role?: 'producer' | 'worker' | 'both';
+  /** Opt out of bootstrap handler checks when registration is intentionally deferred. */
+  dynamicRegistration?: boolean;
   backend: BullMQBackend;
   jobTypes: string[];
   jobs?: JobDefinitions;
@@ -185,9 +302,7 @@ function registerHandlers(
     const handlers = scanner
       .getAllMethodNames(prototype)
       .map((method) => ({
-        jobType: Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]) as
-          | string
-          | undefined,
+        jobType: Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]) as string | undefined,
         method,
       }))
       .filter((handler): handler is { jobType: string; method: string } =>
@@ -275,18 +390,51 @@ function assertJobDefaultsSupported(
 @Module({})
 export class JobsModule {
   static forInMemory(options: InMemoryOptions): DynamicModule {
+    assertJobConfiguration(options.jobTypes, options.jobs);
+    for (const field of ['concurrency', 'shutdown', 'fairness'] as const) {
+      const value = options[field];
+      if (
+        value !== undefined &&
+        (typeof value !== 'object' || value === null || Array.isArray(value))
+      )
+        invalidInput(`${field} must be an object`);
+    }
+    const shutdownTimeoutMs =
+      options.shutdown?.timeoutMs === undefined ? 30_000 : options.shutdown.timeoutMs;
+    if (
+      !Number.isSafeInteger(shutdownTimeoutMs) ||
+      shutdownTimeoutMs <= 0 ||
+      shutdownTimeoutMs > 2_147_483_647
+    ) {
+      invalidInput('shutdown.timeoutMs must be a positive timer-safe integer');
+    }
+    for (const field of ['poolSize', 'tenantCap', 'typeCap'] as const) {
+      if (options.concurrency?.[field] !== undefined)
+        assertPositiveInteger(options.concurrency[field], `concurrency.${field}`);
+    }
+    const poolSize = options.concurrency?.poolSize ?? 10;
+    const tenantCap = options.concurrency?.tenantCap ?? 10;
+    const typeCap = options.concurrency?.typeCap ?? poolSize;
+    const budget = new ExecutionBudget(poolSize, tenantCap);
+    assertPositiveInteger(typeCap, 'concurrency.typeCap');
     const schedOpts: SchedulerOptions = {
-      defaultWeight: options.fairness?.defaultWeight ?? 1,
-      minSharePct: options.fairness?.minSharePct ?? 0.1,
-      tenantCap: options.concurrency?.tenantCap ?? 10,
+      budget,
+      typeCap,
+      defaultWeight:
+        options.fairness?.defaultWeight === undefined ? 1 : options.fairness.defaultWeight,
+      minSharePct: options.fairness?.minSharePct === undefined ? 0.1 : options.fairness.minSharePct,
+      tenantCap,
     };
-    const backend = new InMemoryBackend();
+    const backend = new InMemoryBackend({ retention: options.retention });
     if (options.strictCapabilities) {
       assertJobDefaultsSupported(backend, options.jobs, options.jobTypes);
     }
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
+      { provide: IN_MEMORY_WORKER_ERROR, useValue: options.onWorkerError },
+      { provide: IN_MEMORY_POOL_SIZE, useValue: poolSize },
+      { provide: IN_MEMORY_SHUTDOWN_TIMEOUT, useValue: shutdownTimeoutMs },
       { provide: JOBS_BACKEND, useValue: backend },
       HandlerRegistry,
       {
@@ -343,6 +491,14 @@ export class JobsModule {
   }
 
   static forBullMQ(options: BullMQOptions): DynamicModule {
+    const role = options.role ?? 'both';
+    if (!['producer', 'worker', 'both'].includes(role)) invalidInput('invalid BullMQ role');
+    if (
+      options.dynamicRegistration !== undefined &&
+      typeof options.dynamicRegistration !== 'boolean'
+    )
+      invalidInput('dynamicRegistration must be boolean');
+    assertJobConfiguration(options.jobTypes, options.jobs);
     const runner = options.contextRunner ?? defaultContextRunner;
     if (options.strictCapabilities) {
       assertJobDefaultsSupported(options.backend, options.jobs, options.jobTypes);
@@ -356,6 +512,7 @@ export class JobsModule {
         useFactory: (registry: HandlerRegistry) =>
           new JobsService({
             backend: options.backend,
+            producerEnabled: role !== 'worker',
             registry,
             jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
@@ -376,6 +533,8 @@ export class JobsModule {
           onJobFinish: options.onJobFinish,
           onJobFail: options.onJobFail,
           events: options.events,
+          role,
+          dynamicRegistration: options.dynamicRegistration ?? false,
         } satisfies BullMQConsumerConfig,
       },
       {

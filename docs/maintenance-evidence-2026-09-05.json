@@ -1,0 +1,244 @@
+{
+  "date": "2026-09-05",
+  "scope": "Local uncommitted implementation candidate; not published or merged",
+  "head": "7cb3398acf90b1024354b6a5e928353719b03d3d",
+  "originMain": "405e799367023bb5e868588c85e4ff1fca51d4c0",
+  "published031Commit": "7a173442caea6d7d50b09c9fe01a643cd1afb288",
+  "nextVersionDecision": "0.4.0",
+  "manifestVersion": "0.3.1",
+  "artifact": {
+    "path": "/private/tmp/jobs-maintenance-complete/nestarc-jobs-0.3.1.tgz",
+    "bytes": 89725,
+    "sha256": "cdc5ba0641859957b29d1d156bf4d921e25a3ce6fdfd2ad3c8cceadb8c39801f",
+    "integrity": "sha512-gotnYauHFwt85sBdhBULgn9eBHALf9wzwAsl3SBDpgouDAlay2s05jYedd2RdbxZXZJV66RepsOOt+MvCPQJlQ==",
+    "published": false
+  },
+  "tools": {
+    "node": [
+      "22.23.2",
+      "24.11.1"
+    ],
+    "npm": "11.6.2",
+    "nest": [
+      "10.4.22",
+      "11.2.1"
+    ],
+    "bullmq": [
+      "5.76.2",
+      "5.81.4"
+    ],
+    "jest": "30.5.1",
+    "tsJest": "29.4.12",
+    "eslint": "10.10.0",
+    "eslintJs": "10.0.1",
+    "typescriptEslint": "8.69.0",
+    "typescript": "5.9.3",
+    "jsYaml": "4.3.1"
+  },
+  "checks": {
+    "offlineCi": "PASS",
+    "lint": "PASS",
+    "typecheck": "PASS",
+    "build": "PASS",
+    "changedTsPrettier": "PASS",
+    "unitNode24Nest10": 254,
+    "unitNode22Nest10": 254,
+    "unitNode24Nest11LatestBullmq": 254,
+    "redisFloorEachNode22And24Nest10And11": 48,
+    "redisLatestBullmqNode24Nest11": 48,
+    "coverageTests": 302,
+    "policyTests": 6,
+    "sameFinalTarballConsumers": [
+      "Node24/Nest10.4.22 core",
+      "Node22/Nest11.2.1 core",
+      "Node24/Nest11.2.1/Prisma7.10.0/Outbox0.2.1",
+      "Node24/Nest11.2.1/Prisma7.10.0/Outbox0.3.0"
+    ],
+    "artifactAllowlistAndManifest": "PASS",
+    "samePublishedVersionDifferentBytes": "EXPECTED_FAILURE",
+    "repositoryProtectionBeforeState": "EXPECTED_FAILURE: main unprotected",
+    "nest12.0.1Spike": "ERESOLVE: unsupported peer; runtime not exercised"
+  },
+  "coverage": {
+    "node": "v24.11.1",
+    "ref": "7cb3398acf90b1024354b6a5e928353719b03d3d",
+    "dirty": true,
+    "versions": {
+      "@nestjs/core": "10.4.22",
+      "bullmq": "5.76.2",
+      "jest": "30.5.1",
+      "typescript": "5.9.3"
+    },
+    "coverage": {
+      "lines": {
+        "total": 1742,
+        "covered": 1647,
+        "skipped": 0,
+        "pct": 94.54
+      },
+      "statements": {
+        "total": 1951,
+        "covered": 1805,
+        "skipped": 0,
+        "pct": 92.51
+      },
+      "functions": {
+        "total": 322,
+        "covered": 315,
+        "skipped": 0,
+        "pct": 97.82
+      },
+      "branches": {
+        "total": 1505,
+        "covered": 1317,
+        "skipped": 0,
+        "pct": 87.5
+      },
+      "branchesTrue": {
+        "total": 0,
+        "covered": 0,
+        "skipped": 0,
+        "pct": 100
+      }
+    }
+  },
+  "audit": {
+    "prod": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 0
+    },
+    "full": {
+      "info": 0,
+      "low": 0,
+      "moderate": 4,
+      "high": 0,
+      "critical": 0,
+      "total": 4
+    }
+  },
+  "auditException": {
+    "scope": "Nest10 development compatibility fixture moderate paths",
+    "maintainer": "ksyq12",
+    "expires": "2026-10-05"
+  },
+  "chaos": {
+    "result": "PASS",
+    "cases": [
+      "producer SIGKILL before reserve",
+      "producer SIGKILL after reserve",
+      "producer SIGKILL after add",
+      "stalled worker replacement",
+      "dedicated Redis disconnect and SAVE/restart"
+    ],
+    "leaseSeconds": 60,
+    "leaseShortened": false,
+    "producerPids": [
+      23316,
+      23429,
+      24557
+    ],
+    "project": "jobs-maintenance-20260905",
+    "cleanup": "own container and network removed with docker compose down",
+    "limits": "SAVE plus graceful restart does not prove power-loss durability"
+  },
+  "benchmark": {
+    "enqueueOverheadUs": 23.7,
+    "endToEndUs": 37.3,
+    "singleTenantJobsPerSec": 30605,
+    "hundredTenantJobsPerSec": 30549,
+    "fairnessWorstDeviationPercent": 0,
+    "machineSpecific": true
+  },
+  "externalRemaining": [
+    "JOBS-PLAN-01 public review/merge",
+    "M12 main/tag/environment policy and npm trusted publisher verification",
+    "M22 upstream Outbox stop/drain and retry-budget protection across shutdown",
+    "M24 private vulnerability reporting enablement and delivery evidence",
+    "JOBS-REL-01 new release",
+    "TEN-ECO-NEXT published PostgreSQL/Redis integration"
+  ],
+  "newPersonAssignmentRequired": false,
+  "p4": "BACKLOG per specification",
+  "logs": [
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-unit.log",
+      "sha256": "be6374f4710530ad486420bbc87fca7428af6524d617f2801926917a3a89d2d5"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-node22-unit.log",
+      "sha256": "327c5ab58a25231b9cd328357ab09a6e4d56df763d67d01ede98fb2fb08b6441"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-node22-redis.log",
+      "sha256": "6758ae1cc28bc618a5f8ab63e434cb7471b403d4428afcf66a5756e837da5fd4"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-nest11-floor-redis.log",
+      "sha256": "a847a433f09085b10b783a4f6639be3574da5d8446b05d34ebbc4b61282c4b46"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-nest11-node22-redis.log",
+      "sha256": "e704259a4c6ea20da7218b7f00fd4f30221168c1f61887bd6a522ebf12ea9847"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-nest11-final-unit.log",
+      "sha256": "f58e921b66f7983171915a1038f4d3394c890cb0cdcc10b8c75c3dfb0e02c92e"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-latest-v5-redis.log",
+      "sha256": "186a26ea3927b6028a0f5538810d3b2f1d3446e7a71ce9dca0b98eea35b9ed23"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-coverage.log",
+      "sha256": "e1101e864500ba968845268f8568d0f9d77b8301ddc5b3d60b1ab95acf3ce602"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-core10.log",
+      "sha256": "3218f71b390d9bc317c38d1377c40c7d3862c897502960fc206a850e8b8265e7"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-core11-node22.log",
+      "sha256": "f62b3fc42b542f8feeac67dc8670ea9220aeb27bde58c59725235ece549e18bd"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-outbox021.log",
+      "sha256": "768aa59f9f4d5327e33d4f721cc09c45453258e8f510e168be3a564c0c3cb525"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-outbox030.log",
+      "sha256": "2244f7c168d6aa97bbb2442462f4116b1539947521bd7b5b5593d0638b90ceed"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-policy.log",
+      "sha256": "d645162580afb8f15e01fee68a9ad92779e8c0185c23f30a1d74414e743c547c"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-chaos-final.log",
+      "sha256": "7112a233307a4981cdc934a30779bf325356cdd4cf0ca9a35fcbf4bdc908332a"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-bench.log",
+      "sha256": "49bdff678d73a99560d850a40a82cd72829924efe97c8228c75e60e2387f63c4"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-complete-artifact-negative.log",
+      "sha256": "06e0e491aef75ece7cedcd05269a2ddbc9b35169defd2f94de6d8569058140fb"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-repository-policy-negative.log",
+      "sha256": "f739dc47c1823f0a3bc149c72cafc1539b08711608f19eda6b93b4310376655f"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-nest12-spike.log",
+      "sha256": "60f2ab836c0ec181f1cf26ea528953dc9511d4cd11080367e3c4ccd7003c623b"
+    },
+    {
+      "path": "/private/tmp/jobs-maintenance-final-ci.log",
+      "sha256": "14b780567f608aec43898ee260d878dfc0e7c0603a9b23791f506c5263c6d055"
+    }
+  ]
+}

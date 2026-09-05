@@ -1,0 +1,22 @@
+[
+  "verify / BullMQ v5 (5.76.2)",
+  "verify / BullMQ v5 (5.81.4)",
+  "verify / Consumer (Node 22, Nest 10.4.22)",
+  "verify / Consumer (Node 22, Nest 11.2.1)",
+  "verify / Consumer (Node 24, Nest 10.4.22)",
+  "verify / Consumer (Node 24, Nest 11.2.1)",
+  "verify / Exact Outbox candidate",
+  "verify / Modern Outbox 0.2.1 availability",
+  "verify / Modern Outbox consumer (Nest 11.2.1, Prisma 7.10.0)",
+  "verify / Module lifecycle (Nest 10)",
+  "verify / Module lifecycle (Nest 11)",
+  "verify / Redis (Node 22, Nest 10)",
+  "verify / Redis (Node 22, Nest 11)",
+  "verify / Redis (Node 24, Nest 10)",
+  "verify / Redis (Node 24, Nest 11)",
+  "verify / Unit (Node 22)",
+  "verify / Unit (Node 24)",
+  "verify / coverage",
+  "verify / package-smoke",
+  "verify / quality"
+]

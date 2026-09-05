@@ -1,5 +1,7 @@
 import { JobsError, JobsErrorCode } from './errors';
-import type { JobContext } from './types';
+import { portableRecord } from './portable-value';
+import { assertIdentifier, invalidInput } from './enqueue-validation';
+import type { EnqueueOptions, JobContext } from './types';
 
 export const CONTEXT_KEY = '__nestarcCtx';
 export const INTERNAL_JOB_KEY = '__nestarcJob';
@@ -8,9 +10,10 @@ export function attachContext<T extends Record<string, unknown>>(
   payload: T,
   context: JobContext | undefined,
 ): T & { [CONTEXT_KEY]: JobContext } {
-  assertPlainRecord(payload, 'job payload');
-  const resolvedContext = context ?? {};
-  assertPlainRecord(resolvedContext, 'job context');
+  const normalizedPayload = portableRecord(payload, 'job payload');
+  const resolvedContext = portableRecord(context === undefined ? {} : context, 'job context');
+  if (resolvedContext.tenantId !== undefined)
+    assertIdentifier(resolvedContext.tenantId, 'tenantId');
   const reservedKey = [CONTEXT_KEY, INTERNAL_JOB_KEY].find((key) => key in payload);
   if (reservedKey) {
     throw new JobsError(
@@ -18,7 +21,9 @@ export function attachContext<T extends Record<string, unknown>>(
       `payload must not contain "${reservedKey}"`,
     );
   }
-  return { ...payload, [CONTEXT_KEY]: resolvedContext };
+  return { ...normalizedPayload, [CONTEXT_KEY]: resolvedContext } as T & {
+    [CONTEXT_KEY]: JobContext;
+  };
 }
 
 export function detachContext<T extends Record<string, unknown>>(
@@ -27,18 +32,35 @@ export function detachContext<T extends Record<string, unknown>>(
   const { [CONTEXT_KEY]: context, ...payload } = envelope as T & {
     [CONTEXT_KEY]?: JobContext;
   };
-  return { payload: payload as Omit<T, typeof CONTEXT_KEY>, context: context ?? {} };
+  return {
+    payload: payload as Omit<T, typeof CONTEXT_KEY>,
+    context: context === undefined ? {} : context,
+  };
 }
 
-function assertPlainRecord(
-  value: unknown,
-  label: string,
-): asserts value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new TypeError(`${label} must be a plain object`);
+/** Direct backend callers supply the same envelope as JobsService. */
+export function preparePortableEnqueue(
+  envelope: Record<string, unknown>,
+  opts: EnqueueOptions,
+): { envelope: Record<string, unknown>; opts: EnqueueOptions } {
+  if (typeof envelope === 'object' && envelope !== null && INTERNAL_JOB_KEY in envelope) {
+    throw new JobsError(JobsErrorCode.ReservedPayloadKey, INTERNAL_JOB_KEY);
   }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError(`${label} must be a plain object`);
-  }
+  const normalized = portableRecord(envelope, 'job envelope');
+  const { payload, context } = detachContext(normalized);
+  const attached = attachContext(payload, context);
+  if (opts.context !== undefined) portableRecord(opts.context, 'options.context');
+  if (opts.dedupe?.scope === 'tenant' && !context.tenantId)
+    invalidInput('tenant-scoped dedupe requires tenantId');
+  return {
+    envelope: attached,
+    opts: {
+      ...opts,
+      context,
+      metadata: portableRecord(opts.metadata === undefined ? {} : opts.metadata, 'job metadata'),
+      backoff: opts.backoff ? { ...opts.backoff } : undefined,
+      dedupe: opts.dedupe ? { ...opts.dedupe } : undefined,
+      scheduledFor: opts.scheduledFor ? new Date(opts.scheduledFor.getTime()) : undefined,
+    },
+  };
 }

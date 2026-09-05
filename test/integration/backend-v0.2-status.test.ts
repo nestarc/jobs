@@ -41,8 +41,8 @@ describe('v0.2 backend status and capabilities', () => {
       maxAttempts: 1,
     });
 
-    await backend.moveToActive('email.send', jobId);
-    await backend.ack('email.send', jobId);
+    const activation = await backend.moveToActive('email.send', jobId);
+    await backend.ack('email.send', jobId, activation!.activationId!);
 
     expect(await service.getJob(jobId)).toMatchObject({
       id: jobId,

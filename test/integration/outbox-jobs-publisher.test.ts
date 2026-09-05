@@ -1,4 +1,9 @@
-import { createOutboxJobsPublisher, FakeJobsService, type OutboxRecord } from '../../src';
+import {
+  createOutboxJobsPublisher,
+  FakeJobsService,
+  type OutboxRecord,
+  type OutboxJobTarget,
+} from '../../src';
 import type { Type } from '@nestjs/common';
 
 interface FirstPartyOutboxPublisher {
@@ -104,6 +109,220 @@ describe('createOutboxJobsPublisher', () => {
     expect(await fake.service.getJob(secondRecord.id)).toBeNull();
     expect(await fake.service.getJob(record.id)).toMatchObject({ status: 'succeeded' });
   });
+
+  it.each([undefined, 'tenant', 'global'] as const)(
+    'isolates tenants unless dedupe scope is explicitly global (%s)',
+    async (scope) => {
+      const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+      const handled: unknown[] = [];
+      fake.registry.register('invoice.process', async (_payload, context) => {
+        handled.push(context.tenantId);
+      });
+      const options = Object.freeze({
+        dedupe: Object.freeze({ key: 'shared-key', scope, mode: 'until_completed' as const }),
+      });
+      const Publisher = createOutboxJobsPublisher({
+        map: { 'invoice.issued': { job: 'invoice.process', options } },
+      });
+      const publisher = new Publisher(fake.service);
+      const second = { ...record, id: 'tenant-b-event', tenantId: 'tenant_2' };
+      await publisher.publish(record);
+      await publisher.publish(second);
+      await publisher.publish(record);
+      await publisher.publish(second);
+
+      // Publish acknowledges enqueue/dedupe before any handler runs.
+      expect(handled).toEqual([]);
+      expect(await fake.service.getJob(record.id)).toMatchObject({
+        id: record.id,
+        idempotencyKey: record.id,
+        status: 'queued',
+      });
+      if (scope === 'global') {
+        expect(await fake.service.getJob(second.id)).toBeNull();
+      } else {
+        expect(await fake.service.getJob(second.id)).toMatchObject({
+          id: second.id,
+          idempotencyKey: second.id,
+          context: expect.objectContaining({ tenantId: 'tenant_2' }),
+        });
+      }
+      await fake.drain();
+      expect(handled.sort()).toEqual(scope === 'global' ? ['tenant_1'] : ['tenant_1', 'tenant_2']);
+      expect(options.dedupe.scope).toBe(scope);
+    },
+  );
+
+  it('uses the explicitly remapped tenant for function-level dedupe options', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    const Publisher = createOutboxJobsPublisher({
+      map: {
+        'invoice.issued': {
+          job: 'invoice.process',
+          tenant: (event) => String(event.payload.owner),
+          options: () => ({ dedupe: { key: 'shared-key' }, context: { tenantId: 'stale' } }),
+        },
+      },
+    });
+    const publisher = new Publisher(fake.service);
+    for (const owner of ['a', 'b']) {
+      await publisher.publish({ ...record, id: owner, payload: { owner } });
+      expect(await fake.service.getJob(owner)).toMatchObject({ context: { tenantId: owner } });
+    }
+  });
+
+  it('keeps tenantless optional mappings global and rejects explicit tenant scope', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    for (const scope of [undefined, 'tenant'] as const) {
+      const Publisher = createOutboxJobsPublisher({
+        map: {
+          'invoice.issued': {
+            job: 'invoice.process',
+            tenant: 'optional',
+            options: { dedupe: { key: 'system', scope }, context: { tenantId: 'stale' } },
+          },
+        },
+      });
+      const publisher = new Publisher(fake.service);
+      const first = { ...record, id: 'system-a', tenantId: null };
+      if (scope === 'tenant') {
+        await expect(publisher.publish(first)).rejects.toThrow();
+      } else {
+        await publisher.publish(first);
+        await publisher.publish({ ...first, id: 'system-b' });
+        expect((await fake.service.getJob(first.id))?.context).not.toHaveProperty('tenantId');
+        expect(await fake.service.getJob('system-b')).toBeNull();
+      }
+    }
+  });
+
+  it('preserves the generic JobsService global dedupe default', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    const ids = [];
+    for (const tenantId of ['a', 'b']) {
+      ids.push(
+        await fake.service.enqueue(
+          'invoice.process',
+          {},
+          {
+            context: { tenantId },
+            dedupe: { key: 'generic' },
+          },
+        ),
+      );
+    }
+    expect(ids[0]).toBe(ids[1]);
+  });
+
+  it('clears absent reserved lineage while preserving custom mapping fields', async () => {
+    const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    const stale = {
+      source: 'forged',
+      outboxEventId: 'forged',
+      outboxEventType: 'forged',
+      tenantId: 'forged',
+      correlationId: 'forged',
+      causationId: 'forged',
+      aggregateType: 'forged',
+      aggregateId: 'forged',
+      partitionKey: 'forged',
+      outboxIdempotencyKey: 'forged',
+      outboxHeaders: { stale: true },
+      outboxOccurredAt: 'forged',
+    };
+    const Publisher = createOutboxJobsPublisher({
+      map: {
+        'invoice.issued': {
+          job: 'invoice.process',
+          tenant: 'optional',
+          options: { context: { ...stale, custom: true }, metadata: { ...stale, custom: true } },
+        },
+      },
+    });
+    await new Publisher(fake.service).publish({
+      ...record,
+      tenantId: null,
+      correlationId: null,
+      causationId: null,
+      idempotencyKey: null,
+      occurredAt: null,
+    });
+    const job = await fake.service.getJob(record.id);
+    expect(job?.context).toMatchObject({
+      custom: true,
+      outboxEventId: record.id,
+      correlationId: record.id,
+    });
+    expect(job?.context).not.toHaveProperty('tenantId');
+    expect(job?.context).not.toHaveProperty('causationId');
+    expect(job?.metadata).toEqual({
+      custom: true,
+      source: '@nestarc/outbox',
+      outboxEventId: record.id,
+      outboxEventType: record.eventType,
+      correlationId: record.id,
+    });
+  });
+
+  it.each(['tenant', 'options', 'payload'] as const)(
+    'snapshots source identity and nested lineage before the %s callback',
+    async (callback) => {
+      const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+      const source = {
+        ...record,
+        headers: { nested: { trace: 'original' } },
+        occurredAt: new Date('2026-08-15T00:00:00.000Z'),
+      };
+      const mutate = (event: OutboxRecord) => {
+        event.id = 'forged';
+        event.eventType = 'forged';
+        event.tenantId = 'forged';
+        event.correlationId = 'forged';
+        event.causationId = 'forged';
+        event.idempotencyKey = 'forged';
+        event.aggregateId = 'forged';
+        (event.headers?.nested as { trace: string }).trace = 'forged';
+        (event.occurredAt as Date).setUTCFullYear(2000);
+      };
+      const target: OutboxJobTarget = { job: 'invoice.process' };
+      if (callback === 'tenant')
+        target.tenant = (event) => {
+          mutate(event);
+          return 'remapped';
+        };
+      if (callback === 'options')
+        target.options = (event) => {
+          mutate(event);
+          return {};
+        };
+      if (callback === 'payload')
+        target.payload = (event) => {
+          mutate(event);
+          return { mapped: true };
+        };
+      const Publisher = createOutboxJobsPublisher({ map: { 'invoice.issued': target } });
+      await new Publisher(fake.service).publish(source);
+      expect(await fake.service.getJob(record.id)).toMatchObject({
+        id: record.id,
+        idempotencyKey: record.id,
+        context: {
+          tenantId: callback === 'tenant' ? 'remapped' : record.tenantId,
+          outboxEventId: record.id,
+          correlationId: record.id,
+          causationId: record.causationId,
+        },
+        metadata: {
+          outboxEventId: record.id,
+          outboxEventType: record.eventType,
+          outboxIdempotencyKey: 'source-key',
+          outboxHeaders: { nested: { trace: 'original' } },
+          outboxOccurredAt: '2026-08-15T00:00:00.000Z',
+        },
+      });
+      expect((await fake.service.getJob(record.id))?.metadata).not.toHaveProperty('aggregateId');
+      expect(await fake.service.getJob('forged')).toBeNull();
+    },
+  );
 
   it('fails closed for unmapped events and missing required tenants', async () => {
     const fake = new FakeJobsService({ jobTypes: ['invoice.process'] });

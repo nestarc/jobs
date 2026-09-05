@@ -7,8 +7,14 @@ const os = require('node:os');
 const path = require('node:path');
 
 const projectRoot = path.resolve(__dirname, '..');
+if (process.env.JOBS_TARBALL_DIR) {
+  const files = fs.readdirSync(process.env.JOBS_TARBALL_DIR).filter((f) => f.endsWith('.tgz'));
+  if (files.length !== 1) throw new Error('exactly one candidate tarball required');
+  process.env.JOBS_TARBALL = path.join(process.env.JOBS_TARBALL_DIR, files[0]);
+}
 const fixturePath = path.join(projectRoot, 'test', 'consumer', 'modern-outbox.ts');
-const expectedOutboxVersion = '0.2.1';
+const expectedOutboxVersion = process.env.OUTBOX_EXPECTED_VERSION ?? '0.2.1';
+if (!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(expectedOutboxVersion)) throw new Error('exact expected Outbox version required');
 const exactVersions = Object.freeze({
   '@nestjs/common': '11.2.1',
   '@nestjs/core': '11.2.1',
@@ -150,8 +156,8 @@ function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jobs-modern-consumer-'));
 
   try {
-    run('npm', ['run', 'build']);
-    const tarballName = run(
+    if (!process.env.JOBS_TARBALL) run('npm', ['run', 'build']);
+    const tarballName = process.env.JOBS_TARBALL ? path.basename(process.env.JOBS_TARBALL) : run(
       'npm',
       ['pack', '--ignore-scripts', '--silent', '--pack-destination', tempDir],
       { capture: true },
@@ -160,7 +166,7 @@ function main() {
       .at(-1);
     if (!tarballName) throw new Error('npm pack did not report a Jobs tarball name');
 
-    const jobsTarball = path.join(tempDir, tarballName);
+    const jobsTarball = process.env.JOBS_TARBALL ? fs.realpathSync(process.env.JOBS_TARBALL) : path.join(tempDir, tarballName);
     const jobsSha256 = sha256(jobsTarball);
     const jobsIntegrity = sriSha512(jobsTarball);
     const consumerDir = path.join(tempDir, 'consumer');
@@ -239,8 +245,8 @@ function main() {
     if (jobsManifest.name !== '@nestarc/jobs') {
       throw new Error(`Packed Jobs artifact has unexpected name ${jobsManifest.name}`);
     }
-    if (jobsManifest.peerDependencies?.['@nestarc/outbox'] !== '^0.2.0') {
-      throw new Error('Packed Jobs artifact no longer declares the verified Outbox ^0.2.0 range');
+    if (jobsManifest.peerDependencies?.['@nestarc/outbox'] !== '^0.2.1 || ^0.3.0') {
+      throw new Error('Packed Jobs artifact no longer declares the verified Outbox ^0.2.1 || ^0.3.0 range');
     }
     if (outboxManifest.name !== '@nestarc/outbox') {
       throw new Error(`Outbox artifact has unexpected name ${outboxManifest.name}`);
@@ -280,6 +286,7 @@ function main() {
     if (lockedJobs.integrity !== jobsIntegrity) {
       throw new Error('Packed Jobs artifact lock integrity does not match its SHA-512 digest');
     }
+    if (process.env.OUTBOX_EXPECTED_INTEGRITY && lockedOutbox.integrity !== process.env.OUTBOX_EXPECTED_INTEGRITY) throw new Error('Outbox artifact differs from candidate manifest integrity');
     if (localOutboxCandidate && lockedOutbox.integrity !== outboxIntegrity) {
       throw new Error('Outbox candidate lock integrity does not match its SHA-512 digest');
     }

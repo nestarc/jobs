@@ -58,11 +58,14 @@ export interface BackendCapabilities {
   deadLetter: boolean;
   fairness: 'none' | 'local-tenant';
   manualDrain: boolean;
+  /** Required by FairWorker: completion is fenced by an opaque activation token. */
+  activationFencing?: boolean;
 }
 
 export type JobLifecycleEventType =
   | 'job.enqueued'
   | 'job.started'
+  | 'job.timed_out'
   | 'job.succeeded'
   | 'job.failed'
   | 'job.retry_scheduled'

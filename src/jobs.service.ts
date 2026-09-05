@@ -1,4 +1,4 @@
-import { attachContext } from './context-serializer';
+import { attachContext, preparePortableEnqueue, detachContext } from './context-serializer';
 import { JobsError, JobsErrorCode } from './errors';
 import type { JobsBackend } from './backend/jobs-backend.interface';
 import type { HandlerRegistry } from './handler-registry';
@@ -6,7 +6,12 @@ import type { Scheduler, SchedulerEnqueueTiming } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
 import { notifyLifecycleObserver, snapshotLifecycleValue } from './lifecycle-observer';
-import { assertValidJobId } from './enqueue-validation';
+import {
+  assertIdentifier,
+  assertEnqueueOptions,
+  assertJobType,
+  assertJobConfiguration,
+} from './enqueue-validation';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -18,6 +23,7 @@ import type {
 } from './lifecycle';
 
 export interface JobsServiceDeps {
+  producerEnabled?: boolean;
   backend: JobsBackend;
   registry: HandlerRegistry;
   schedulers?: Map<string, Scheduler>;
@@ -34,7 +40,9 @@ export class JobsService {
 
   constructor(private readonly deps: JobsServiceDeps) {
     this.schedulers = deps.schedulers ?? new Map();
-    this.jobTypes = new Set(deps.jobTypes ?? this.schedulers.keys());
+    this.jobTypes = new Set(
+      assertJobConfiguration(deps.jobTypes ?? this.schedulers.keys(), deps.jobs),
+    );
   }
 
   async enqueue(
@@ -50,8 +58,14 @@ export class JobsService {
     payload: object,
     opts: EnqueueOptions<object, object> = {},
   ): Promise<EnqueueResult> {
+    if (this.deps.producerEnabled === false)
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        'worker role cannot enqueue; use both',
+      );
+    assertJobType(jobType);
     this.assertKnownJobType(jobType);
-    assertValidJobId(opts.jobId);
+    assertEnqueueOptions(opts);
     const defaults = this.jobDefaults(jobType);
     const effectiveOpts: EnqueueOptions<object, object> = {
       ...opts,
@@ -59,23 +73,32 @@ export class JobsService {
       backoff: opts.backoff ?? defaults.backoff,
       timeoutMs: opts.timeoutMs ?? defaults.timeoutMs,
     };
-    this.assertEnqueueCapabilities(effectiveOpts);
+    assertEnqueueOptions(effectiveOpts);
 
-    const context = (effectiveOpts.context ?? this.deps.contextExtractor?.() ?? {}) as JobContext;
-    const envelope = attachContext(payload as Record<string, unknown>, context);
-    const backendOpts: EnqueueOptions = {
-      ...effectiveOpts,
-      context,
-      metadata: effectiveOpts.metadata as Record<string, unknown> | undefined,
-    };
+    const inputContext = (
+      effectiveOpts.context === undefined
+        ? (this.deps.contextExtractor?.() ?? {})
+        : effectiveOpts.context
+    ) as JobContext;
+    const prepared = preparePortableEnqueue(
+      attachContext(payload as Record<string, unknown>, inputContext),
+      {
+        ...effectiveOpts,
+        context: inputContext,
+        metadata: effectiveOpts.metadata as Record<string, unknown> | undefined,
+      },
+    );
+    this.assertEnqueueCapabilities(effectiveOpts);
+    const { envelope, opts: backendOpts } = prepared;
+    const { context } = detachContext(envelope);
     let enqueueNotified = false;
     const notifyEnqueued = (result: EnqueueResult): void => {
       if (enqueueNotified || result.status !== 'created') return;
       enqueueNotified = true;
-      const tenantId = (context.tenantId as string | undefined) ?? '__default__';
+      const tenantId = context.tenantId as string | undefined;
       this.schedulers
         .get(jobType)
-        ?.onEnqueue(result.jobId, tenantId, this.schedulerTiming(effectiveOpts));
+        ?.onEnqueue(result.jobId, tenantId, this.schedulerTiming(backendOpts));
       notifyLifecycleObserver(() =>
         this.deps.events?.onEvent?.({
           type: 'job.enqueued',
@@ -100,6 +123,15 @@ export class JobsService {
 
   capabilities(): BackendCapabilities {
     return this.deps.backend.capabilities();
+  }
+
+  /** Authorization remains the caller's responsibility; mismatches look like missing IDs. */
+  async getJobForTenant(jobId: string, expectedTenantId: string): Promise<JobRecord | null> {
+    assertIdentifier(expectedTenantId, 'expectedTenantId');
+    const record = await this.getJob(jobId);
+    return (record?.context as JobContext | undefined)?.tenantId === expectedTenantId
+      ? record
+      : null;
   }
 
   getJob<TPayload = unknown, TContext = unknown>(
@@ -166,7 +198,7 @@ export class JobsService {
       : null;
     if (record && !this.isTerminal(record.status)) {
       const tenantId = (record.context as JobContext | undefined)?.tenantId;
-      const schedulerTenantId = tenantId ?? '__default__';
+      const schedulerTenantId = tenantId;
       if (
         record.status === 'queued' ||
         record.status === 'delayed' ||
@@ -234,7 +266,7 @@ export class JobsService {
     );
   }
 
-  setTenantWeight(jobType: string, tenantId: string, weight: number): void {
+  setTenantWeight(jobType: string, tenantId: string | undefined, weight: number): void {
     this.requireScheduler(jobType).setWeight(tenantId, weight);
   }
 

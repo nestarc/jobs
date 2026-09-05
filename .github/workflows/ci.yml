@@ -10,13 +10,42 @@ on:
         required: false
         type: string
         default: ''
+      modern_outbox_version:
+        description: Expected exact version for the separate candidate lane
+        required: false
+        type: string
+        default: ''
+      modern_outbox_integrity:
+        description: Expected SHA-512 SRI for the separate candidate lane
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
     with:
-      modern_outbox_package: ${{ inputs.modern_outbox_package || '' }}
+      modern_outbox_package: ${{ inputs.modern_outbox_package || '@nestarc/outbox@0.3.0' }}
+      modern_outbox_version: ${{ inputs.modern_outbox_version || (inputs.modern_outbox_package == '' && '0.3.0') || '' }}
+      modern_outbox_integrity: ${{ inputs.modern_outbox_integrity || (inputs.modern_outbox_package == '' && 'sha512-rbPiDgQCNVtQifVf01we+vREYDDwccpezc5cSlaoa8VeIW3NxmGWrMe8ccwQRex/pF2MxlFW4K645SDbN27evQ==') || '' }}
+
+  repository-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Verify repository release protection with read-only permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-repository-policy.js

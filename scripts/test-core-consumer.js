@@ -1,0 +1,24 @@
+'use strict';
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const { digest } = require('./lib/release-artifact');
+const inputDir = process.env.JOBS_TARBALL_DIR;
+const inputFiles = inputDir ? fs.readdirSync(inputDir).filter((f) => f.endsWith('.tgz')) : [];
+if (inputDir && inputFiles.length !== 1) throw new Error('exactly one candidate tarball required');
+const artifact = fs.realpathSync(process.env.JOBS_TARBALL ?? path.join(inputDir, inputFiles[0]));
+const nest = process.env.CORE_NEST_VERSION ?? '10.4.22';
+if (!/^(10|11)\.\d+\.\d+$/.test(nest)) throw new Error('CORE_NEST_VERSION must be a supported exact release');
+const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'jobs-core-consumer-'));
+function run(command, args) { execFileSync(command, args, { cwd: directory, stdio: 'inherit' }); }
+fs.writeFileSync(path.join(directory, 'package.json'), '{"name":"jobs-core-proof","version":"1.0.0","private":true}');
+fs.copyFileSync(path.resolve(__dirname, '../test/consumer/maintenance-core.ts'), path.join(directory, 'index.ts'));
+run('npm', ['install', '--strict-peer-deps', '--legacy-peer-deps=false', '--force=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', artifact, `@nestjs/common@${nest}`, `@nestjs/core@${nest}`, 'reflect-metadata@0.2.2', 'rxjs@7.8.2', 'typescript@5.9.3', '@types/node@22.19.11']);
+run('npm', ['ls', '--all']);
+const lock = JSON.parse(fs.readFileSync(path.join(directory, 'package-lock.json'), 'utf8'));
+if (lock.packages['node_modules/@nestarc/jobs'].integrity !== digest(fs.readFileSync(artifact))) throw new Error('core consumer installed different artifact bytes');
+run('npx', ['--no-install', 'tsc', '--strict', '--skipLibCheck', 'false', '--noEmitOnError', '--target', 'ES2022', '--module', 'commonjs', '--moduleResolution', 'node', '--esModuleInterop', '--outDir', 'dist', 'index.ts']);
+run(process.execPath, ['dist/index.js']);
+run(process.execPath, ['-e', "const assert=require('node:assert/strict'); require('@nestarc/jobs/package.json'); assert.equal(typeof require('@nestarc/jobs/dist/backend/in-memory-backend').InMemoryBackend,'function');"]);
+console.log(JSON.stringify({ directory, artifact, integrity: digest(fs.readFileSync(artifact)), nest, node: process.version, result: 'PASS' }));

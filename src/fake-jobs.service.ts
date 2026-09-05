@@ -1,3 +1,5 @@
+import { JobsError, JobsErrorCode } from './errors';
+import { assertPositiveInteger } from './enqueue-validation';
 import { HandlerRegistry } from './handler-registry';
 import { Scheduler, SchedulerOptions } from './scheduler';
 import { InMemoryBackend } from './backend/in-memory-backend';
@@ -61,12 +63,19 @@ export class FakeJobsService {
   }
 
   async drainUntilIdle(maxIterations = 1000): Promise<void> {
+    assertPositiveInteger(maxIterations, 'maxIterations');
     for (let i = 0; i < maxIterations; i++) {
       let anyPicked = false;
       for (const worker of this.workers) {
         if (await worker.tick()) anyPicked = true;
       }
       if (!anyPicked) return;
+    }
+    if ([...this.schedulers.values()].some((scheduler) => scheduler.hasReadyJobs())) {
+      throw new JobsError(
+        JobsErrorCode.DrainLimitExceeded,
+        `${maxIterations} iterations; ready jobs remain`,
+      );
     }
   }
 }

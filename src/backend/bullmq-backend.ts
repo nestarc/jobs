@@ -1,17 +1,32 @@
+import { decodeEnvelope, INTERNAL_VERSION, type PersistedJobMetadata } from './bullmq/codec';
+import {
+  withIdentityLocks,
+  COMPARE_AND_DELETE_SCRIPT,
+  type IdentityRedisClient,
+} from './bullmq/identity-lock';
+import { notifyCompleted, notifyFailed } from './bullmq/lifecycle';
+import { closeOwnedResources } from './bullmq/resources';
+import {
+  validateRetention,
+  assertRetentionMaintenance,
+  type RetentionOptions,
+  type RetentionCleanupOptions,
+} from '../retention';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } from 'bullmq';
-import { detachContext, INTERNAL_JOB_KEY } from '../context-serializer';
+import { preparePortableEnqueue, detachContext, INTERNAL_JOB_KEY } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
 import { normalizeError } from '../error-utils';
-import { assertValidJobId } from '../enqueue-validation';
-import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
 import {
-  notifyLifecycleObserver,
-  snapshotLifecycleError,
-  snapshotLifecycleValue,
-} from '../lifecycle-observer';
+  assertEnqueueOptions,
+  assertJobType,
+  assertJobConfiguration,
+  assertPositiveInteger,
+} from '../enqueue-validation';
+import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
+import { notifyLifecycleObserver, snapshotLifecycleValue } from '../lifecycle-observer';
 import type { EnqueueCommitObserver, JobsBackend } from './jobs-backend.interface';
 import type { DedupeOptions, EnqueueOptions, JobContext, JobEnvelope, JobEvent } from '../types';
 import type { HandlerRegistry } from '../handler-registry';
@@ -25,14 +40,8 @@ import type {
 } from '../lifecycle';
 
 const INTERNAL_KEY = INTERNAL_JOB_KEY;
-const INTERNAL_VERSION = 1;
 const CUSTOM_BACKOFF_TYPE = 'nestarc';
-const IDENTITY_LOCK_TTL_MS = 60_000;
-const IDENTITY_LOCK_WAIT_MS = 30_000;
-const IDENTITY_LOCK_RETRY_MS = 10;
 const IDENTITY_BIND_RETRY_LIMIT = 3;
-const COMPARE_AND_DELETE_SCRIPT =
-  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 const COMPARE_AND_PEXPIRE_SCRIPT =
   "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end";
 const ATOMIC_BIND_IDENTITIES_SCRIPT = `
@@ -48,22 +57,6 @@ return 1
 `;
 
 type BullMQModule = typeof import('bullmq');
-
-interface PersistedJobMetadata {
-  version: typeof INTERNAL_VERSION;
-  metadata: Record<string, unknown>;
-  scheduledFor?: number;
-  idempotencyKey?: string;
-  dedupeKey?: string;
-  enqueueToken: string;
-  backoff?: BackoffPolicy;
-}
-
-interface DecodedEnvelope {
-  payload: Record<string, unknown>;
-  context: JobContext;
-  internal?: PersistedJobMetadata;
-}
 
 type PersistentIdentity =
   | {
@@ -99,23 +92,8 @@ interface IdentityResolution {
   reservedJobId?: string;
 }
 
-interface IdentityRedisClient {
-  get(key: string): Promise<string | null>;
-  zscore(key: string, member: string): Promise<string | null>;
-  set(key: string, value: string): Promise<unknown>;
-  set(key: string, value: string, condition: 'NX'): Promise<'OK' | null>;
-  set(
-    key: string,
-    value: string,
-    expiryMode: 'PX',
-    ttlMs: number,
-    condition: 'NX',
-  ): Promise<'OK' | null>;
-  del(...keys: string[]): Promise<number>;
-  eval(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown>;
-}
-
 export interface BullMQBackendOptions {
+  retention?: RetentionOptions;
   namespace?: string;
   /** BullMQ/ioredis connection object. Kept structural so BullMQ remains an optional peer. */
   connection: object;
@@ -138,6 +116,8 @@ export interface BullMQConsumerOptions {
 }
 
 export class BullMQBackend implements JobsBackend {
+  private readonly retention: RetentionOptions | undefined;
+  private retentionOperation: Promise<number> | null = null;
   private readonly queues = new Map<string, Queue>();
   private readonly workers = new Map<string, Worker>();
   private readonly activeHandlerScope = new AsyncLocalStorage<boolean>();
@@ -149,6 +129,10 @@ export class BullMQBackend implements JobsBackend {
   private closed = false;
 
   constructor(private readonly opts: BullMQBackendOptions) {
+    validateRetention(opts.retention);
+    this.retention = opts.retention ? Object.freeze({ ...opts.retention }) : undefined;
+    if (opts.workerConcurrency !== undefined)
+      assertPositiveInteger(opts.workerConcurrency, 'workerConcurrency');
     const namespace = opts.namespace ?? 'nestarc';
     if (namespace.includes('.')) {
       throw new TypeError('BullMQ namespace must not contain "."');
@@ -173,7 +157,7 @@ export class BullMQBackend implements JobsBackend {
   }
 
   registerJobTypes(jobTypes: Iterable<string>): void {
-    for (const jobType of jobTypes) this.getOrCreateQueue(jobType);
+    for (const jobType of assertJobConfiguration(jobTypes)) this.getOrCreateQueue(jobType);
   }
 
   async enqueue(
@@ -190,7 +174,9 @@ export class BullMQBackend implements JobsBackend {
     opts: EnqueueOptions,
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
-    assertValidJobId(opts.jobId);
+    assertJobType(jobType);
+    assertEnqueueOptions(opts);
+    ({ envelope, opts } = preparePortableEnqueue(envelope, opts));
     this.assertAcceptingWork();
     const operation = this.performEnqueueDetailed(jobType, envelope, opts, onCommit);
     this.inFlightEnqueues.add(operation);
@@ -281,7 +267,7 @@ export class BullMQBackend implements JobsBackend {
     this.enqueueBarriers.set(enqueueToken, enqueueBarrier);
 
     try {
-      const result = await this.withIdentityLocks<EnqueueResult>(
+      const result = await withIdentityLocks<EnqueueResult>(
         queue,
         lockIdentities,
         async (client) => {
@@ -475,12 +461,100 @@ export class BullMQBackend implements JobsBackend {
           },
         },
       });
-      worker.on('completed', (job) => this.notifyCompleted(jobType, job, consumer));
+      worker.on('completed', (job) =>
+        notifyCompleted(jobType, job, consumer, (internal) =>
+          this.scheduleTerminalDedupeCleanup(jobType, job, internal),
+        ),
+      );
       worker.on('failed', (job, error) => {
-        if (job) this.notifyFailed(jobType, job, error, consumer);
+        if (job)
+          notifyFailed(jobType, job, error, consumer, (internal) =>
+            this.scheduleTerminalDedupeCleanup(jobType, job, internal),
+          );
       });
       this.workers.set(name, worker);
     }
+  }
+
+  /** Offline maintenance: stop producers/admin writers first. Workers are paused and must be idle. */
+  pruneTerminal(options: RetentionCleanupOptions): Promise<number> {
+    this.assertAcceptingWork();
+    if (this.retentionOperation)
+      throw new JobsError(JobsErrorCode.InvalidInput, 'retention cleanup already running');
+    const operation = this.performRetentionCleanup(options);
+    this.retentionOperation = operation;
+    void operation.then(
+      () => {
+        this.retentionOperation = null;
+      },
+      () => {
+        this.retentionOperation = null;
+      },
+    );
+    return operation;
+  }
+
+  private async performRetentionCleanup(options: RetentionCleanupOptions): Promise<number> {
+    assertRetentionMaintenance(options);
+    const policy = this.retention;
+    if (!policy) throw this.unsupported('retention');
+    if (this.inFlightEnqueues.size)
+      throw new JobsError(JobsErrorCode.InvalidInput, 'retention requires stopped producers');
+    let removed = 0;
+    for (const queue of this.queues.values()) {
+      const paused = await queue.isPaused();
+      await queue.pause();
+      try {
+        if (await queue.getActiveCount())
+          throw new JobsError(JobsErrorCode.InvalidInput, 'retention requires idle workers');
+        const client = (await queue.client) as unknown as IdentityRedisClient;
+        const jobs = await queue.getJobs(
+          ['completed', 'failed'],
+          0,
+          (policy.batchSize ?? 1000) - 1,
+          true,
+        );
+        for (const job of jobs) {
+          if (job.finishedOn === undefined || Date.now() - job.finishedOn < policy.terminalAgeMs)
+            continue;
+          const mappings: Array<[string, string]> = [];
+          let cursor = '0';
+          do {
+            const page = await client.scan(
+              cursor,
+              'MATCH',
+              `*${this.identityHashTag()}:nestarc:identity:*`,
+              'COUNT',
+              200,
+            );
+            cursor = page[0];
+            for (const key of page[1]) {
+              if (key.endsWith(':lock')) continue;
+              const raw = await client.get(key);
+              if (!raw) continue;
+              try {
+                const mapping = JSON.parse(raw) as IdentityMapping;
+                if (
+                  mapping.jobId === String(job.id) &&
+                  mapping.jobType &&
+                  this.queueName(mapping.jobType) === queue.name
+                )
+                  mappings.push([key, raw]);
+              } catch {
+                /* Preserve ambiguous legacy reservations for explicit migration. */
+              }
+            }
+          } while (cursor !== '0');
+          for (const [key, raw] of mappings)
+            await client.eval(COMPARE_AND_DELETE_SCRIPT, 1, key, raw);
+          await job.remove();
+          removed++;
+        }
+      } finally {
+        if (!paused) await queue.resume();
+      }
+    }
+    return removed;
   }
 
   async close(): Promise<void> {
@@ -532,71 +606,6 @@ export class BullMQBackend implements JobsBackend {
     } catch (error) {
       throw normalizeError(error);
     }
-  }
-
-  private notifyCompleted(jobType: string, job: Job, consumer: BullMQConsumerOptions): void {
-    const { context, internal } = this.decode(job.data as Record<string, unknown>);
-    this.scheduleTerminalDedupeCleanup(jobType, job, internal);
-    const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
-    const startedAt = new Date(job.processedOn ?? job.timestamp);
-    const finishedAt = new Date(job.finishedOn ?? Date.now());
-    const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
-    const event: JobEvent = {
-      jobId: String(job.id),
-      jobType,
-      tenantId,
-      startedAt,
-      finishedAt,
-      durationMs,
-    };
-    notifyLifecycleObserver(() => consumer.onFinish?.(snapshotLifecycleValue(event)));
-    notifyLifecycleObserver(() =>
-      consumer.events?.onEvent?.({
-        type: 'job.succeeded',
-        jobId: String(job.id),
-        jobType,
-        tenantId,
-        attempt: job.attemptsMade,
-        at: finishedAt,
-        durationMs,
-        metadata: snapshotLifecycleValue(internal?.metadata),
-      }),
-    );
-  }
-
-  private notifyFailed(
-    jobType: string,
-    job: Job,
-    error: Error,
-    consumer: BullMQConsumerOptions,
-  ): void {
-    const { context, internal } = this.decode(job.data as Record<string, unknown>);
-    const tenantId = typeof context.tenantId === 'string' ? context.tenantId : undefined;
-    const startedAt = new Date(job.processedOn ?? job.timestamp);
-    const finishedAt = new Date(job.finishedOn ?? Date.now());
-    const event: JobEvent = { jobId: String(job.id), jobType, tenantId, startedAt, finishedAt };
-    // BullMQ sets finishedOn before emitting `failed` only when moveToFailed
-    // actually chose the terminal path. The attempts count alone is not enough:
-    // a custom backoff can return -1 and Job.discard() can stop retries early,
-    // while an indeterminate transition can emit `failed` without finishing.
-    const terminal = typeof job.finishedOn === 'number' && Number.isFinite(job.finishedOn);
-    const willRetry = !terminal;
-    if (!willRetry) this.scheduleTerminalDedupeCleanup(jobType, job, internal);
-    notifyLifecycleObserver(() =>
-      consumer.onFail?.(snapshotLifecycleValue(event), snapshotLifecycleError(error)),
-    );
-    notifyLifecycleObserver(() =>
-      consumer.events?.onEvent?.({
-        type: willRetry ? 'job.retry_scheduled' : 'job.failed',
-        jobId: String(job.id),
-        jobType,
-        tenantId,
-        attempt: job.attemptsMade,
-        at: finishedAt,
-        error: snapshotLifecycleValue({ message: error.message, name: error.name }),
-        metadata: snapshotLifecycleValue(internal?.metadata),
-      }),
-    );
   }
 
   private scheduleTerminalDedupeCleanup(
@@ -934,46 +943,6 @@ export class BullMQBackend implements JobsBackend {
     );
   }
 
-  private async withIdentityLocks<T>(
-    queue: Queue,
-    identities: PersistentIdentity[],
-    action: (client: IdentityRedisClient) => Promise<T>,
-  ): Promise<T> {
-    const client = (await queue.client) as unknown as IdentityRedisClient;
-    const token = randomUUID();
-    const lockKeys = [...new Set(identities.map((identity) => `${identity.mapKey}:lock`))].sort();
-    const acquired: string[] = [];
-
-    try {
-      for (const lockKey of lockKeys) {
-        await this.acquireIdentityLock(client, lockKey, token);
-        acquired.push(lockKey);
-      }
-      return await action(client);
-    } finally {
-      await Promise.allSettled(
-        acquired
-          .reverse()
-          .map((lockKey) => client.eval(COMPARE_AND_DELETE_SCRIPT, 1, lockKey, token)),
-      );
-    }
-  }
-
-  private async acquireIdentityLock(
-    client: IdentityRedisClient,
-    lockKey: string,
-    token: string,
-  ): Promise<void> {
-    const deadline = Date.now() + IDENTITY_LOCK_WAIT_MS;
-    do {
-      const result = await client.set(lockKey, token, 'PX', IDENTITY_LOCK_TTL_MS, 'NX');
-      if (result === 'OK') return;
-      await sleep(IDENTITY_LOCK_RETRY_MS);
-    } while (Date.now() < deadline);
-
-    throw new Error(`timed out acquiring BullMQ identity lock: ${lockKey}`);
-  }
-
   private identityMapKey(queue: Queue, kind: PersistentIdentity['kind'], value: string): string {
     return queue.toKey(`${this.identityHashTag()}:nestarc:identity:${kind}:${this.hash(value)}`);
   }
@@ -1055,37 +1024,11 @@ export class BullMQBackend implements JobsBackend {
     return delayMs === undefined ? undefined : new Date(Date.now() + Math.max(0, delayMs));
   }
 
-  private decode(envelope: Record<string, unknown>): DecodedEnvelope {
-    const rawInternal = envelope[INTERNAL_KEY];
-    if (!this.isPersistedMetadata(rawInternal)) {
-      const { payload, context } = detachContext(envelope);
-      return { payload, context };
-    }
-    const persistedEnvelope = { ...envelope };
-    delete persistedEnvelope[INTERNAL_KEY];
-    const { payload, context } = detachContext(persistedEnvelope);
-    return { payload, context, internal: rawInternal };
-  }
-
-  private isPersistedMetadata(value: unknown): value is PersistedJobMetadata {
-    return (
-      typeof value === 'object' &&
-      value !== null &&
-      (value as { version?: unknown }).version === INTERNAL_VERSION &&
-      typeof (value as { metadata?: unknown }).metadata === 'object' &&
-      (value as { metadata?: unknown }).metadata !== null &&
-      typeof (value as { enqueueToken?: unknown }).enqueueToken === 'string'
-    );
-  }
+  private readonly decode = decodeEnvelope;
 
   private async closeResources(): Promise<void> {
     const failures: unknown[] = [];
-    const workers = [...this.workers.entries()];
-    const workerResults = await Promise.allSettled(workers.map(([, worker]) => worker.close()));
-    workerResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') this.workers.delete(workers[index][0]);
-      else failures.push(result.reason);
-    });
+    failures.push(...(await closeOwnedResources(this.workers)));
 
     // External producers that entered before closing began own identity locks
     // and Redis commands. Drain them before closing queue connections so their
@@ -1100,16 +1043,19 @@ export class BullMQBackend implements JobsBackend {
       await Promise.allSettled([...this.inFlightIdentityCleanups]);
     }
 
+    if (this.retentionOperation) {
+      try {
+        await this.retentionOperation;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+
     // Active handlers have drained. Reject later producer work before queues
     // are closed, while still allowing handlers to enqueue follow-up jobs.
     this.closed = true;
 
-    const queues = [...this.queues.entries()];
-    const queueResults = await Promise.allSettled(queues.map(([, queue]) => queue.close()));
-    queueResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') this.queues.delete(queues[index][0]);
-      else failures.push(result.reason);
-    });
+    failures.push(...(await closeOwnedResources(this.queues)));
 
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, 'BullMQ backend close failed');
@@ -1171,6 +1117,8 @@ export class BullMQBackend implements JobsBackend {
 
   private assertAcceptingWork(): void {
     this.assertOpen();
+    if (this.retentionOperation)
+      throw new JobsError(JobsErrorCode.BackendClosed, 'retention maintenance in progress');
     if (this.closing && !this.activeHandlerScope.getStore()) {
       throw new JobsError(JobsErrorCode.BackendClosed, 'BullMQ backend is closing');
     }
@@ -1183,8 +1131,4 @@ const requireModule = createRequire(__filename);
 function loadBullMQ(): BullMQModule {
   bullmqModule ??= requireModule('bullmq') as BullMQModule;
   return bullmqModule;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
