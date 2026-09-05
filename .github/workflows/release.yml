@@ -103,7 +103,8 @@ jobs:
           mkdir "${RUNNER_TEMP}/published-signatures"
           cd "${RUNNER_TEMP}/published-signatures"
           npm init -y
-          npm install --ignore-scripts --save-exact "@nestarc/jobs@${PACKAGE_VERSION}"
+          npm install --ignore-scripts --strict-peer-deps --legacy-peer-deps=false --force=false --save-exact \
+            "@nestarc/jobs@${PACKAGE_VERSION}" @nestjs/common@11.2.1 @nestjs/core@11.2.1 reflect-metadata@0.2.2 rxjs@7.8.2
           npm audit signatures
       - name: Create GitHub Release after publication verification
         env:

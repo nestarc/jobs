@@ -1,8 +1,8 @@
 # Security policy
 
-The latest published 0.3 patch is the current maintenance line. The 0.4 source candidate is unreleased; older 0.1/0.2 releases are unsupported. See CHANGELOG for migration requirements. Fixes may require moving to the next pre-1.0 minor when preserving an unsafe behavior would prevent remediation.
+The latest published 0.4 patch is the current maintenance line. Upgrade older 0.1/0.2/0.3 releases to 0.4 for the activation, shutdown, tenant isolation and input-validation fixes. See CHANGELOG for migration requirements. Fixes may require moving to the next pre-1.0 minor when preserving an unsafe behavior would prevent remediation.
 
-Repository security owner: [@ksyq12](https://github.com/ksyq12). Private vulnerability reporting configuration must be confirmed before this policy is treated as a working disclosure channel. Until then, open an issue requesting a private contact channel without including vulnerability details, payloads, credentials, or exploits. Do not report sensitive details in public issues. Enabling GitHub private vulnerability reporting and validating the owner inbox is an outstanding administrator release gate.
+Repository security owner: [@ksyq12](https://github.com/ksyq12). Use [GitHub private vulnerability reporting](https://github.com/nestarc/jobs/security/advisories/new) for sensitive reports. The channel was enabled and administrator inbox access verified on 2026-09-05; no reports were present, so delivery of an actual report has not yet been verified. Do not report vulnerability details, payloads, credentials, or exploits in public issues.
 
 Jobs is an at-least-once execution transport. Producers must be trusted and separately authenticated: possession of Redis credentials or direct JobsService access permits work creation. Handler side effects must be idempotent. `getJob`, history, DLQ replay/discard, raw queues, and retention cleanup are privileged control-plane operations. Authorize tenant membership before using `getJobForTenant`; a tenant ID supplied by a request is not authorization. Jobs does not import an RBAC framework.
 

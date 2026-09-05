@@ -1,0 +1,84 @@
+name: Finalize published release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable release tag (v0.4.0)
+        required: true
+        type: string
+      artifact_run_id:
+        description: Original Release run whose npm publish succeeded
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-published:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify current repository protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-repository-policy.js
+      - name: Bind recovery to the original successful publication
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: node scripts/prepare-release-recovery.js
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
+          run-id: ${{ inputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify original bytes, provenance and npm signatures
+        env:
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          git checkout --detach "${RELEASE_COMMIT}"
+          GITHUB_REF_NAME="${RELEASE_TAG}" GITHUB_SHA="${RELEASE_COMMIT}" node scripts/verify-release-artifact.js package-artifact --require-published
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          mkdir "${RUNNER_TEMP}/published-signatures"
+          cd "${RUNNER_TEMP}/published-signatures"
+          npm init -y
+          npm install --ignore-scripts --strict-peer-deps --legacy-peer-deps=false --force=false --save-exact \
+            "@nestarc/jobs@${PACKAGE_VERSION}" @nestjs/common@11.2.1 @nestjs/core@11.2.1 reflect-metadata@0.2.2 rxjs@7.8.2
+          npm audit signatures
+
+  release:
+    needs: verify-published
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Finalize GitHub Release after publication verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-published.outputs.tag }}
+        run: |
+          if ! gh release view "${RELEASE_TAG}" --repo nestarc/jobs; then
+            gh release create "${RELEASE_TAG}" --repo nestarc/jobs --verify-tag --generate-notes
+          fi

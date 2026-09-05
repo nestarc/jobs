@@ -128,3 +128,16 @@ main의 실제 effective rules/branch protection을 읽어 필요한 PR/check/fo
 - npm 로그인 대신 GitHub OIDC Release workflow로 실제 배포 및 provenance를 검증한다는 사용자 지시를 반영했다.
 
 릴리스 완료 증거와 최종 상태는 실행 후 아래에 추가한다. M22/TEN-ECO-NEXT 및 P4 BACKLOG는 이 Jobs 릴리스와 별도다.
+
+### npm 게시 및 후속 GitHub Release 복구
+
+- [PR #2](https://github.com/nestarc/jobs/pull/2)는 `563612539401f49fa6b1ab0c9c265f79e8f61741`에 squash merge됐다. Protected main CI [33946073721](https://github.com/nestarc/jobs/actions/runs/33946073721) 전체 PASS. `v0.4.0` annotated tag는 이 commit을 가리키며 기존 태그 이동/삭제는 없다.
+- 원본 [Release run 33946102143](https://github.com/nestarc/jobs/actions/runs/33946102143)의 전체 verify, 실제 repository/artifact policy 및 npm OIDC publish가 PASS했다. npm `@nestarc/jobs@0.4.0` 게시와 원본 artifact의 SRI/attestation subject/ref/source SHA 일치를 독립적으로 재확인했다.
+- 단, 최종 `release` job의 서명 검사용 `npm install @nestarc/jobs@0.4.0`이 floating optional-peer 해석 과정에서 Nest 12를 선택해 ERESOLVE로 실패했다. 서명 불일치나 package runtime 실패가 아니다. 이미 게시된 0.4.0과 태그를 변경하지 않는다.
+- 검증용 install에 exact Nest 11.2.1/common/core, reflect-metadata 0.2.2, rxjs 7.8.2와 strict peer 옵션을 적용한 후 **22 registry signatures / 1 attestation 검증 PASS**를 확인했다. 다음 릴리스의 동일 오류를 수정하고, 기존 성공 publish run의 정확한 artifact만 검증하는 `release-recovery.yml`을 추가했다. 복구 workflow에는 npm publish/OIDC 권한이 없고 검증 성공 뒤 GitHub Release만 생성한다.
+- 원본 artifact: `/private/tmp/jobs-040-release-artifact/nestarc-jobs-0.4.0.tgz`, **89,723 bytes**, SHA-256 `326a84b7dc47e778bbb75104dbe443f0857ffc3bba71f8b04be34d26a2f80aa1`, SRI `sha512-3OzypjcJmx5f1ImRyXZACU3F0z+PpXPCEwhU8CtIB7b03nqX2T0WCNOcLJFpWG2JK4UvIgfWs8jQjaedFktw9w==`.
+- 같은 실제 Release artifact의 로컬 Outbox 0.2.1/0.3.0 strict 소비자도 PASS. 실제 60초 lease/producer SIGKILL 3개 지점/stalled worker와 전용 Redis restart 재실행 PASS. Redis 프로젝트 `jobs-040-20260905`, `jobs-maintenance-040-restart`는 모두 제거했다.
+- M24: 사용자가 식별자·상태 조회를 명시적으로 승인한 뒤 관리자 신고함 API가 성공했고 결과는 `[]`였다. 본문/제보자 정보는 출력하거나 저장하지 않았다. 활성화와 수신함 접근은 확인됐지만 실제 신고 전달 증거는 없어 M24의 수신 acceptance는 EXTERNAL로 남는다.
+- 저장소 SECURITY.md의 지원 버전·신고 경로를 실제 0.4 게시/활성화 상태로 갱신했다. 이미 게시된 0.4.0 tarball의 SECURITY.md에는 게시 전 0.3/source-candidate 문구가 남아 있으므로 최신 보안 정책은 저장소 SECURITY.md를 따른다. 이 문서 정정 때문에 immutable 태그/registry bytes를 변경하지 않는다.
+
+복구 workflow의 최종 실행 결과는 후속 완료 기록에서 확인한다.
