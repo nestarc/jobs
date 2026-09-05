@@ -6,7 +6,9 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
-### Added (planned 0.4.0)
+## [0.4.0] - 2026-09-05
+
+### Added
 
 - Explicit BullMQ producer/worker/both roles, bootstrap handler validation and a dynamic-registration escape.
 - Operator-driven terminal retention with recovery-horizon validation, bounded cleanup batches and identity-aware deletion.
@@ -14,7 +16,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Exact Outbox candidate manifests alongside the fixed 0.2.1 anchor; verified 0.3.0 peer support.
 - Real lease-expiry/producer-crash/stalled-worker/Redis-restart fixtures, seeded state-model tests and coverage tuple evidence.
 
-### Changed (planned 0.4.0)
+### Changed
 
 - Support Node 22/24; raise optional BullMQ floor to 5.76.2 and Outbox range to ^0.2.1 || ^0.3.0.
 - Upgrade Jest/ts-jest and ESLint/typescript-eslint, refresh compatible lock dependencies, and document remaining Nest 10 fixture audit exceptions.
@@ -33,7 +35,7 @@ This project is currently pre-release. The changelog below starts from the curre
 - Rebuild reserved Outbox context and metadata from a source snapshot, remove stale mapping
   lineage when source fields are absent, and preserve canonical identity through callback mutation.
 
-### Changed (planned 0.4.0)
+### Changed
 
 - Run in-memory workers in a bounded pool (default 10), with module-wide pool and
   tenant limits and per-type limits; preserve timeout ownership and shutdown drain.

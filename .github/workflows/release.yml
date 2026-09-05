@@ -18,7 +18,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/verify.yml
     with:
-      modern_outbox_package: '@nestarc/outbox@0.2.1'
+      modern_outbox_package: '@nestarc/outbox@0.3.0'
+      modern_outbox_version: '0.3.0'
+      modern_outbox_integrity: 'sha512-rbPiDgQCNVtQifVf01we+vREYDDwccpezc5cSlaoa8VeIW3NxmGWrMe8ccwQRex/pF2MxlFW4K645SDbN27evQ=='
 
   artifact-policy:
     needs: verify

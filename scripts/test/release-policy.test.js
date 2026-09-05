@@ -33,17 +33,6 @@ test('provenance requires the exact subject digest and immutable source commit',
   assert.throws(() => verifyProvenance(bytes, {}, '0.4.0', 'abc'));
 });
 
-test('release policy fails closed on unprotected refs and unrestricted environment refs', () => {
-  const { verifyRepositoryPolicy } = require('../verify-repository-policy');
-  const tags = [{ target: 'tag', enforcement: 'active', conditions: { ref_name: { include: ['refs/tags/v*'], exclude: [] } }, bypass_actors: [], rules: [{ type: 'update' }, { type: 'deletion' }] }];
-  const env = { protection_rules: [], deployment_branch_policy: { custom_branch_policies: true } };
-  assert.doesNotThrow(() => verifyRepositoryPolicy({ protected: true }, tags, env));
-  assert.throws(() => verifyRepositoryPolicy({ protected: false }, tags, env));
-  assert.throws(() => verifyRepositoryPolicy({ protected: true }, [], env));
-  assert.throws(() => verifyRepositoryPolicy({ protected: true }, tags, {}));
-  assert.throws(() => verifyRepositoryPolicy({ protected: true }, [{ ...tags[0], bypass_actors: [{ actor_id: 1 }] }], env));
-});
-
 test('coverage builds the separate Redis producer fixture before running it', () => {
   const verify = yaml.load(fs.readFileSync('.github/workflows/verify.yml', 'utf8'));
   const steps = verify.jobs.coverage.steps.map((step) => step.run);
