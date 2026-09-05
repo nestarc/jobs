@@ -102,6 +102,43 @@ Important behavior:
 - workers start automatically when the Nest module initializes
 - tenant fairness is enforced by the in-process `Scheduler`
 - this backend is not distributed across multiple processes
+- shutdown closes admission first, then drains accepted active, queued, delayed, and retrying work before destroying feature dependencies
+- `shutdown: { timeoutMs: 30_000 }` sets the graceful drain deadline (30 seconds by default; positive integer up to 2,147,483,647)
+- enqueue (including dedupe acknowledgement) and dead-letter replay during/after shutdown reject with `jobs_backend_closed`
+
+If drain exceeds its deadline, `app.close()` rejects with `JobsShutdownError`
+(`code: 'jobs_shutdown_incomplete'`, `reason: 'deadline'`, `remainingJobIds`,
+`remainingCount`). Admission stays closed; records and identity mappings remain
+available while drain continues in the background. A later `app.close()` joins the
+same drain with a new deadline. Backend resources close exactly once after all
+accepted work and outstanding handler invocations finish. Successful close releases
+in-memory records and history. This is a pre-1.0 minor behavior change, planned for
+0.4.0; it does not add crash durability.
+
+A handler that ignores `ctx.signal` retains its slot until its actual promise
+settles. Timeout emits `job.timed_out` and aborts the signal immediately; the job
+stays active until settlement, then records timeout failure and schedules any retry.
+Late success cannot turn a timeout into success. A never-settling handler prevents
+graceful completion. Observe the shutdown error, arrange cooperative handler
+settlement, or explicitly terminate the process knowing that in-memory work is
+lost. Administrative cancellation changes logical state but cannot stop JavaScript
+or make shutdown treat an outstanding invocation as finished. Delivery remains
+at-least-once; side effects are not exactly-once.
+
+Stop upstream producers before closing Jobs. Handler follow-up enqueue during drain
+also rejects; applications that relied on it must move production before admission
+closes or handle the rejection. Nest shutdown ordering drains Jobs before feature
+provider destruction in Nest 10 and 11. A co-located Outbox poller must stop before
+Jobs admission closes; this change does not coordinate its separate shutdown hooks.
+
+For standalone `InMemoryBackend`/`FairWorker` use, call `beginClose()` to stop
+admission, drain workers (including future schedules), await `waitForIdle()` on
+all workers, then call `backend.close()`. `outstandingJobIds()` reports worker-owned
+invocations; `pendingJobIds()` reports backend nonterminal records. A direct backend
+`close()` cannot run handlers and rejects with `JobsShutdownError` and
+`reason: 'pending_jobs'` if nonterminal records remain. Explicitly cancel/disposition
+those records or finish processing them before retrying close. Backend-only close
+cannot observe externally owned handler promises, so their owner must await them.
 
 ### BullMQ backend
 
@@ -381,7 +418,7 @@ const replayedJobId = await jobs.replayDeadLetter(failed[0].id);
 // await jobs.discardDeadLetter(failed[0].id, 'handled manually');
 ```
 
-In-memory replay preserves and rebinds the original idempotency/dedupe identity to the replayed job. Attempts reset by default; pass `{ resetAttempts: false }` to retain the recorded attempt count. A successful discard emits `job.discarded`; repeated, missing, or non-dead-letter discard calls are no-ops and emit nothing.
+In-memory replay preserves and rebinds the original idempotency/dedupe identity to the replayed job. Attempts reset by default for a new replay ID; pass `{ resetAttempts: false }` to retain the recorded attempt count. With `{ preserveOriginalId: true }`, the lifetime attempt count never resets. By default a fresh retry budget is added to that count (`maxAttempts` becomes the cumulative ceiling), and backoff starts at the first attempt of the replay generation. `resetAttempts: false` retains the previous ceiling and backoff position. A successful discard emits `job.discarded`; repeated, missing, or non-dead-letter discard calls are no-ops and emit nothing.
 
 Tenant-scoped dedupe requires a tenant id:
 
@@ -628,3 +665,33 @@ The npm trusted publisher is configured for:
 ## License
 
 MIT
+
+### Custom backend activation contract (planned 0.4.0)
+
+`FairWorker` requires `capabilities().activationFencing === true`. A custom backend
+must generate a fresh, opaque `activationId` on every successful `moveToActive`,
+return it on the envelope, and atomically validate it with the active state for
+`ack(jobType, jobId, activationId)` and
+`fail(jobType, jobId, reason, activationId)`. Direct in-memory `markFailed` takes
+the token before its optional error summary. Do not infer the token from the latest
+job state: carry the token from the invocation being completed. Legacy custom
+backends must implement this contract before opting into the capability; the worker
+fails at construction if the capability is absent. BullMQ keeps its own worker lock
+contract and does not use these manual completion APIs.
+
+| Current state | Operation | Result |
+| --- | --- | --- |
+| queued / due delayed | moveToActive | active, fresh token, attempt +1 |
+| future delayed / active / terminal / missing | moveToActive | null; no mutation |
+| active with matching token | ack | succeeded |
+| active with matching token | fail / markFailed | retry scheduled, failed, or dead letter according to budget |
+| missing / non-active / wrong type / stale or absent token | ack / fail / markFailed | `jobs_activation_conflict`; no history or budget mutation |
+| queued / delayed / active | markCancelled | cancelled; late completions conflict |
+| terminal | markCancelled | unchanged; no new history |
+| dead_letter | explicit replay / discard | new replay generation / cancelled |
+
+Duplicate and opposite terminal completions both conflict. Only explicit dead-letter
+administration can leave a terminal state; a same-ID replay creates a new activation
+and preserves monotonic attempt history. The public backend signature, lifecycle
+event union, same-ID replay accounting, and shutdown defaults require a 0.4.0 minor
+release. The package version is advanced by the separate release task.

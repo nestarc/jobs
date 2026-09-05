@@ -4,20 +4,21 @@
 - 대상 패키지: `@nestarc/jobs@0.3.1` (변경 전 배포 버전 `0.3.0`)
 - 관련 저장소: `jobs`, `nestjs-tenancy`
 - 목적: 상위/인접 Nest module에 선언된 decorator handler가 의존성 초기화 전에 등록될 수 있는 문제를 재현하고, 모든 provider 초기화 이후 handler를 등록한 다음 worker를 시작하도록 lifecycle 계약을 고정한다.
+- 상태: **구현, `0.3.1` 배포, tenancy published-only E2E 완료** (2026-08-24)
 
 ## 1. 요약
 
-현재 `JobsModule`은 `JOBS_WORKERS` provider factory를 생성하는 동안 `DiscoveryService`로
+변경 전 `JobsModule`은 `JOBS_WORKERS` provider factory를 생성하는 동안 `DiscoveryService`로
 전체 Nest provider를 스캔하고 `@JobHandler(jobType)` 메서드를 `HandlerRegistry`에
 등록한다.
 
-이 방식은 handler가 단순 singleton이고 주입 dependency가 없을 때는 동작한다. 하지만
+이전 방식은 handler가 단순 singleton이고 주입 dependency가 없을 때는 동작한다. 하지만
 `JobsModule`을 import하는 상위 feature module의 handler가 다른 provider를 주입받으면,
 Nest가 모든 provider instance와 lifecycle hook을 완전히 초기화하기 전에 discovery가
 실행될 수 있다. 이때 registry가 초기화 전 instance를 캡처하거나 provider를 건너뛰면
 나중에 완성된 Nest provider와 다른 instance를 호출할 수 있다.
 
-`nestjs-tenancy` ecosystem fixture에서는 이 순서를 관찰한 뒤 `@JobHandler()` 자동 발견을
+`nestjs-tenancy` ecosystem fixture에서는 당시 이 순서를 관찰한 뒤 `@JobHandler()` 자동 발견을
 사용하지 않고 `await app.init()` 이후 공개 `HandlerRegistry`에 handler closure를 수동
 등록하는 workaround를 사용한다.
 
@@ -37,7 +38,7 @@ Nest가 모든 provider instance와 lifecycle hook을 완전히 초기화하기 
 > 없었다. 양 버전이 공통으로 보장하는 계약은 모든 `onModuleInit()` 완료 후 Jobs의
 > `onApplicationBootstrap()` coordinator가 discovery와 consumer 시작을 순차 실행하는 것이다.
 
-## 2. 현재 구현
+## 2. 변경 전 구현
 
 ### 2.1 Handler discovery
 
@@ -79,7 +80,7 @@ for (const provider of discovery.getProviders()) {
 즉 BullMQ consumer 시작은 application bootstrap hook보다도 이르며 provider factory의
 부수 효과다.
 
-### 2.4 현재 테스트 공백
+### 2.4 변경 전 테스트 공백
 
 기존 `test/integration/jobs.module.in-memory.test.ts`와
 `test/integration/module-v0.2-events.test.ts`는 decorator discovery를 확인하지만 handler가
@@ -106,7 +107,7 @@ API key
 ```
 
 원래 의도는 상위 `EcosystemModule` provider가 `WebhookService`를 주입받고
-`@JobHandler('webhook.publish')`로 처리하는 것이다. 현재 fixture는 초기화 순서 문제를
+`@JobHandler('webhook.publish')`로 처리하는 것이었다. 변경 전 fixture는 초기화 순서 문제를
 피하기 위해 다음과 같이 app init 이후 수동 등록한다.
 
 ```ts
@@ -119,12 +120,12 @@ app.get(HandlerRegistry).register('webhook.publish', async (payload) => {
 });
 ```
 
-이 workaround는 runtime을 deterministic하게 만들지만 README가 약속하는 decorator 기반
+이 workaround는 runtime을 deterministic하게 만들었지만 README가 약속하는 decorator 기반
 provider scanning을 대표 통합 경로에서 사용하지 못한다.
 
 ## 4. 원인 가설과 검증 기준
 
-현재 근거로 가장 강한 원인 가설은 `JOBS_WORKERS` provider factory가 Nest의 전체 provider
+구현 전 가장 강한 원인 가설은 `JOBS_WORKERS` provider factory가 Nest의 전체 provider
 초기화보다 먼저 `DiscoveryService`를 조회한다는 것이다. Nest는 dependency graph를 만드는
 동안 provider wrapper/prototype를 먼저 노출할 수 있으므로 당시 `provider.instance`가 최종
 singleton instance라고 가정하면 안 된다.
@@ -201,7 +202,7 @@ race가 생길 수 있다. handler 등록과 worker 시작을 같은 coordinator
 
 ### 5.4 handler scope 계약
 
-현재 구현은 stable `provider.instance`를 registry에 바인딩하므로 singleton provider를
+설계 대상 구현은 stable `provider.instance`를 registry에 바인딩하므로 singleton provider를
 전제로 한다. request/transient-scoped handler까지 지원할지 이번 작업에서 명확히 결정한다.
 
 최소 안전 계약:
@@ -240,7 +241,7 @@ ReadyDependency
 - handler의 `this`가 `moduleRef.get(InjectedJobHandler)`와 동일함
 - job이 정확히 한 번 처리됨
 
-현재 구현에서 테스트가 실패하는 것을 먼저 확인한 뒤 lifecycle 수정으로 통과시킨다.
+변경 전 구현에서 테스트가 실패하는 것을 먼저 확인한 뒤 lifecycle 수정으로 통과시킨다.
 
 ### 6.2 In-memory 검증
 
@@ -317,7 +318,7 @@ class WebhookPublishHandler {
 
 ## 8. 완료 조건
 
-- [x] 현재 구현에서 실패하는 parent-module injected handler 회귀 테스트 확보
+- [x] 변경 전 구현에서 실패하는 parent-module injected handler 회귀 테스트 확보
 - [x] 실패 원인이 discovery/initialization 순서임을 테스트 근거로 확정
 - [x] provider factory에서 handler discovery 부수 효과 제거
 - [x] handler registration 완료 후 worker/consumer가 시작되는 명시적 lifecycle 구현
@@ -331,7 +332,7 @@ class WebhookPublishHandler {
 - [x] tenancy fixture의 manual `HandlerRegistry` workaround 제거
 - [x] tenancy fixture가 `@JobHandler('webhook.publish')` provider를 사용
 - [x] 로컬 Jobs tarball ecosystem E2E 통과
-- [ ] 새 Jobs release 기반 published-only ecosystem E2E 통과
+- [x] 새 Jobs release 기반 published-only ecosystem E2E 통과
 - [x] API Keys `0.3.1` strict ecosystem 설치 계약 회귀 없음
 
 ## 9. 권장 검증 명령
@@ -426,30 +427,35 @@ Tenancy:
 - `npm test -- --runInBand`: 47 suites, 554 tests 통과
 - `npm run build`: 통과
 - 로컬 sibling Jobs tarball ecosystem E2E: 3 tests 통과
-- published-only strict install의 package graph assertion은 통과했고
-  `@nestarc/api-keys@0.3.1`을 확인했다.
-- published-only 전체 E2E는 현재 배포된 `@nestarc/jobs@0.3.0`의 조기 instance 캡처로
-  예상대로 실패했다. 새 수정 버전 배포 후 재실행이 필요하다.
+- npm published `@nestarc/jobs@0.3.1`과 `@nestarc/api-keys@0.3.1`만 사용하는
+  published-only strict install 및 package graph assertion을 통과했다.
+- published-only 전체 ecosystem E2E 3 tests가 통과했다. constructor-injected
+  `@JobHandler('webhook.publish')`가 tenant context를 복원하고 signed HTTP webhook을
+  전송했으며 missing/mismatched/unauthorized context는 side effect 전에 실패했다.
 
-### 11.3 남은 외부 release gate
+### 11.3 외부 release gate 완료 (2026-08-24)
 
-코드와 로컬 artifact 검증은 완료했다. 다만 npm publish는 외부 배포 작업이므로 이 작업에서
-수행하지 않았다. `@nestarc/jobs@0.3.1`이 배포된 뒤 아래 명령을 다시 실행해야 마지막 완료
-조건이 닫힌다. tenancy fixture dependency와 expected version은 `0.3.1`로 갱신했다.
+`@nestarc/jobs@0.3.1`이 npm `latest`로 배포됐고 live registry manifest를 확인했다.
+tenancy fixture dependency와 expected version을 `0.3.1`로 갱신한 상태에서 형제 저장소
+탐색을 비활성화하고 아래 published-only strict lane을 재실행해 통과했다.
 
 ```bash
 NESTARC_ECOSYSTEM_SOURCE_ROOT=/path/without/local/siblings \
   npm run test:e2e:ecosystem
 ```
 
-## 12. 작업 시작용 프롬프트
+## 12. 완료 상태
+
+이 문서의 handler discovery 초기화 계약과 cross-package workaround 제거 작업에는 남은
+항목이 없다. 향후 Jobs 기능 작업은 새로운 범위로 시작하고, 이 lifecycle 및 published-only
+ecosystem E2E를 회귀 gate로 보존한다.
+
+회귀 확인용 프롬프트:
 
 ```text
 docs/handler-discovery-initialization-plan-2026-08-23.md를 읽고,
-@nestarc/jobs의 @JobHandler discovery가 상위 feature module의 constructor-injected
-handler를 provider 초기화 전에 캡처하는 문제를 먼저 실패하는 회귀 테스트로 재현해 주세요.
-모든 provider 초기화 후 handler 등록이 완료된 다음 in-memory worker/BullMQ consumer가
-시작되도록 lifecycle을 수정하고 NestJS 10/11 및 Redis matrix를 통과시켜 주세요.
-그 후 nestjs-tenancy ecosystem fixture의 manual HandlerRegistry 등록을
-@JobHandler('webhook.publish') provider로 교체하고 tarball/published-only E2E를 검증해 주세요.
+완료된 application-bootstrap handler discovery, singleton scope fail-fast,
+in-memory/BullMQ startup ordering 및 shutdown 계약을 보존해 주세요.
+변경 후 NestJS 10/11, Redis와 nestjs-tenancy의 Jobs 0.3.1 published-only
+ecosystem E2E를 회귀 검증해 주세요.
 ```

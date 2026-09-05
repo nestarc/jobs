@@ -23,15 +23,16 @@ import type { JobContext, JobEvent } from './types';
 import { JOBS_SERVICE } from './contracts';
 import type { JobDefinitions } from './contracts';
 import type { JobEventsOptions } from './lifecycle';
-import { JobsError, JobsErrorCode } from './errors';
+import { JobsError, JobsErrorCode, JobsShutdownError } from './errors';
 
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
 const BULLMQ_CONSUMER_CONFIG = Symbol('BULLMQ_CONSUMER_CONFIG');
+const IN_MEMORY_SHUTDOWN_TIMEOUT = Symbol('IN_MEMORY_SHUTDOWN_TIMEOUT');
 
 const IN_MEMORY_WORKER_IDLE_MS = 10;
 const requireModule = createRequire(__filename);
-const BULLMQ_SHUTDOWN_DISTANCE =
+const WORKER_SHUTDOWN_DISTANCE =
   nestCoreMajorVersion() >= 11 ? Number.MIN_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
 
 @Injectable()
@@ -55,22 +56,83 @@ class HandlerDiscovery {
 class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
   private running = false;
   private loop: Promise<void> | null = null;
+  private draining: Promise<void> | null = null;
+  private loopFailure: { error: unknown } | null = null;
 
   constructor(
     @Inject(JOBS_WORKERS) private readonly workers: FairWorker[],
+    @Inject(JOBS_BACKEND) private readonly backend: InMemoryBackend,
+    @Inject(IN_MEMORY_SHUTDOWN_TIMEOUT) private readonly shutdownTimeoutMs: number,
     private readonly handlerDiscovery: HandlerDiscovery,
-  ) {}
+    discovery: DiscoveryService,
+  ) {
+    // Drain before feature dependencies are destroyed in either supported Nest major.
+    for (const provider of discovery.getProviders()) {
+      if (provider.token === InMemoryWorkersHost && provider.host) {
+        provider.host.distance = WORKER_SHUTDOWN_DISTANCE;
+      }
+    }
+  }
 
   onApplicationBootstrap(): void {
-    if (this.running) return;
+    if (this.running || this.backend.lifecycleState !== 'open') return;
     this.handlerDiscovery.discover();
     this.running = true;
-    this.loop = this.run();
+    this.loop = this.run().catch((error) => {
+      this.loopFailure = { error };
+      this.running = false;
+    });
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.backend.beginClose();
     this.running = false;
-    await this.loop;
+    this.draining ??= this.drain();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.draining,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new JobsShutdownError('deadline', this.remainingJobIds())),
+            this.shutdownTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private remainingJobIds(): string[] {
+    return [
+      ...new Set([
+        ...this.backend.pendingJobIds(),
+        ...this.workers.flatMap((worker) => worker.outstandingJobIds()),
+      ]),
+    ];
+  }
+
+  private async drain(): Promise<void> {
+    try {
+      await this.loop;
+      if (this.loopFailure) throw this.loopFailure.error;
+      await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
+      while (this.backend.pendingJobIds().length) {
+        let anyPicked = false;
+        for (const worker of this.workers) {
+          if (await worker.tick()) anyPicked = true;
+        }
+        // Let deadline timers run even when handlers settle and retry immediately.
+        if (this.backend.pendingJobIds().length) {
+          await sleep(anyPicked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
+        }
+      }
+      await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
+      await this.backend.close();
+    } catch (error) {
+      throw new JobsShutdownError('worker_error', this.remainingJobIds(), error);
+    }
   }
 
   private async run(): Promise<void> {
@@ -113,7 +175,7 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     // active handlers drain before feature dependencies are destroyed.
     for (const provider of discovery.getProviders()) {
       if (provider.token === BullMQWorkersHost && provider.host) {
-        provider.host.distance = BULLMQ_SHUTDOWN_DISTANCE;
+        provider.host.distance = WORKER_SHUTDOWN_DISTANCE;
       }
     }
   }
@@ -138,6 +200,8 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
 }
 
 export interface InMemoryOptions {
+  /** Graceful drain deadline (default 30 seconds). Timeout rejects; draining continues. */
+  shutdown?: { timeoutMs?: number };
   jobTypes: string[];
   jobs?: JobDefinitions;
   global?: boolean;
@@ -185,9 +249,7 @@ function registerHandlers(
     const handlers = scanner
       .getAllMethodNames(prototype)
       .map((method) => ({
-        jobType: Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]) as
-          | string
-          | undefined,
+        jobType: Reflect.getMetadata(JOB_HANDLER_METADATA, prototype[method]) as string | undefined,
         method,
       }))
       .filter((handler): handler is { jobType: string; method: string } =>
@@ -275,6 +337,14 @@ function assertJobDefaultsSupported(
 @Module({})
 export class JobsModule {
   static forInMemory(options: InMemoryOptions): DynamicModule {
+    const shutdownTimeoutMs = options.shutdown?.timeoutMs ?? 30_000;
+    if (
+      !Number.isSafeInteger(shutdownTimeoutMs) ||
+      shutdownTimeoutMs <= 0 ||
+      shutdownTimeoutMs > 2_147_483_647
+    ) {
+      throw new RangeError('shutdown.timeoutMs must be a positive timer-safe integer');
+    }
     const schedOpts: SchedulerOptions = {
       defaultWeight: options.fairness?.defaultWeight ?? 1,
       minSharePct: options.fairness?.minSharePct ?? 0.1,
@@ -287,6 +357,7 @@ export class JobsModule {
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
+      { provide: IN_MEMORY_SHUTDOWN_TIMEOUT, useValue: shutdownTimeoutMs },
       { provide: JOBS_BACKEND, useValue: backend },
       HandlerRegistry,
       {

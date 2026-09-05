@@ -13,6 +13,8 @@ export interface JobEnvelope<T = unknown> {
   context: JobContext;
   enqueuedAt: Date;
   attempts: number;
+  /** Opaque ownership token returned only by moveToActive. */
+  activationId?: string;
   maxAttempts: number;
   scheduledFor?: Date;
   timeoutMs?: number;

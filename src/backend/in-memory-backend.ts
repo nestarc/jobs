@@ -13,7 +13,7 @@ import type {
   ReplayOptions,
 } from '../lifecycle';
 import { computeBackoffDelayMs } from '../retry';
-import { JobsError, JobsErrorCode } from '../errors';
+import { JobsError, JobsErrorCode, JobsShutdownError } from '../errors';
 import { snapshotLifecycleValue } from '../lifecycle-observer';
 import { assertValidJobId } from '../enqueue-validation';
 
@@ -22,6 +22,7 @@ interface Slot {
   state: JobStatus;
   identityLineage: IdentityLineage;
   initialScheduledFor?: Date;
+  retryBase?: number;
   startedAt?: Date;
   completedAt?: Date;
   failedAt?: Date;
@@ -47,6 +48,7 @@ export interface InMemoryBackendOptions {
 }
 
 export class InMemoryBackend implements JobsBackend {
+  private lifecycle: 'open' | 'closing' | 'closed' = 'open';
   private readonly store = new Map<string, Map<string, Slot>>();
   private readonly jobTypesById = new Map<string, string>();
   private readonly history = new Map<string, JobHistoryEntry[]>();
@@ -69,6 +71,7 @@ export class InMemoryBackend implements JobsBackend {
       deadLetter: true,
       fairness: 'local-tenant',
       manualDrain: true,
+      activationFencing: true,
     };
   }
 
@@ -86,6 +89,7 @@ export class InMemoryBackend implements JobsBackend {
     opts: EnqueueOptions,
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
+    this.assertOpen();
     assertValidJobId(opts.jobId);
     const { payload, context } = detachContext(envelope);
     const idempotencyKey = opts.idempotencyKey;
@@ -161,16 +165,17 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   async peekWaiting(jobType: string): Promise<JobEnvelope[]> {
-    return [...this.bucketOf(jobType).values()]
+    return [...(this.store.get(jobType)?.values() ?? [])]
       .filter((slot) => this.isWaiting(slot))
       .map((slot) => snapshotLifecycleValue(slot.envelope));
   }
 
   async moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null> {
-    const slot = this.bucketOf(jobType).get(jobId);
+    const slot = this.store.get(jobType)?.get(jobId);
     if (!slot || !this.isWaiting(slot)) return null;
     if (slot.state === 'delayed' && !this.isDue(slot)) return null;
     slot.state = 'active';
+    slot.envelope.activationId = randomUUID();
     slot.envelope.attempts += 1;
     slot.startedAt = this.now();
     slot.nextAttemptAt = undefined;
@@ -178,9 +183,8 @@ export class InMemoryBackend implements JobsBackend {
     return snapshotLifecycleValue(slot.envelope);
   }
 
-  async ack(jobType: string, jobId: string): Promise<JobRecord | void> {
-    const slot = this.bucketOf(jobType).get(jobId);
-    if (!slot) return;
+  async ack(jobType: string, jobId: string, activationId: string): Promise<JobRecord> {
+    const slot = this.requireActivation(jobType, jobId, activationId);
     slot.state = 'succeeded';
     slot.completedAt = this.now();
     slot.terminalAt = new Date(slot.completedAt.getTime());
@@ -194,23 +198,31 @@ export class InMemoryBackend implements JobsBackend {
     return this.toRecord(slot);
   }
 
-  async fail(jobType: string, jobId: string, reason: string): Promise<JobRecord | void> {
+  async fail(
+    jobType: string,
+    jobId: string,
+    reason: string,
+    activationId: string,
+  ): Promise<JobRecord | void> {
     const error = reason === 'timeout' ? { message: reason, reason: 'timeout' } : undefined;
-    return (await this.markFailed(jobType, jobId, reason, error)) ?? undefined;
+    return (await this.markFailed(jobType, jobId, reason, activationId, error)) ?? undefined;
   }
 
   async markFailed(
     jobType: string,
     jobId: string,
     reason: string,
+    activationId: string,
     error?: JobErrorSummary,
   ): Promise<JobRecord | null> {
-    const slot = this.bucketOf(jobType).get(jobId);
-    if (!slot) return null;
+    const slot = this.requireActivation(jobType, jobId, activationId);
     slot.failedAt = this.now();
     slot.error = error ?? { message: reason };
 
-    const retryDelayMs = computeBackoffDelayMs(slot.envelope.backoff, slot.envelope.attempts);
+    const retryDelayMs = computeBackoffDelayMs(
+      slot.envelope.backoff,
+      slot.envelope.attempts - (slot.retryBase ?? 0),
+    );
     if (slot.envelope.attempts < slot.envelope.maxAttempts) {
       const nextAttemptAt = new Date(this.now().getTime() + retryDelayMs);
       slot.nextAttemptAt = nextAttemptAt;
@@ -236,8 +248,10 @@ export class InMemoryBackend implements JobsBackend {
     jobId: string,
     reason = 'cancelled',
   ): Promise<JobRecord | null> {
-    const slot = this.bucketOf(jobType).get(jobId);
+    const slot = this.store.get(jobType)?.get(jobId);
     if (!slot) return null;
+    if (!['queued', 'delayed', 'retrying', 'active'].includes(slot.state))
+      return this.toRecord(slot);
     slot.state = 'cancelled';
     slot.terminalAt ??= this.now();
     slot.nextAttemptAt = undefined;
@@ -273,6 +287,7 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   async replayDeadLetter(jobId: string, options: ReplayOptions = {}): Promise<string> {
+    this.assertOpen();
     const slot = this.slotById(jobId);
     if (!slot || slot.state !== 'dead_letter') {
       throw new Error(`dead-letter job not found: ${jobId}`);
@@ -292,9 +307,13 @@ export class InMemoryBackend implements JobsBackend {
     }
 
     const newJobId = options.preserveOriginalId ? jobId : randomUUID();
-    const replayAttempt = options.resetAttempts === false ? slot.envelope.attempts : 0;
+    const replayAttempt =
+      options.preserveOriginalId || options.resetAttempts === false ? slot.envelope.attempts : 0;
+    const retryBase = options.resetAttempts === false ? (slot.retryBase ?? 0) : replayAttempt;
+    const retryBudget = slot.envelope.maxAttempts - (slot.retryBase ?? 0);
     const replaySlot: Slot = {
       state: 'queued',
+      retryBase,
       identityLineage: this.cloneIdentityLineage(slot.identityLineage),
       envelope: {
         id: newJobId,
@@ -303,7 +322,7 @@ export class InMemoryBackend implements JobsBackend {
         context: snapshotLifecycleValue(slot.envelope.context),
         enqueuedAt: this.now(),
         attempts: replayAttempt,
-        maxAttempts: slot.envelope.maxAttempts,
+        maxAttempts: retryBase + retryBudget,
         timeoutMs: slot.envelope.timeoutMs,
         backoff: slot.envelope.backoff,
         metadata: {
@@ -340,12 +359,55 @@ export class InMemoryBackend implements JobsBackend {
     return this.toRecord(slot);
   }
 
+  get lifecycleState(): 'open' | 'closing' | 'closed' {
+    return this.lifecycle;
+  }
+
+  beginClose(): void {
+    if (this.lifecycle === 'open') this.lifecycle = 'closing';
+  }
+
+  pendingJobIds(): string[] {
+    const ids: string[] = [];
+    for (const bucket of this.store.values()) {
+      for (const [id, slot] of bucket) {
+        if (['queued', 'delayed', 'retrying', 'active'].includes(slot.state)) ids.push(id);
+      }
+    }
+    return ids;
+  }
+
   async close(): Promise<void> {
+    if (this.lifecycle === 'closed') return;
+    this.beginClose();
+    const pending = this.pendingJobIds();
+    if (pending.length) throw new JobsShutdownError('pending_jobs', pending);
     this.store.clear();
     this.jobTypesById.clear();
     this.history.clear();
     this.idempotency.clear();
     this.dedupe.clear();
+    this.lifecycle = 'closed';
+  }
+
+  private assertOpen(): void {
+    if (this.lifecycle !== 'open') throw new JobsError(JobsErrorCode.BackendClosed);
+  }
+
+  private requireActivation(jobType: string, jobId: string, activationId: string): Slot {
+    const slot = this.store.get(jobType)?.get(jobId);
+    if (
+      !activationId ||
+      !slot ||
+      slot.state !== 'active' ||
+      slot.envelope.activationId !== activationId
+    ) {
+      throw new JobsError(
+        JobsErrorCode.ActivationConflict,
+        `inactive or stale activation for ${jobId}`,
+      );
+    }
+    return slot;
   }
 
   private bucketOf(jobType: string): Map<string, Slot> {

@@ -6,6 +6,18 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+### Changed (planned 0.4.0)
+
+- Require opaque activation tokens for manual backend ack/fail/markFailed and an
+  activation-fencing capability for FairWorker; reject stale and illegal completion
+  with `jobs_activation_conflict`. Preserve lifetime attempt counts on same-ID replay.
+- Keep timed-out in-memory invocations owned until settlement, emit `job.timed_out`,
+  and defer retries and slot release until the original handler has finished.
+- Close in-memory admission before Nest shutdown drain, process accepted queued,
+  delayed, and retrying jobs, and close resources once before feature teardown.
+  The default 30-second deadline rejects with `JobsShutdownError` and remaining IDs
+  instead of reporting success; standalone close reports pending jobs without deletion.
+
 ## [0.3.1] - 2026-08-23
 
 ### Changed

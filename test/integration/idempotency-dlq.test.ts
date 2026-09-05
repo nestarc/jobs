@@ -181,7 +181,7 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       dedupe: { key: 'active', mode: 'while_active' as const, ttlMs: 1_000 },
     };
     const activeId = await service.enqueue('report.generate', {}, whileActive);
-    await backend.moveToActive('report.generate', activeId);
+    const activation = await backend.moveToActive('report.generate', activeId);
     now = new Date(now.getTime() + 5_000);
     await expect(
       service.enqueueDetailed('report.generate', {}, whileActive),
@@ -189,7 +189,7 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       status: 'deduped',
       jobId: activeId,
     });
-    await backend.ack('report.generate', activeId);
+    await backend.ack('report.generate', activeId, activation!.activationId!);
     await expect(
       service.enqueueDetailed('report.generate', {}, whileActive),
     ).resolves.toMatchObject({ status: 'created' });
@@ -198,9 +198,9 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       dedupe: { key: 'retained', mode: 'until_completed' as const, ttlMs: 1_000 },
     };
     const retainedId = await service.enqueue('report.generate', {}, untilCompleted);
-    await backend.moveToActive('report.generate', retainedId);
+    const nextActivation1 = await backend.moveToActive('report.generate', retainedId);
     now = new Date(now.getTime() + 5_000);
-    await backend.ack('report.generate', retainedId);
+    await backend.ack('report.generate', retainedId, nextActivation1!.activationId!);
     await expect(
       service.enqueueDetailed('report.generate', {}, untilCompleted),
     ).resolves.toMatchObject({ status: 'deduped', jobId: retainedId });
@@ -223,8 +223,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       dedupe: { key: 'immutable-terminal', mode: 'until_completed' as const, ttlMs: 1_000 },
     };
     const jobId = await service.enqueue('report.generate', {}, options);
-    await backend.moveToActive('report.generate', jobId);
-    await backend.ack('report.generate', jobId);
+    const activation = await backend.moveToActive('report.generate', jobId);
+    await backend.ack('report.generate', jobId, activation!.activationId!);
 
     const record = await service.getJob(jobId);
     record?.completedAt?.setTime(0);
@@ -294,8 +294,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       ),
     ).resolves.toMatchObject({ status: 'deduped', jobId: first.jobId });
 
-    await backend.moveToActive('report.generate', first.jobId);
-    await backend.ack('report.generate', first.jobId);
+    const activation = await backend.moveToActive('report.generate', first.jobId);
+    await backend.ack('report.generate', first.jobId, activation!.activationId!);
 
     await expect(
       service.enqueueDetailed(
@@ -375,8 +375,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       {},
       { attempts: 1, context: { tenantId: 'tenant_1', correlationId: 'corr_1' } },
     );
-    await backend.moveToActive('report.generate', jobId);
-    await backend.fail('report.generate', jobId, 'boom');
+    const activation = await backend.moveToActive('report.generate', jobId);
+    await backend.fail('report.generate', jobId, 'boom', activation!.activationId!);
 
     expect(await service.listDeadLetters()).toEqual([
       expect.objectContaining({ id: jobId, status: 'dead_letter' }),
@@ -407,8 +407,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       },
     );
     const queuedId = await service.enqueue('report.generate', { reportId: 'queued' });
-    await backend.moveToActive('report.generate', jobId);
-    await backend.fail('report.generate', jobId, 'boom');
+    const activation = await backend.moveToActive('report.generate', jobId);
+    await backend.fail('report.generate', jobId, 'boom', activation!.activationId!);
 
     await service.discardDeadLetter(jobId, 'handled manually');
     await service.discardDeadLetter(jobId, 'already discarded');
@@ -444,8 +444,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
         metadata: { nested: { value: 'source' } },
       },
     );
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'boom');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom', activation!.activationId!);
 
     const replayedId = await service.replayDeadLetter(originalId);
     const replayed = await backend.moveToActive('report.generate', replayedId);
@@ -468,8 +468,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       {},
       { attempts: 1, context: { tenantId: '__default__' } },
     );
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'boom');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom', activation!.activationId!);
 
     const replayedId = await service.replayDeadLetter(originalId);
     expect(events.filter((event) => event.type === 'job.replayed')).toEqual([
@@ -487,8 +487,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       metadata: { original: true },
     };
     const originalId = await service.enqueue('report.generate', {}, options);
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'boom');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom', activation!.activationId!);
 
     const replayedId = await service.replayDeadLetter(originalId, {
       resetAttempts: false,
@@ -533,8 +533,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
         },
       ),
     ).resolves.toMatchObject({ status: 'deduped', jobId: originalId });
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'boom');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom', activation!.activationId!);
 
     const replayedId = await service.replayDeadLetter(originalId);
     expect(replayedId).not.toBe(originalId);
@@ -566,8 +566,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       },
     );
     expect(scheduler.pickNext()?.jobId).toBe(originalId);
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'boom');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'boom', activation!.activationId!);
     scheduler.onAck(originalId);
 
     now = new Date('2026-08-16T00:00:00.020Z');
@@ -614,8 +614,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       },
     );
     scheduler.pickNext();
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'first failure');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure', activation!.activationId!);
     scheduler.onAck(originalId);
 
     now = new Date('2026-08-16T00:00:00.020Z');
@@ -625,8 +625,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       { dedupe: { key: 'terminal-replay-dedupe', mode: 'until_completed', ttlMs: 1_000 } },
     );
     scheduler.pickNext();
-    await backend.moveToActive('report.generate', terminalTarget.jobId);
-    await backend.ack('report.generate', terminalTarget.jobId);
+    const nextActivation1 = await backend.moveToActive('report.generate', terminalTarget.jobId);
+    await backend.ack('report.generate', terminalTarget.jobId, nextActivation1!.activationId!);
     scheduler.onAck(terminalTarget.jobId);
 
     const replayedId = await service.replayDeadLetter(originalId);
@@ -654,8 +654,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       {},
       { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 10 } },
     );
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'first failure');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure', activation!.activationId!);
 
     now = new Date('2026-08-16T00:00:00.020Z');
     const terminalTarget = await service.enqueueDetailed(
@@ -663,12 +663,12 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       {},
       { dedupe: { key: 'retained-replay-policy', mode: 'until_completed', ttlMs: 1_000 } },
     );
-    await backend.moveToActive('report.generate', terminalTarget.jobId);
-    await backend.ack('report.generate', terminalTarget.jobId);
+    const nextActivation1 = await backend.moveToActive('report.generate', terminalTarget.jobId);
+    await backend.ack('report.generate', terminalTarget.jobId, nextActivation1!.activationId!);
 
     const replayedId = await service.replayDeadLetter(originalId);
-    await backend.moveToActive('report.generate', replayedId);
-    await backend.ack('report.generate', replayedId);
+    const nextActivation2 = await backend.moveToActive('report.generate', replayedId);
+    await backend.ack('report.generate', replayedId, nextActivation2!.activationId!);
 
     now = new Date('2026-08-16T00:00:00.031Z');
     await expect(
@@ -705,8 +705,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
         dedupe: { key: 'multi-hop-dedupe', mode: 'until_completed', ttlMs: 10 },
       },
     );
-    await backend.moveToActive('report.generate', originalId);
-    await backend.fail('report.generate', originalId, 'first failure');
+    const activation = await backend.moveToActive('report.generate', originalId);
+    await backend.fail('report.generate', originalId, 'first failure', activation!.activationId!);
 
     now = new Date('2026-08-16T00:00:00.020Z');
     const convergedTarget = await service.enqueueDetailed(
@@ -716,8 +716,13 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     );
     await expect(service.replayDeadLetter(originalId)).resolves.toBe(convergedTarget.jobId);
 
-    await backend.moveToActive('report.generate', convergedTarget.jobId);
-    await backend.fail('report.generate', convergedTarget.jobId, 'second failure');
+    const nextActivation1 = await backend.moveToActive('report.generate', convergedTarget.jobId);
+    await backend.fail(
+      'report.generate',
+      convergedTarget.jobId,
+      'second failure',
+      nextActivation1!.activationId!,
+    );
     const replayedId = await service.replayDeadLetter(convergedTarget.jobId);
 
     await expect(
@@ -737,8 +742,8 @@ describe('v0.2 idempotency and DLQ APIs', () => {
       dedupe: { key: 'discarded', mode: 'until_completed' as const, ttlMs: 100 },
     };
     const jobId = await service.enqueue('report.generate', {}, options);
-    await backend.moveToActive('report.generate', jobId);
-    await backend.fail('report.generate', jobId, 'boom');
+    const activation = await backend.moveToActive('report.generate', jobId);
+    await backend.fail('report.generate', jobId, 'boom', activation!.activationId!);
 
     now = new Date('2026-08-16T00:00:00.200Z');
     await service.discardDeadLetter(jobId);

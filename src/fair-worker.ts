@@ -9,6 +9,7 @@ import {
   snapshotLifecycleValue,
 } from './lifecycle-observer';
 import { normalizeError } from './error-utils';
+import { JobsError, JobsErrorCode } from './errors';
 
 export interface FairWorkerOptions {
   jobType: string;
@@ -23,12 +24,49 @@ export interface FairWorkerOptions {
 }
 
 export class FairWorker {
-  constructor(private readonly opts: FairWorkerOptions) {}
+  private readonly ticks = new Set<Promise<boolean>>();
+  private readonly invocations = new Set<string>();
 
-  async tick(): Promise<boolean> {
+  outstandingJobIds(): string[] {
+    return [...this.invocations];
+  }
+
+  async waitForIdle(): Promise<void> {
+    while (this.ticks.size) await Promise.all([...this.ticks]);
+  }
+
+  constructor(private readonly opts: FairWorkerOptions) {
+    if (!opts.backend.capabilities().activationFencing) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        'FairWorker requires activation fencing',
+      );
+    }
+  }
+
+  tick(): Promise<boolean> {
+    const tick = this.runTick();
+    this.ticks.add(tick);
+    void tick.then(
+      () => this.ticks.delete(tick),
+      () => this.ticks.delete(tick),
+    );
+    return tick;
+  }
+
+  private async runTick(): Promise<boolean> {
     const picked = this.opts.scheduler.pickNext();
     if (!picked) return false;
 
+    this.invocations.add(picked.jobId);
+    try {
+      return await this.execute(picked);
+    } finally {
+      this.invocations.delete(picked.jobId);
+    }
+  }
+
+  private async execute(picked: { jobId: string; tenantId: string }): Promise<boolean> {
     const envelope = await this.opts.backend.moveToActive(this.opts.jobType, picked.jobId);
     if (!envelope) {
       this.opts.scheduler.onAck(picked.jobId);
@@ -45,6 +83,13 @@ export class FairWorker {
       return false;
     }
 
+    const activationId = envelope.activationId;
+    if (!activationId) {
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        'FairWorker requires activation fencing',
+      );
+    }
     const startedAt = new Date();
     const event: JobEvent = {
       jobId: picked.jobId,
@@ -85,24 +130,47 @@ export class FairWorker {
         ),
       ),
     );
-    const work = envelope.timeoutMs
-      ? Promise.race([
-          invoke,
-          new Promise<never>((_resolve, reject) => {
-            timeout = setTimeout(() => {
-              controller.abort();
-              const err = new Error('timeout');
-              (err as Error & { reason?: string }).reason = 'timeout';
-              reject(err);
-            }, envelope.timeoutMs);
+    let timedOut = false;
+    const timeoutError = Object.assign(new Error('timeout'), { reason: 'timeout' });
+    if (envelope.timeoutMs) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        notifyLifecycleObserver(() =>
+          this.opts.events?.onEvent?.({
+            type: 'job.timed_out',
+            jobId: picked.jobId,
+            jobType: this.opts.jobType,
+            tenantId: picked.tenantId,
+            attempt: envelope.attempts,
+            at: new Date(),
+            error: { message: 'timeout', reason: 'timeout' },
+            metadata: snapshotLifecycleValue(envelope.metadata),
           }),
-        ])
-      : invoke;
+        );
+        controller.abort();
+      }, envelope.timeoutMs);
+    }
+    // Abort is cooperative. Keep ownership until the actual invocation settles.
+    const work = invoke.then(
+      (value) => {
+        if (timedOut) throw timeoutError;
+        return value;
+      },
+      (error) => {
+        throw timedOut ? timeoutError : error;
+      },
+    );
 
     try {
       await work;
       const finishedAt = new Date();
-      await this.opts.backend.ack(this.opts.jobType, picked.jobId);
+      try {
+        await this.opts.backend.ack(this.opts.jobType, picked.jobId, activationId);
+      } catch (err) {
+        if (!(err instanceof JobsError) || err.code !== JobsErrorCode.ActivationConflict) throw err;
+        this.opts.scheduler.onAck(picked.jobId);
+        return true;
+      }
       this.opts.scheduler.onAck(picked.jobId);
       notifyLifecycleObserver(() =>
         this.opts.onFinish?.(
@@ -129,7 +197,20 @@ export class FairWorker {
     } catch (err) {
       const error = normalizeError(err);
       const reason = (error as Error & { reason?: string }).reason ?? error.message;
-      const record = await this.opts.backend.fail(this.opts.jobType, picked.jobId, reason);
+      let record;
+      try {
+        record = await this.opts.backend.fail(
+          this.opts.jobType,
+          picked.jobId,
+          reason,
+          activationId,
+        );
+      } catch (failure) {
+        if (!(failure instanceof JobsError) || failure.code !== JobsErrorCode.ActivationConflict)
+          throw failure;
+        this.opts.scheduler.onAck(picked.jobId);
+        return true;
+      }
       this.opts.scheduler.onAck(picked.jobId);
       if (
         record?.status === 'queued' ||
@@ -158,7 +239,6 @@ export class FairWorker {
       return true;
     } finally {
       if (timeout) clearTimeout(timeout);
-      invoke.catch(() => undefined);
     }
   }
 

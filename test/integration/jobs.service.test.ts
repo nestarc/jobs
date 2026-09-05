@@ -223,8 +223,8 @@ describe('JobsService', () => {
       { attempts: 1, context: { tenantId: 'tenant_1' } },
     );
     expect(scheduler.pickNext()?.jobId).toBe(originalId);
-    await backend.moveToActive('doThing', originalId);
-    await backend.fail('doThing', originalId, 'boom');
+    const activation = await backend.moveToActive('doThing', originalId);
+    await backend.fail('doThing', originalId, 'boom', activation!.activationId!);
     scheduler.onAck(originalId);
 
     const replayedId = await service.replayDeadLetter(originalId);
