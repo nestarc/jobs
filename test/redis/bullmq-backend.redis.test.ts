@@ -1422,6 +1422,58 @@ describe('BullMQBackend with Redis', () => {
     }
   });
 
+  it.each([undefined, 'tenant', 'global'] as const)(
+    'keeps Outbox tenants isolated across restart unless scope is global (%s)',
+    async (scope) => {
+      const { namespace, jobType } = testIdentity('outbox-dedupe');
+      const first = backend(namespace, jobType);
+      const Publisher = createOutboxJobsPublisher({
+        map: {
+          'test.requested': {
+            job: jobType,
+            options: { dedupe: { key: 'shared', scope, mode: 'until_completed' } },
+          },
+        },
+      });
+      const records = ['a', 'b'].map((tenantId) => ({
+        id: randomUUID(),
+        eventType: 'test.requested',
+        tenantId,
+        payload: { tenantId },
+      }));
+      const publisher = new Publisher(service(first, jobType));
+      await Promise.all(records.map((record) => publisher.publish(record)));
+      const beforeRestart = await Promise.all(records.map((record) => first.getJob(record.id)));
+      expect(beforeRestart.filter(Boolean)).toHaveLength(scope === 'global' ? 1 : 2);
+      for (const job of beforeRestart.filter((job) => job !== null)) {
+        expect(job).toMatchObject({
+          idempotencyKey: job.id,
+          context: { outboxEventId: job.id, correlationId: job.id },
+          status: 'queued',
+        });
+      }
+      await first.close();
+      const restarted = backend(namespace, jobType);
+      const redelivery = new Publisher(service(restarted, jobType));
+      await Promise.all(records.map((record) => redelivery.publish(record)));
+      const handled: string[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(jobType, async (_payload, context) => {
+        handled.push(String(context.tenantId));
+      });
+      expect(handled).toEqual([]);
+      restarted.startConsumer([jobType], consumer(registry));
+      const ids = beforeRestart.filter((job) => job !== null).map((job) => job.id);
+      await waitFor(async () =>
+        (await Promise.all(ids.map((id) => restarted.getJob(id)))).every(
+          (job) => job?.status === 'succeeded',
+        ),
+      );
+      expect(handled).toHaveLength(scope === 'global' ? 1 : 2);
+      if (scope !== 'global') expect(handled.sort()).toEqual(['a', 'b']);
+    },
+  );
+
   it('preserves outbox identity and lineage through Redis restart and redelivery', async () => {
     const { namespace, jobType } = testIdentity('outbox');
     const first = backend(namespace, jobType);

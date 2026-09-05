@@ -6,6 +6,13 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+### Fixed
+
+- Default first-party Outbox mapping dedupe to tenant scope when a tenant is present;
+  require explicit global scope to suppress jobs across tenants. Preserve generic JobsService defaults.
+- Rebuild reserved Outbox context and metadata from a source snapshot, remove stale mapping
+  lineage when source fields are absent, and preserve canonical identity through callback mutation.
+
 ### Changed (planned 0.4.0)
 
 - Require opaque activation tokens for manual backend ack/fail/markFailed and an

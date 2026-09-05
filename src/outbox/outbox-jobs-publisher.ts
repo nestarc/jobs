@@ -1,5 +1,6 @@
 import { Inject, Injectable, type Type } from '@nestjs/common';
 import { JOBS_SERVICE } from '../contracts';
+import { snapshotLifecycleValue } from '../lifecycle-observer';
 import type { JobsService } from '../jobs.service';
 import type { EnqueueOptions, JobContext } from '../types';
 
@@ -62,57 +63,86 @@ export function createOutboxJobsPublisher(
 
       const target: OutboxJobTarget =
         typeof configuredTarget === 'string' ? { job: configuredTarget } : configuredTarget;
-      const tenantId = this.resolveTenant(record, target.tenant ?? 'required');
+      // Capture source-owned lineage before any user mapping can mutate the record.
+      const source = {
+        ...record,
+        headers: snapshotLifecycleValue(record.headers),
+        occurredAt:
+          record.occurredAt instanceof Date ? record.occurredAt.toISOString() : record.occurredAt,
+      };
+      const tenantId = this.resolveTenant(source, record, target.tenant ?? 'required');
       const configuredOptions =
         typeof target.options === 'function' ? target.options(record) : (target.options ?? {});
-      const correlationId = record.correlationId ?? record.id;
+      const dedupe: EnqueueOptions['dedupe'] = configuredOptions.dedupe
+        ? {
+            ...configuredOptions.dedupe,
+            scope: configuredOptions.dedupe.scope ?? (tenantId ? 'tenant' : 'global'),
+          }
+        : undefined;
+      const correlationId = source.correlationId ?? source.id;
+      const customContext = { ...(configuredOptions.context as JobContext | undefined) };
+      for (const key of ['tenantId', 'outboxEventId', 'correlationId', 'causationId']) {
+        delete customContext[key];
+      }
+      const customMetadata = { ...configuredOptions.metadata };
+      for (const key of [
+        'source',
+        'outboxEventId',
+        'outboxEventType',
+        'tenantId',
+        'correlationId',
+        'causationId',
+        'aggregateType',
+        'aggregateId',
+        'partitionKey',
+        'outboxIdempotencyKey',
+        'outboxHeaders',
+        'outboxOccurredAt',
+      ]) {
+        delete customMetadata[key];
+      }
       const context: JobContext = {
-        ...(configuredOptions.context as JobContext | undefined),
+        ...customContext,
         ...(tenantId ? { tenantId } : {}),
-        outboxEventId: record.id,
+        outboxEventId: source.id,
         correlationId,
-        ...(record.causationId ? { causationId: record.causationId } : {}),
+        ...(source.causationId ? { causationId: source.causationId } : {}),
       };
       const metadata: Record<string, unknown> = {
-        ...configuredOptions.metadata,
+        ...customMetadata,
         source: '@nestarc/outbox',
-        outboxEventId: record.id,
-        outboxEventType: record.eventType,
+        outboxEventId: source.id,
+        outboxEventType: source.eventType,
         correlationId,
         ...(tenantId ? { tenantId } : {}),
-        ...(record.causationId ? { causationId: record.causationId } : {}),
-        ...(record.aggregateType ? { aggregateType: record.aggregateType } : {}),
-        ...(record.aggregateId ? { aggregateId: record.aggregateId } : {}),
-        ...(record.partitionKey ? { partitionKey: record.partitionKey } : {}),
-        ...(record.idempotencyKey ? { outboxIdempotencyKey: record.idempotencyKey } : {}),
-        ...(record.headers ? { outboxHeaders: record.headers } : {}),
-        ...(record.occurredAt
-          ? {
-              outboxOccurredAt:
-                record.occurredAt instanceof Date
-                  ? record.occurredAt.toISOString()
-                  : record.occurredAt,
-            }
-          : {}),
+        ...(source.causationId ? { causationId: source.causationId } : {}),
+        ...(source.aggregateType ? { aggregateType: source.aggregateType } : {}),
+        ...(source.aggregateId ? { aggregateId: source.aggregateId } : {}),
+        ...(source.partitionKey ? { partitionKey: source.partitionKey } : {}),
+        ...(source.idempotencyKey ? { outboxIdempotencyKey: source.idempotencyKey } : {}),
+        ...(source.headers ? { outboxHeaders: source.headers } : {}),
+        ...(source.occurredAt ? { outboxOccurredAt: source.occurredAt } : {}),
       };
 
       await this.jobs.enqueue(target.job, target.payload?.(record) ?? record.payload, {
         ...configuredOptions,
+        dedupe,
         context,
         metadata,
-        jobId: record.id,
-        idempotencyKey: record.id,
+        jobId: source.id,
+        idempotencyKey: source.id,
       });
     }
 
     private resolveTenant(
+      source: OutboxRecord,
       record: OutboxRecord,
       strategy: NonNullable<OutboxJobTarget['tenant']>,
     ): string | undefined {
       const tenantId =
-        typeof strategy === 'function' ? strategy(record) : (record.tenantId ?? undefined);
+        typeof strategy === 'function' ? strategy(record) : (source.tenantId ?? undefined);
       if (strategy !== 'optional' && (!tenantId || tenantId.length === 0)) {
-        throw new Error(`Outbox event "${record.id}" requires a tenantId`);
+        throw new Error(`Outbox event "${source.id}" requires a tenantId`);
       }
       return tenantId || undefined;
     }

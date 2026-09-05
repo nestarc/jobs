@@ -62,6 +62,76 @@ async function main(): Promise<void> {
   assert.equal(job?.idempotencyKey, record.id);
   assert.equal(job?.metadata?.source, '@nestarc/outbox');
   assert.equal(job?.metadata?.outboxEventId, record.id);
+
+  for (const scope of [undefined, 'global'] as const) {
+    const isolated = new FakeJobsService({ jobTypes: ['invoice.process'] });
+    const tenants: unknown[] = [];
+    isolated.registry.register('invoice.process', async (_payload, context) => {
+      tenants.push(context.tenantId);
+    });
+    const DedupePublisher: Type<FirstPartyOutboxPublisher> = createOutboxJobsPublisher({
+      map: {
+        'invoice.issued': {
+          job: 'invoice.process',
+          options: { dedupe: { key: 'shared-key', scope, mode: 'until_completed' } },
+        },
+      },
+    });
+    const dedupePublisher = new DedupePublisher(isolated.service);
+    for (const tenantId of ['a', 'b']) {
+      const event = { ...record, id: `event-${tenantId}`, tenantId };
+      await dedupePublisher.publish(event);
+      await dedupePublisher.publish(event);
+      if (scope !== 'global' || tenantId === 'a') {
+        const enqueued = await isolated.service.getJob(event.id);
+        assert.equal(enqueued?.idempotencyKey, event.id);
+        assert.equal(enqueued?.status, 'queued');
+      } else {
+        assert.equal(await isolated.service.getJob(event.id), null);
+      }
+    }
+    assert.deepEqual(tenants, []);
+    await isolated.drain();
+    assert.deepEqual(tenants.sort(), scope === 'global' ? ['a'] : ['a', 'b']);
+  }
+
+  const SystemPublisher: Type<FirstPartyOutboxPublisher> = createOutboxJobsPublisher({
+    map: {
+      'invoice.issued': {
+        job: 'invoice.process',
+        tenant: 'optional',
+        options: (event) => {
+          event.id = 'forged';
+          event.correlationId = 'forged';
+          return {
+            context: { tenantId: 'stale', causationId: 'stale', custom: true },
+            metadata: { aggregateId: 'stale', outboxHeaders: { stale: true }, custom: true },
+          };
+        },
+      },
+    },
+  });
+  await new SystemPublisher(fake.service).publish({
+    ...record,
+    id: 'system-event',
+    tenantId: null,
+    correlationId: null,
+    causationId: null,
+    aggregateId: null,
+    headers: {},
+  });
+  const systemJob = await fake.service.getJob<unknown, Record<string, unknown>>('system-event');
+  assert.equal(systemJob?.idempotencyKey, 'system-event');
+  assert.equal(systemJob?.context?.correlationId, 'system-event');
+  for (const field of ['tenantId', 'causationId']) {
+    assert.equal(Object.hasOwn(systemJob?.context ?? {}, field), false);
+  }
+  for (const field of ['aggregateId']) {
+    assert.equal(Object.hasOwn(systemJob?.metadata ?? {}, field), false);
+  }
+  assert.deepEqual(systemJob?.metadata?.outboxHeaders, {});
+  assert.equal(systemJob?.metadata?.custom, true);
+  await fake.drain();
 }
 
 void main().catch((error: unknown) => {

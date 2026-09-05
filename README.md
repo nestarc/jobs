@@ -488,6 +488,25 @@ OutboxModule.forRoot({
 
 The adapter sets both `jobId` and `idempotencyKey` to the outbox record ID. It preserves `tenantId`, `outboxEventId`, `correlationId` (falling back to the event ID), and optional `causationId` in context and metadata. Missing mappings, including inherited object property names, and missing required tenants fail closed by default. Delivery remains at-least-once; retain BullMQ terminal job records for at least the outbox retry and operator-recovery horizon.
 
+For tenant-bearing events, mapping-level `dedupe: { key }` defaults to `scope: 'tenant'`
+using the resolved tenant. Two tenants with the same key enqueue separate jobs. To intentionally
+collapse work across tenants of a job type, set `dedupe: { key, scope: 'global' }` explicitly.
+A `tenant: 'optional'` event without a tenant retains global dedupe; explicit tenant-scoped dedupe
+without a tenant fails closed. The generic `JobsService` dedupe default remains global.
+
+A successful `publish()` acknowledges enqueue or duplicate suppression. Outbox `SENT` does not
+mean the Jobs handler succeeded. A suppressed event may have no separate job under its record ID;
+the retained job keeps its original record ID as both `jobId` and `idempotencyKey`.
+
+Context fields `tenantId`, `outboxEventId`, `correlationId`, and `causationId` are source-owned.
+Metadata fields `source`, `outboxEventId`, `outboxEventType`, `tenantId`, `correlationId`,
+`causationId`, `aggregateType`, `aggregateId`, `partitionKey`, `outboxIdempotencyKey`,
+`outboxHeaders`, and `outboxOccurredAt` are also reserved. Mapping values for these fields are
+removed before source lineage is applied, including when a source value is absent. Other custom
+context and metadata fields are preserved. Only an explicit `target.tenant` function can remap
+the tenant. Source identity and lineage (including headers and occurrence time) are snapshotted
+before mapping callbacks run, so mutating a callback's record cannot replace canonical lineage.
+
 ## Legacy generic bridge
 
 `JobsOutboxBridge` remains available for compatibility with generic sources that expose `onEvent()`; it is not the `@nestarc/outbox` publisher transport.

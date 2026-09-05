@@ -21,6 +21,9 @@
 > [!NOTE]
 > 2026-09-05 사용자가 `JOBS-M02 → JOBS-M05 → JOBS-M01` 구현·검증으로 범위를 확대했다. 아래 세 작업의 `DONE`과 `JOBS-M06`의 `READY`는 **로컬 구현 후보 기준**이며, 공개 main에 merge되거나 배포됐다는 뜻이 아니다. `JOBS-PLAN-01`은 여전히 미merge 상태다. 다른 세션은 branch-local 상태를 shared claim 또는 main 완료 증거로 사용하지 않는다. 상세 인계는 §9를 따른다.
 
+> [!NOTE]
+> 2026-09-05 후속 요청으로 `JOBS-M03`과 필수 선행 `JOBS-M04`의 로컬 구현·검증을 완료했다. 시작 checkout은 이전 M01/M02/M05 구현을 포함한 `main@1f4c486`이며 clean 상태였다. 이 문서는 이제 tracked이지만 fetched `origin/main@405e799`에는 여전히 없다. M03/M04의 `DONE`도 로컬 후보 기준이며, shared claim·PR·merge·release 완료를 뜻하지 않는다. 가장 최근 인계는 §9의 M04 → M03 기록을 따른다.
+
 ## 0. 문서 운영 계약
 
 ### 0.1 우선순위
@@ -191,8 +194,8 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 |    0 | `JOBS-PLAN-01` | 문서     | `READY`    | S    | 없음                                                          | 이 계획만 별도 PR로 review/merge                                    |
 |    1 | `JOBS-M01`     | P0       | `DONE`  | L    | `JOBS-M02`, `JOBS-M05`                                        | in-memory shutdown admission/drain 계약                             |
 |    2 | `JOBS-M02`     | P0       | `DONE`    | L    | 없음                                                          | activation-fenced state machine                                     |
-|    3 | `JOBS-M03`     | P0       | `BLOCKED`  | M    | `JOBS-M04`                                                    | Outbox adapter tenant dedupe 격리                                   |
-|    4 | `JOBS-M04`     | P0       | `READY`    | S    | 없음                                                          | Outbox source-owned lineage 봉인                                    |
+|    3 | `JOBS-M03`     | P0       | `DONE`     | M    | `JOBS-M04`                                                    | Outbox adapter tenant dedupe 격리                                   |
+|    4 | `JOBS-M04`     | P0       | `DONE`     | S    | 없음                                                          | Outbox source-owned lineage 봉인                                    |
 |    5 | `JOBS-M05`     | P0       | `DONE`  | M    | `JOBS-M02`                                                    | cooperative timeout 뒤 attempt 중첩 방지                            |
 |    6 | `JOBS-M06`     | P1       | `READY`  | L    | `JOBS-M01–02`, `JOBS-M05`                                     | 실제 in-memory pool과 cross-type cap                                |
 |    7 | `JOBS-M07`     | P1       | `READY`    | M    | 없음                                                          | enqueue/config fail-closed validation                               |
@@ -308,34 +311,34 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 
 ### `JOBS-M03` — Outbox adapter의 tenant-safe dedupe
 
-- 상태: `P0 / BLOCKED`; 선행 `JOBS-M04`
-- 문제: adapter는 tenant를 기본 필수로 하면서 mapping dedupe를 그대로 넘기고, 두 backend는 missing scope를 global로 처리한다. tenant A/B 같은 key에서 B Outbox row도 terminal acknowledgement 되지만 A job 하나만 남을 수 있다.
+- 상태: `P0 / DONE` (로컬 후보); 선행 `JOBS-M04` 포함 완료. 근거: §9의 M04 → M03 인계
+- 문제(수정 전): adapter는 tenant를 기본 필수로 하면서 mapping dedupe를 그대로 넘기고, 두 backend는 missing scope를 global로 처리한다. tenant A/B 같은 key에서 B Outbox row도 terminal acknowledgement 되지만 A job 하나만 남을 수 있다.
 
 완료 조건:
 
-- [ ] tenant-bearing Outbox event에서 scope 누락은 adapter 경계에서 `tenant`로 확정하거나 fail-closed한다.
-- [ ] cross-tenant global dedupe는 명시적 `scope:'global'` 또는 더 강한 이름의 opt-in만 허용한다.
-- [ ] generic `JobsService` dedupe 기본값은 이 task에서 바꾸지 않는다.
-- [ ] tenant A/B 동일 key가 InMemory와 BullMQ에서 각각 job을 만든다.
-- [ ] explicit global positive case는 의도대로 한 job으로 축약된다.
-- [ ] suppressed Outbox publish가 enqueue acknowledgement일 뿐 handler 성공이 아님을 문서화한다.
-- [ ] record ID는 canonical job/idempotency identity로 계속 보존한다.
+- [x] tenant-bearing Outbox event에서 scope 누락은 adapter 경계에서 `tenant`로 확정하거나 fail-closed한다.
+- [x] cross-tenant global dedupe는 명시적 `scope:'global'` 또는 더 강한 이름의 opt-in만 허용한다.
+- [x] generic `JobsService` dedupe 기본값은 이 task에서 바꾸지 않는다.
+- [x] tenant A/B 동일 key가 InMemory와 BullMQ에서 각각 job을 만든다.
+- [x] explicit global positive case는 의도대로 한 job으로 축약된다.
+- [x] suppressed Outbox publish가 enqueue acknowledgement일 뿐 handler 성공이 아님을 문서화한다.
+- [x] record ID는 canonical job/idempotency identity로 계속 보존한다.
 
 검증: 프로필 A/B/D. Semver: correctness patch 가능; global opt-in shape가 바뀌면 `0.4.0`. 비범위: exactly-once와 generic API default.
 
 ### `JOBS-M04` — Outbox source-owned lineage 봉인
 
-- 상태: `P0 / READY`
-- 문제: mapping context/metadata를 먼저 spread하고 source 값이 truthy일 때만 덮어써 global event/null lineage에서 mapping의 stale/위조 reserved field가 남는다.
+- 상태: `P0 / DONE` (로컬 후보); 완료 근거: §9의 M04 → M03 인계
+- 문제(수정 전): mapping context/metadata를 먼저 spread하고 source 값이 truthy일 때만 덮어써 global event/null lineage에서 mapping의 stale/위조 reserved field가 남는다.
 
 완료 조건:
 
-- [ ] context의 `tenantId`, `outboxEventId`, `correlationId`, `causationId`를 mapping 입력에서 제거한 뒤 source로 재구성한다.
-- [ ] metadata의 source/event/type/tenant/correlation/causation/aggregate/partition/idempotency/header/occurredAt 예약 필드도 같은 규칙을 쓴다.
-- [ ] source 값이 없으면 mapping의 stale 값도 결과에 남지 않는다.
-- [ ] 명시적 `target.tenant` 함수만 tenant 재매핑을 소유한다.
-- [ ] 사용자 정의 비예약 context/metadata는 보존한다.
-- [ ] source object를 mapping function이 mutate해 canonical identity를 바꾸지 못하게 snapshot/order를 고정한다.
+- [x] context의 `tenantId`, `outboxEventId`, `correlationId`, `causationId`를 mapping 입력에서 제거한 뒤 source로 재구성한다.
+- [x] metadata의 source/event/type/tenant/correlation/causation/aggregate/partition/idempotency/header/occurredAt 예약 필드도 같은 규칙을 쓴다.
+- [x] source 값이 없으면 mapping의 stale 값도 결과에 남지 않는다.
+- [x] 명시적 `target.tenant` 함수만 tenant 재매핑을 소유한다.
+- [x] 사용자 정의 비예약 context/metadata는 보존한다.
+- [x] source object를 mapping function이 mutate해 canonical identity를 바꾸지 못하게 snapshot/order를 고정한다.
 
 검증: 프로필 A/D. Semver: patch. 비범위: Tenancy runtime dependency와 arbitrary business metadata validation.
 
@@ -656,6 +659,8 @@ Outbox ── publisher record ──> Jobs Outbox adapter ──> Jobs backend/
 | 2026-09-05 | `JOBS-M02` | `DONE` (로컬) | `405e799` 기준 미커밋 후보 | activation regression 8건; Nest 10/11 전체 178 PASS | 로컬 변경 review 및 main 반영 |
 | 2026-09-05 | `JOBS-M05` | `DONE` (로컬) | `405e799` 기준 미커밋 후보 | timeout ownership regression 4건; Nest 10/11 전체 178 PASS | 로컬 변경 review 및 main 반영 |
 | 2026-09-05 | `JOBS-M01` | `DONE` (로컬) | `405e799` 기준 미커밋 후보 | backend close 4건 + module lifecycle 16건; 프로필 A/C PASS | 로컬 변경 review 및 main 반영; 이후 남은 P0 M04 → M03 |
+| 2026-09-05 | `JOBS-M04` | `DONE` (로컬) | `1f4c486` 기준 미커밋 후보 | reserved lineage·callback mutation 회귀; 프로필 A/D PASS | M03과 함께 로컬 후보 review 및 main 반영 |
+| 2026-09-05 | `JOBS-M03` | `DONE` (로컬) | `1f4c486` 기준 미커밋 후보 | unit 188 / Redis 44 / coverage 232 PASS; packed core·Outbox PASS | 계획 bootstrap 및 P0 후보 main 반영; M12 → M17, M13 release 선행 검토 |
 
 ### 2026-09-05 — JOBS-M01 시작 전 선행 조건 확인
 
@@ -714,3 +719,46 @@ Outbox ── publisher record ──> Jobs Outbox adapter ──> Jobs backend/
 - Redis / packed consumer / release/settings: 미실행. 이 세 작업의 acceptance는 프로필 A/C와 Nest 10/11 lifecycle이며 B/D/E 및 publish는 요구하지 않는다. `npm pack --dry-run`만으로 packed runtime 검증 또는 배포 완료를 주장하지 않는다. Redis backend 구현은 변경하지 않았다.
 - Remaining risk: in-memory crash durability 없음; signal-ignore handler는 deadline 후에도 남을 수 있음; host의 기존 sequential 처리와 fault recovery는 각각 M06/M16 범위다. co-located Outbox shutdown ordering 조정은 M22 범위다.
 - Next exact action: 계획 bootstrap과 이 로컬 후보를 review/PR 절차로 main에 반영한다. 공개 main에서 완료 여부를 재확인한 뒤 남은 P0 `JOBS-M04 → JOBS-M03`을 진행한다. M06은 이 로컬 후보의 선행 조건만 충족됐으며 남은 P0보다 먼저 착수하지 않는다.
+
+
+### 2026-09-05 — JOBS-M04 → JOBS-M03 완료 인계
+
+- Task / State: `JOBS-M03` 및 필수 선행 `JOBS-M04`, 모두 `DONE` (로컬 code/docs/test 완료).
+- 요청 범위: 사용자의 M03 실행 요청을 완료하기 위해 같은 adapter의 선행 M04도 먼저 구현했다. 문서 bootstrap과 main merge를 기다리는 대신 기존 로컬 후보를 이어 구현했으며, shared 완료 상태를 주장하지 않는다.
+- Start ref: `main@1f4c4865c37568437bbcfab41115681a7377cae8` (M01/M02/M05 구현 포함). 최초 `git status --short`는 clean. 기존 handler 계획 문서는 읽기 전용으로 보존했다.
+- End ref: `codex/jobs-m03-tenant-dedupe`의 위 ref 기준 미커밋 후보. 전용 worktree `/private/tmp/jobs-m03-tenant-dedupe`에서 검증한 7개 파일을 원래 작업 경로에 반영했다. 원래 branch/HEAD는 보존했다. stage, commit, push, shared claim, PR, merge, publish는 수행하지 않았다.
+- 외부 기준 재확인: fetch 성공, main `405e799367023bb5e868588c85e4ff1fca51d4c0`, release tag `7a173442caea6d7d50b09c9fe01a643cd1afb288`, npm latest `0.3.1` 유지. GitHub Release 시각 `2026-08-23T15:09:01Z`, [main CI 33294387914](https://github.com/nestarc/jobs/actions/runs/33294387914) `completed/success`. npm integrity도 앞선 기준선과 동일하다.
+
+#### 계약과 semver 결정
+
+- M04: mapping callback 실행 전에 source 필드를 snapshot한다. nested headers를 복제하고 Date occurrence time을 문자열로 보존한다. context 4개 및 metadata 12개 예약 필드를 mapping에서 제거한 뒤 source로 재구성한다. source 값이 없으면 stale mapping 값도 제거하며, custom 필드는 보존한다. tenant 재매핑은 명시적 `target.tenant` 함수만 소유한다.
+- M03: mapping dedupe가 있고 scope가 생략되면 resolved tenant가 있는 경우 `tenant`, tenant 없는 optional event는 `global`로 확정한다. 명시적 `global` 및 `tenant` 설정은 보존하며 tenant 없는 명시적 tenant scope는 거부한다. 공유 mapping options를 mutate하지 않는다. generic `JobsService`와 두 backend의 기본값/구현은 변경하지 않았다.
+- 원본 record ID를 canonical `jobId`/`idempotencyKey`로 보존한다. dedupe로 축약된 Outbox 이벤트는 별도 job이 없을 수 있으며, 성공 publish/Outbox SENT는 enqueue acknowledgement이지 handler 성공이 아니다. README에 해당 의미를 명시했다.
+- Semver: M03/M04 자체는 correctness **patch**이며 global opt-in의 public shape를 변경하지 않았다. 기존 M01/M02/M05의 `0.4.0` minor 결정은 유지한다. package/lock version은 `0.3.1` 그대로이며 실제 version bump는 `JOBS-REL-01` 범위다.
+
+#### RED와 최종 검증
+
+| 구분 | 명령 / 결과 |
+| --- | --- |
+| First RED | `npm test -- --runInBand test/integration/outbox-jobs-publisher.test.ts`: **6 FAIL / 8 PASS**. M03 tenant B job 유실 및 remap dedupe 2건, M04 stale lineage 및 tenant/options/payload callback의 canonical identity 변조 4건 |
+| M04 단독 수정 뒤 | 같은 명령 **2 FAIL / 12 PASS**; M04 회귀는 통과하고 M03 tenant dedupe 2건만 실패 |
+| Redis First RED | `REDIS_URL=redis://127.0.0.1:16379 npm run test:redis -- -t 'keeps Outbox tenants'`: **1 FAIL / 2 PASS / 41 skipped**. scope 누락 시 2개 대신 1개 job; explicit tenant/global은 기대대로 동작 |
+| Adapter 최종 회귀 | `npm test -- --runInBand test/integration/outbox-jobs-publisher.test.ts`: **16 PASS**. 기본/explicit tenant/global, same-ID redelivery, explicit remap, optional tenantless, generic default, callback mutation 포함 |
+| 설치 | `npm ci --cache /private/tmp/jobs-m03-npm-cache --no-audit --no-fund`: PASS |
+| 프로필 A | `npm run --if-present clean` (script 없음), `npm run lint`, `npx --no-install tsc -p tsconfig.json --noEmit`, `npm run build`: PASS. `npm test -- --runInBand`: **23 suites / 188 tests PASS** |
+| 프로필 B | `REDIS_URL=redis://127.0.0.1:16379 npm run test:redis`: **1 suite / 44 tests PASS**. 신규 3건은 concurrent A/B publish, backend 재생성/redelivery 및 실제 handler 실행 검증 |
+| Coverage | `REDIS_URL=redis://127.0.0.1:16379 npm run test:coverage`: **24 suites / 232 tests PASS**. global statements/branches/functions/lines **92.24/85.04/97.16/94.42%**; BullMQ **92.56/84.98/94.25/94.36%**, threshold PASS |
+| Production audit | `npm audit --omit=dev --json --cache /private/tmp/jobs-m03-npm-cache`: **total 0**, PASS |
+| Pack dry run | `npm pack --dry-run --json --cache /private/tmp/jobs-m03-npm-cache`: PASS. 최초 기본 npm cache 쓰기 EPERM은 전용 `/private/tmp` cache로 해소 |
+| 프로필 D / modern | `OUTBOX_PACKAGE=@nestarc/outbox@0.2.1 npm_config_cache=/private/tmp/jobs-m03-npm-cache npm run test:consumer:modern`: PASS. exact Outbox **0.2.1**, Nest **11.2.1**, Prisma **7.10.0**, strict peer install, graph/digest assertions, `tsc --strict --skipLibCheck false --noEmitOnError`, runtime smoke. 신규 tenant/global dedupe 및 source lineage 검증 포함 |
+| Packed fixture 보정 | 최초 strict compile에서 실제 Outbox의 required `headers: Record<string, string>` 및 optional/unknown job context 타입과 fixture의 불일치를 발견. headers `{}`와 typed optional context 접근으로 수정하여 최종 PASS; production API 타입은 변경하지 않음 |
+| 프로필 D / core | `/private/tmp/jobs-m03-core-BjDqi5`에서 동일 digest tarball + exact Nest **10.4.22** strict peer install, `npm ls --all`, BullMQ/Outbox 모두 `MODULE_NOT_FOUND`, Nest enqueue/shutdown runtime smoke 및 `tsc --strict --skipLibCheck false --noEmit`: PASS |
+| Diff / 보존 | start ref 대비 7개 파일 path-scoped 변경 확인, `git diff --check`, `git diff --cached --check`: PASS. handler 계획·package.json·package-lock.json은 미수정·미stage |
+
+- 환경: Node `24.11.1`, npm `11.6.2`; source unit/Redis는 Nest `10.4.22`, BullMQ `5.74.1`. Nest 11은 위 packed gate로 검증했으며 Node 20/22 및 전체 Nest 11 Redis matrix는 이 세션에서 재실행하지 않았다.
+- Redis evidence: 비어 있는 host port `16379`를 확인하고 전용 compose project `jobs-m03-20260905` / `redis:7.2-alpine`을 시작했다. 테스트마다 UUID namespace만 정리했고 검증 후 자신이 시작한 compose project만 `down`했다. 여기서 restart는 backend instance 재생성이다. Redis server/process chaos는 M25 범위다.
+- Packed artifact: `/private/tmp/jobs-m03-core-BjDqi5/nestarc-jobs-0.3.1.tgz` 보존. SHA-256 `b576d2a6f7ff2ddefd7d6d5f644424f0cd11ba80295a11bd23a20afec954025c`, SRI `sha512-eSCSS7H42CK8Gd5XzhAd0pYjlsTuZlCBzE7qbp/O3Y/MrXjqNLWexlNHCIRZezDLfAb/hZHSmqpZOVTzyiorsg==`. modern gate가 별도로 pack한 artifact와 digest 일치. 게시 Jobs `0.3.1` bytes와는 다르다.
+- Published Outbox `0.2.1` SRI: `sha512-VfxGSeRgKk9MVFCCbvzym2nk6I+qfkoFzY1B04I7y40nZSMaXn4Nh0t+FDgH4OT90ZYZDrGJVQbwNNmzEDkKcw==`. modern gate 로그 `/private/tmp/jobs-m03-modern-consumer.log`, core dependency tree `/private/tmp/jobs-m03-core-BjDqi5/dependency-tree.txt`.
+- 변경 파일: `src/outbox/outbox-jobs-publisher.ts`, `test/integration/outbox-jobs-publisher.test.ts`, `test/redis/bullmq-backend.redis.test.ts`, `test/consumer/modern-outbox.ts`, `README.md`, `CHANGELOG.md`, 이 계획 문서.
+- Remaining risk: 이미 global dedupe로 축약되어 SENT가 된 이벤트는 자동 복구되지 않는다. 기존 global 예약이 남은 상태의 과거 이벤트 재전달/롤아웃은 별도 운영 판단이 필요하며, exactly-once side effects와 기존 유실의 자동 복구를 보장하지 않는다. arbitrary mapping option 입력 검증은 M07, 일반 serialization은 M09 범위다.
+- Next exact action: bootstrap 및 P0 로컬 후보를 review/PR 절차로 main에 반영한다. release 직접 선행 `JOBS-M12 → JOBS-M17` 및 `JOBS-M13`을 검토한 뒤 `JOBS-REL-01`을 진행한다. 위의 과거 인계에서 남아 있던 M04 → M03 재실행 지시는 이 기록으로 대체한다.
