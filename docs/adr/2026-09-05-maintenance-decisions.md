@@ -1,6 +1,6 @@
 # Maintenance decisions — 2026-09-05
 
-Status: local implementation candidate; public main, administrator settings and release are separate gates.
+Status: maintenance implementation merged through PR #2 to protected main `563612539401f49fa6b1ab0c9c265f79e8f61741`. Administrator settings are applied. Publication and remaining external lifecycle/report-receipt evidence are tracked in [the release review](../2026-09-05-maintenance-release-review.md).
 
 ## Runtime and semver
 
