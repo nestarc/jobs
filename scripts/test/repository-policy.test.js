@@ -48,3 +48,15 @@ test('immutable tag protection must include explicit no-bypass evidence', () => 
     { conditions: { ref_name: { include: ['refs/tags/v*'], exclude: ['refs/tags/v0.*'] } } },
   ]) assert.throws(() => verify(rules, [main, { ...tags, ...change }]), /immutable/);
 });
+
+test('read-only REST omissions require complete GraphQL evidence, never an assumed empty list', () => {
+  const { withBypassEvidence } = require('../verify-repository-policy');
+  const rule = { node_id: 'ruleset-1' };
+  const response = (count, nodes) => ({ data: { node: { id: rule.node_id, bypassActors: { totalCount: count, nodes } } } });
+  assert.deepEqual(withBypassEvidence(rule, () => response(0, [])).bypass_actors, []);
+  assert.equal(withBypassEvidence(rule, () => response(2, [{ id: 'bypass' }])).bypass_actors.length, 1);
+  for (const invalid of [{}, { errors: [{ message: 'denied' }] }, response(null, []), response(1, []), response(0, [{ id: 'bypass' }]), { data: { node: { id: 'other', bypassActors: { totalCount: 0, nodes: [] } } } }]) {
+    assert.throws(() => withBypassEvidence(rule, () => invalid));
+  }
+  assert.throws(() => withBypassEvidence(rule, () => { throw new Error('API unavailable'); }));
+});

@@ -36,12 +36,16 @@ jobs:
       modern_outbox_version: ${{ inputs.modern_outbox_version || (inputs.modern_outbox_package == '' && '0.3.0') || '' }}
       modern_outbox_integrity: ${{ inputs.modern_outbox_integrity || (inputs.modern_outbox_package == '' && 'sha512-rbPiDgQCNVtQifVf01we+vREYDDwccpezc5cSlaoa8VeIW3NxmGWrMe8ccwQRex/pF2MxlFW4K645SDbN27evQ==') || '' }}
 
-  policy-visibility:
+  repository-policy:
     runs-on: ubuntu-latest
     steps:
-      - name: Check read-only ruleset evidence
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Verify repository release protection with read-only permissions
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api repos/nestarc/jobs/rulesets/22319849 --jq '{id, bypass_actors}'
-          gh api graphql -f 'query=query { node(id:"RRS_lACqUmVwb3NpdG9yec5IJ4sAzgFUkuk") { ... on RepositoryRuleset { id name bypassActors(first:100) { totalCount nodes { id bypassMode } } } } }'
+        run: node scripts/verify-repository-policy.js
