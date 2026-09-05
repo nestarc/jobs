@@ -196,3 +196,63 @@ describe('maintenance concurrency and system identity', () => {
     expect(events.every((e) => e.tenantId === undefined)).toBe(true);
   });
 });
+
+describe('automatic loop backend recovery', () => {
+  it('observes a transient backend error, continues another type and drains recovered work', async () => {
+    const errors: unknown[] = [];
+    const app = await Test.createTestingModule({
+      imports: [
+        JobsModule.forInMemory({
+          jobTypes: ['one', 'two'],
+          onWorkerError: (error) => errors.push(error),
+        }),
+      ],
+    }).compile();
+    const backend = app.get<InMemoryBackend>(JOBS_BACKEND);
+    const jobs = app.get(JobsService);
+    const calls: string[] = [];
+    for (const type of ['one', 'two'])
+      app.get(HandlerRegistry).register(type, async () => {
+        calls.push(type);
+      });
+    const first = await jobs.enqueue('one', {});
+    await jobs.enqueue('two', {});
+    jest.spyOn(backend, 'moveToActive').mockRejectedValueOnce(new Error('transient'));
+    await app.init();
+    await eventually(() => expect(calls).toContain('two'));
+    await eventually(() => expect(calls).toContain('one'));
+    expect(errors).toHaveLength(1);
+    expect((await backend.getJob(first))?.attempt).toBe(1);
+    await app.close();
+  });
+});
+
+describe('shutdown reconciliation ownership', () => {
+  it('waits for a commit-then-throw acknowledgement to reconcile before closing', async () => {
+    const events: JobLifecycleEvent[] = [];
+    const app = await Test.createTestingModule({
+      imports: [
+        JobsModule.forInMemory({
+          jobTypes: ['job'],
+          events: { onEvent: (event) => events.push(event) },
+        }),
+      ],
+    }).compile();
+    const backend = app.get<InMemoryBackend>(JOBS_BACKEND);
+    const jobs = app.get(JobsService);
+    const handler = jest.fn(async () => undefined);
+    app.get(HandlerRegistry).register('job', handler);
+    const ack = backend.ack.bind(backend);
+    jest.spyOn(backend, 'ack').mockImplementationOnce(async (...args) => {
+      await ack(...args);
+      throw new Error('ack response lost');
+    });
+    const fail = jest.spyOn(backend, 'fail');
+    await jobs.enqueue('job', {});
+    await app.init();
+    await app.close();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(fail).not.toHaveBeenCalled();
+    expect(events.filter((event) => event.type === 'job.succeeded')).toHaveLength(1);
+  });
+});

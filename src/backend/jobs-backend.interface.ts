@@ -24,7 +24,7 @@ export interface JobsBackend {
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult>;
   peekWaiting(jobType: string): Promise<JobEnvelope[]>;
-  moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null>;
+  moveToActive(jobType: string, jobId: string, activationId?: string): Promise<JobEnvelope | null>;
   ack(jobType: string, jobId: string, activationId: string): Promise<void | JobRecord>;
   fail(
     jobType: string,

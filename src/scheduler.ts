@@ -114,6 +114,16 @@ export class Scheduler {
     shard.inflight -= 1;
   }
 
+  hasReadyJobs(): boolean {
+    this.promoteDueJobs();
+    return [...this.shards.values()].some(
+      (shard) =>
+        shard.waiting.length > 0 &&
+        this.hasCapacity(shard) &&
+        (shard.weight > 0 || this.opts.minSharePct > 0),
+    );
+  }
+
   pickNext(): PickedJob | null {
     if (this.activeJobs.size >= (this.opts.typeCap ?? Infinity)) return null;
     this.promoteDueJobs();

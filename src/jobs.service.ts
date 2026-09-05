@@ -6,7 +6,12 @@ import type { Scheduler, SchedulerEnqueueTiming } from './scheduler';
 import type { EnqueueOptions, JobContext } from './types';
 import type { JobDefinitions, JobDefaults } from './contracts';
 import { notifyLifecycleObserver, snapshotLifecycleValue } from './lifecycle-observer';
-import { assertEnqueueOptions, assertJobType, assertJobConfiguration } from './enqueue-validation';
+import {
+  assertIdentifier,
+  assertEnqueueOptions,
+  assertJobType,
+  assertJobConfiguration,
+} from './enqueue-validation';
 import type {
   BackendCapabilities,
   DeadLetterFilter,
@@ -18,6 +23,7 @@ import type {
 } from './lifecycle';
 
 export interface JobsServiceDeps {
+  producerEnabled?: boolean;
   backend: JobsBackend;
   registry: HandlerRegistry;
   schedulers?: Map<string, Scheduler>;
@@ -52,6 +58,11 @@ export class JobsService {
     payload: object,
     opts: EnqueueOptions<object, object> = {},
   ): Promise<EnqueueResult> {
+    if (this.deps.producerEnabled === false)
+      throw new JobsError(
+        JobsErrorCode.CapabilityUnsupported,
+        'worker role cannot enqueue; use both',
+      );
     assertJobType(jobType);
     this.assertKnownJobType(jobType);
     assertEnqueueOptions(opts);
@@ -112,6 +123,15 @@ export class JobsService {
 
   capabilities(): BackendCapabilities {
     return this.deps.backend.capabilities();
+  }
+
+  /** Authorization remains the caller's responsibility; mismatches look like missing IDs. */
+  async getJobForTenant(jobId: string, expectedTenantId: string): Promise<JobRecord | null> {
+    assertIdentifier(expectedTenantId, 'expectedTenantId');
+    const record = await this.getJob(jobId);
+    return (record?.context as JobContext | undefined)?.tenantId === expectedTenantId
+      ? record
+      : null;
   }
 
   getJob<TPayload = unknown, TContext = unknown>(

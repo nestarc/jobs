@@ -8,6 +8,17 @@ on:
         required: false
         type: string
         default: ''
+      modern_outbox_version:
+        required: false
+        type: string
+        default: ''
+      modern_outbox_integrity:
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
   modern-outbox-availability:
@@ -16,7 +27,7 @@ jobs:
     outputs:
       published: ${{ steps.registry.outputs.published }}
     steps:
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -46,12 +57,13 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run test:policy
       - run: npm run lint
       - run: npm run build
 
@@ -61,10 +73,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -79,8 +91,8 @@ jobs:
       matrix:
         nest: [10, 11]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -98,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        node: [22, 24]
         nest: [10, 11]
     services:
       redis:
@@ -111,8 +123,8 @@ jobs:
           --health-timeout 1s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -122,64 +134,56 @@ jobs:
         run: >-
           npm install --no-save --package-lock=false
           @nestjs/common@^11.0.0 @nestjs/core@^11.0.0 @nestjs/testing@^11.0.0
+      - run: npm run build
       - run: npm run test:redis
         env:
           REDIS_URL: redis://127.0.0.1:6379
 
   consumer-compat:
     name: Consumer (Node ${{ matrix.node }}, Nest ${{ matrix.nest }})
+    needs: package-smoke
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
-        nest: [10, 11]
+        node: [22, 24]
+        nest: ['10.4.22', '11.2.1']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-      - run: npm pack --pack-destination "${RUNNER_TEMP}"
-      - name: Install packed library without BullMQ
-        working-directory: ${{ runner.temp }}
-        run: |
-          mkdir consumer
-          cd consumer
-          npm init -y
-          npm install --package-lock=false \
-            "${RUNNER_TEMP}"/nestarc-jobs-*.tgz \
-            "@nestjs/common@^${{ matrix.nest }}.0.0" \
-            "@nestjs/core@^${{ matrix.nest }}.0.0" \
-            "@nestjs/testing@^${{ matrix.nest }}.0.0" \
-            reflect-metadata@^0.2.0 rxjs@^7.0.0 typescript@^5.4.0 @types/node@^20.0.0
-          npm ls --omit=dev
-          if npm ls bullmq >/dev/null 2>&1; then
-            echo "BullMQ must remain optional for core consumers"
-            exit 1
-          fi
-          node -e "require('reflect-metadata'); const {Test}=require('@nestjs/testing'); const {JobsModule,JobsService,HandlerRegistry}=require('@nestarc/jobs'); (async()=>{const app=await Test.createTestingModule({imports:[JobsModule.forInMemory({jobTypes:['smoke']})]}).compile(); app.get(HandlerRegistry).register('smoke',async()=>null); await app.init(); await app.get(JobsService).enqueue('smoke',{}); await app.close()})().catch(error=>{console.error(error);process.exit(1)})"
-          node -e "require('fs').writeFileSync('index.ts', \"import { defineJobs, job, TypedJobsService } from '@nestarc/jobs'; const defs = defineJobs({ smoke: job<{ value: string }>().defaults({ attempts: 2 }) }); declare const jobs: TypedJobsService<typeof defs>; void jobs.enqueue('smoke', { value: 'ok' });\")"
-          npx tsc --strict --skipLibCheck false --noEmit --target ES2022 --module commonjs --moduleResolution node index.ts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
+      - run: node scripts/test-core-consumer.js
+        env:
+          JOBS_TARBALL_DIR: package-artifact
+          CORE_NEST_VERSION: ${{ matrix.nest }}
 
   modern-outbox-consumer:
     name: Modern Outbox consumer (Nest 11.2.1, Prisma 7.10.0)
-    needs: modern-outbox-availability
+    needs: [modern-outbox-availability, package-smoke]
     if: >-
-      inputs.modern_outbox_package != '' ||
+      inputs.modern_outbox_package == '@nestarc/outbox@0.2.1' ||
       needs.modern-outbox-availability.outputs.published == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
       - run: npm ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
       - run: npm run test:consumer:modern
         env:
-          OUTBOX_PACKAGE: ${{ inputs.modern_outbox_package || '@nestarc/outbox@0.2.1' }}
+          OUTBOX_PACKAGE: '@nestarc/outbox@0.2.1'
+          JOBS_TARBALL_DIR: package-artifact
 
   coverage:
     runs-on: ubuntu-latest
@@ -194,8 +198,8 @@ jobs:
           --health-timeout 1s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -203,10 +207,14 @@ jobs:
       - run: >-
           npm install --no-save --package-lock=false
           @nestjs/common@^11.0.0 @nestjs/core@^11.0.0 @nestjs/testing@^11.0.0
+      - run: npm run build
       - run: npm run test:coverage
         env:
           REDIS_URL: redis://127.0.0.1:6379
-      - uses: actions/upload-artifact@v4
+      - run: node scripts/coverage-evidence.js
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage
           path: coverage/
@@ -214,8 +222,8 @@ jobs:
   package-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -269,10 +277,10 @@ jobs:
           assert.equal(manifest.version, sourceManifest.version);
           assert.equal(manifest.main, 'dist/index.js');
           assert.equal(manifest.types, 'dist/index.d.ts');
-          assert.equal(manifest.peerDependencies?.['@nestarc/outbox'], '^0.2.0');
+          assert.equal(manifest.peerDependencies?.['@nestarc/outbox'], '^0.2.1 || ^0.3.0');
           assert.equal(manifest.peerDependencies?.['@nestjs/common'], '^10.0.0 || ^11.0.0');
           assert.equal(manifest.peerDependencies?.['@nestjs/core'], '^10.0.0 || ^11.0.0');
-          assert.equal(manifest.peerDependencies?.bullmq, '^5.74.1');
+          assert.equal(manifest.peerDependencies?.bullmq, '^5.76.2');
           assert.equal(manifest.peerDependenciesMeta?.['@nestarc/outbox']?.optional, true);
           assert.equal(manifest.peerDependenciesMeta?.bullmq?.optional, true);
 
@@ -281,6 +289,7 @@ jobs:
             'dist/index.d.ts',
             'README.md',
             'CHANGELOG.md',
+            'SECURITY.md',
             'LICENSE',
             'docs/prd.md',
             'docs/spec.md',
@@ -295,8 +304,59 @@ jobs:
           assert.equal(typeof api.FakeJobsService, 'function');
           assert.equal(typeof api.createOutboxJobsPublisher, 'function');
           NODE
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-tarball
           path: package-artifact/*.tgz
           if-no-files-found: error
+
+  bullmq-v5:
+    name: BullMQ v5 (${{ matrix.bullmq }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bullmq: ['5.76.2', '5.81.4']
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 1s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save --package-lock=false bullmq@${{ matrix.bullmq }}
+      - run: npm run build
+      - run: npm run test:redis
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+
+  outbox-candidate:
+    name: Exact Outbox candidate
+    needs: package-smoke
+    if: >-
+      inputs.modern_outbox_version != '' ||
+      (inputs.modern_outbox_package != '' && inputs.modern_outbox_package != '@nestarc/outbox@0.2.1')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
+      - name: Validate manifest and test exact producer contract
+        env:
+          CANDIDATE_PACKAGE: ${{ inputs.modern_outbox_package }}
+          CANDIDATE_VERSION: ${{ inputs.modern_outbox_version }}
+          CANDIDATE_INTEGRITY: ${{ inputs.modern_outbox_integrity }}
+          JOBS_TARBALL_DIR: package-artifact
+        run: |
+          node -e "require('fs').writeFileSync('outbox-candidate.json', JSON.stringify({package:process.env.CANDIDATE_PACKAGE,version:process.env.CANDIDATE_VERSION,integrity:process.env.CANDIDATE_INTEGRITY}))"
+          node scripts/test-outbox-candidate-consumer.js outbox-candidate.json

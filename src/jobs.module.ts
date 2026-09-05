@@ -1,3 +1,5 @@
+import type { RetentionOptions } from './retention';
+import { notifyLifecycleObserver } from './lifecycle-observer';
 import { ExecutionBudget } from './execution-budget';
 import {
   DynamicModule,
@@ -30,6 +32,7 @@ import { JobsError, JobsErrorCode, JobsShutdownError } from './errors';
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
 const BULLMQ_CONSUMER_CONFIG = Symbol('BULLMQ_CONSUMER_CONFIG');
+const IN_MEMORY_WORKER_ERROR = Symbol('IN_MEMORY_WORKER_ERROR');
 const IN_MEMORY_POOL_SIZE = Symbol('IN_MEMORY_POOL_SIZE');
 const IN_MEMORY_SHUTDOWN_TIMEOUT = Symbol('IN_MEMORY_SHUTDOWN_TIMEOUT');
 
@@ -69,6 +72,8 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     @Inject(IN_MEMORY_POOL_SIZE) private readonly poolSize: number,
     @Inject(IN_MEMORY_SHUTDOWN_TIMEOUT) private readonly shutdownTimeoutMs: number,
     private readonly handlerDiscovery: HandlerDiscovery,
+    @Inject(IN_MEMORY_WORKER_ERROR)
+    private readonly workersErrorObserver: ((error: unknown) => void) | undefined,
     discovery: DiscoveryService,
   ) {
     // Drain before feature dependencies are destroyed in either supported Nest major.
@@ -99,7 +104,16 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
         this.draining,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
-            () => reject(new JobsShutdownError('deadline', this.remainingJobIds())),
+            () =>
+              reject(
+                new JobsShutdownError(
+                  this.workers.some((worker) => worker.pendingRecoveryJobIds().length)
+                    ? 'worker_error'
+                    : 'deadline',
+                  this.remainingJobIds(),
+                  this.loopFailure?.error,
+                ),
+              ),
             this.shutdownTimeoutMs,
           );
         }),
@@ -113,7 +127,10 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     return [
       ...new Set([
         ...this.backend.pendingJobIds(),
-        ...this.workers.flatMap((worker) => worker.outstandingJobIds()),
+        ...this.workers.flatMap((worker) => [
+          ...worker.outstandingJobIds(),
+          ...worker.pendingRecoveryJobIds(),
+        ]),
       ]),
     ];
   }
@@ -122,15 +139,10 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     try {
       await this.loop;
       while (this.remainingJobIds().length) {
-        if (this.loopFailure) {
-          await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
-          throw this.loopFailure.error;
-        }
         const picked = this.dispatch();
         // Yield even under an immediate retry backlog so deadlines can run.
         await sleep(picked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
       }
-      if (this.loopFailure) throw this.loopFailure.error;
       await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
       await this.backend.close();
     } catch (error) {
@@ -149,8 +161,8 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
         this.cursor = (this.cursor + 1) % this.workers.length;
         const before = worker.outstandingJobIds().length;
         void worker.tick().catch((error) => {
-          this.loopFailure ??= { error };
-          this.running = false;
+          this.loopFailure = { error };
+          notifyLifecycleObserver(() => this.workersErrorObserver?.(error));
         });
         if (worker.outstandingJobIds().length > before) {
           roundPicked = picked = true;
@@ -171,6 +183,8 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
 }
 
 interface BullMQConsumerConfig {
+  role: 'producer' | 'worker' | 'both';
+  dynamicRegistration: boolean;
   jobTypes: string[];
   contextRunner: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
   onJobStart?: (event: JobEvent) => void;
@@ -203,7 +217,17 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
 
   onApplicationBootstrap(): void {
     if (this.started) return;
+    if (this.consumerConfig.role === 'producer') {
+      this.started = true;
+      return;
+    }
     this.handlerDiscovery.discover();
+    if (!this.consumerConfig.dynamicRegistration) {
+      const registered = new Set(this.registry.list());
+      for (const type of this.consumerConfig.jobTypes) {
+        if (!registered.has(type)) throw new JobsError(JobsErrorCode.HandlerNotFound, type);
+      }
+    }
     this.backend.startConsumer(this.consumerConfig.jobTypes, {
       registry: this.registry,
       contextRunner: this.consumerConfig.contextRunner,
@@ -221,6 +245,9 @@ class BullMQWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
 }
 
 export interface InMemoryOptions {
+  retention?: RetentionOptions;
+  /** Best-effort observer. Backend operation retries use a 50ms backoff. */
+  onWorkerError?: (error: unknown) => void;
   /** Graceful drain deadline (default 30 seconds). Timeout rejects; draining continues. */
   shutdown?: { timeoutMs?: number };
   jobTypes: string[];
@@ -239,6 +266,10 @@ export interface InMemoryOptions {
 }
 
 export interface BullMQOptions {
+  /** Default both. Worker role rejects JobsService enqueue. Producer never consumes. */
+  role?: 'producer' | 'worker' | 'both';
+  /** Opt out of bootstrap handler checks when registration is intentionally deferred. */
+  dynamicRegistration?: boolean;
   backend: BullMQBackend;
   jobTypes: string[];
   jobs?: JobDefinitions;
@@ -394,13 +425,14 @@ export class JobsModule {
       minSharePct: options.fairness?.minSharePct === undefined ? 0.1 : options.fairness.minSharePct,
       tenantCap,
     };
-    const backend = new InMemoryBackend();
+    const backend = new InMemoryBackend({ retention: options.retention });
     if (options.strictCapabilities) {
       assertJobDefaultsSupported(backend, options.jobs, options.jobTypes);
     }
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
+      { provide: IN_MEMORY_WORKER_ERROR, useValue: options.onWorkerError },
       { provide: IN_MEMORY_POOL_SIZE, useValue: poolSize },
       { provide: IN_MEMORY_SHUTDOWN_TIMEOUT, useValue: shutdownTimeoutMs },
       { provide: JOBS_BACKEND, useValue: backend },
@@ -459,6 +491,13 @@ export class JobsModule {
   }
 
   static forBullMQ(options: BullMQOptions): DynamicModule {
+    const role = options.role ?? 'both';
+    if (!['producer', 'worker', 'both'].includes(role)) invalidInput('invalid BullMQ role');
+    if (
+      options.dynamicRegistration !== undefined &&
+      typeof options.dynamicRegistration !== 'boolean'
+    )
+      invalidInput('dynamicRegistration must be boolean');
     assertJobConfiguration(options.jobTypes, options.jobs);
     const runner = options.contextRunner ?? defaultContextRunner;
     if (options.strictCapabilities) {
@@ -473,6 +512,7 @@ export class JobsModule {
         useFactory: (registry: HandlerRegistry) =>
           new JobsService({
             backend: options.backend,
+            producerEnabled: role !== 'worker',
             registry,
             jobTypes: options.jobTypes,
             contextExtractor: options.contextExtractor ?? defaultContextExtractor,
@@ -493,6 +533,8 @@ export class JobsModule {
           onJobFinish: options.onJobFinish,
           onJobFail: options.onJobFail,
           events: options.events,
+          role,
+          dynamicRegistration: options.dynamicRegistration ?? false,
         } satisfies BullMQConsumerConfig,
       },
       {

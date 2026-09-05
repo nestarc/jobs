@@ -1,4 +1,5 @@
 export const JobsErrorCode = {
+  DrainLimitExceeded: 'jobs_drain_limit_exceeded',
   InvalidInput: 'jobs_invalid_input',
   SerializationInvalid: 'jobs_serialization_invalid',
   ReservedPayloadKey: 'jobs_reserved_payload_key',

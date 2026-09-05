@@ -10,13 +10,28 @@ on:
         required: false
         type: string
         default: ''
+      modern_outbox_version:
+        description: Expected exact version for the separate candidate lane
+        required: false
+        type: string
+        default: ''
+      modern_outbox_integrity:
+        description: Expected SHA-512 SRI for the separate candidate lane
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   verify:
     uses: ./.github/workflows/verify.yml
     with:
       modern_outbox_package: ${{ inputs.modern_outbox_package || '' }}
+      modern_outbox_version: ${{ inputs.modern_outbox_version || '' }}
+      modern_outbox_integrity: ${{ inputs.modern_outbox_integrity || '' }}

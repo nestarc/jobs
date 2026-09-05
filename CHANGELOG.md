@@ -6,7 +6,27 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ## [Unreleased]
 
+### Added (planned 0.4.0)
+
+- Explicit BullMQ producer/worker/both roles, bootstrap handler validation and a dynamic-registration escape.
+- Operator-driven terminal retention with recovery-horizon validation, bounded cleanup batches and identity-aware deletion.
+- Tenant-filtered status reads, worker error observers and same-activation backend response reconciliation.
+- Exact Outbox candidate manifests alongside the fixed 0.2.1 anchor; verified 0.3.0 peer support.
+- Real lease-expiry/producer-crash/stalled-worker/Redis-restart fixtures, seeded state-model tests and coverage tuple evidence.
+
+### Changed (planned 0.4.0)
+
+- Support Node 22/24; raise optional BullMQ floor to 5.76.2 and Outbox range to ^0.2.1 || ^0.3.0.
+- Upgrade Jest/ts-jest and ESLint/typescript-eslint, refresh compatible lock dependencies, and document remaining Nest 10 fixture audit exceptions.
+- Separate release verification, npm OIDC publication and GitHub Release grants; pin official Actions and require exact digest/provenance lineage for reruns.
+- Split BullMQ codec, identity leases, lifecycle observers and owned-resource cleanup into private modules; preserve current CommonJS/deep-import behavior.
+- Mark old implementation plans historical and deprecate the legacy Outbox bridge without runtime removal.
+
 ### Fixed
+
+- Return deeply detached history snapshots and reject exhausted fake drains; continue through cancelled head entries.
+- Preserve settled handler outcomes across backend failures, avoid fail after an uncertain ack, and keep the automatic loop recoverable.
+
 
 - Default first-party Outbox mapping dedupe to tenant scope when a tenant is present;
   require explicit global scope to suppress jobs across tenants. Preserve generic JobsService defaults.

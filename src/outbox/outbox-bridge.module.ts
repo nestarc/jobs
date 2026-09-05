@@ -17,6 +17,7 @@ export interface JobsOutboxBridgeOptions {
   tenantFrom?: (event: OutboxEvent) => string;
 }
 
+/** @deprecated Compatibility-only bridge without source identity/lineage. Use createOutboxJobsPublisher for first-party Outbox. */
 export class JobsOutboxBridge {
   constructor(private readonly opts: JobsOutboxBridgeOptions) {
     opts.source.onEvent(async (event) => this.dispatch(event));

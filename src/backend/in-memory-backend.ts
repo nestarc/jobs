@@ -1,3 +1,9 @@
+import {
+  validateRetention,
+  assertRetentionMaintenance,
+  type RetentionOptions,
+  type RetentionCleanupOptions,
+} from '../retention';
 import { randomUUID } from 'node:crypto';
 import { preparePortableEnqueue, detachContext } from '../context-serializer';
 import type { EnqueueCommitObserver, JobsBackend } from './jobs-backend.interface';
@@ -16,7 +22,7 @@ import { computeBackoffDelayMs } from '../retry';
 import { JobsError, JobsErrorCode, JobsShutdownError } from '../errors';
 import { portableRecord } from '../portable-value';
 import { snapshotLifecycleValue } from '../lifecycle-observer';
-import { assertEnqueueOptions, assertJobType } from '../enqueue-validation';
+import { assertEnqueueOptions, assertJobType, assertIdentifier } from '../enqueue-validation';
 
 interface Slot {
   envelope: JobEnvelope;
@@ -44,11 +50,13 @@ interface IdentityLineage {
 }
 
 export interface InMemoryBackendOptions {
+  retention?: RetentionOptions;
   now?: () => Date;
   deadLetter?: { enabled?: boolean };
 }
 
 export class InMemoryBackend implements JobsBackend {
+  private readonly retention: RetentionOptions | undefined;
   private lifecycle: 'open' | 'closing' | 'closed' = 'open';
   private readonly store = new Map<string, Map<string, Slot>>();
   private readonly jobTypesById = new Map<string, string>();
@@ -56,7 +64,10 @@ export class InMemoryBackend implements JobsBackend {
   private readonly idempotency = new Map<string, string>();
   private readonly dedupe = new Map<string, DedupeEntry>();
 
-  constructor(private readonly opts: InMemoryBackendOptions = {}) {}
+  constructor(private readonly opts: InMemoryBackendOptions = {}) {
+    validateRetention(opts.retention);
+    this.retention = opts.retention ? Object.freeze({ ...opts.retention }) : undefined;
+  }
 
   capabilities(): BackendCapabilities {
     return {
@@ -173,12 +184,19 @@ export class InMemoryBackend implements JobsBackend {
       .map((slot) => snapshotLifecycleValue(slot.envelope));
   }
 
-  async moveToActive(jobType: string, jobId: string): Promise<JobEnvelope | null> {
+  async moveToActive(
+    jobType: string,
+    jobId: string,
+    activationId?: string,
+  ): Promise<JobEnvelope | null> {
+    if (activationId !== undefined) assertIdentifier(activationId, 'activationId');
     const slot = this.store.get(jobType)?.get(jobId);
+    if (slot?.state === 'active' && activationId && slot.envelope.activationId === activationId)
+      return snapshotLifecycleValue(slot.envelope);
     if (!slot || !this.isWaiting(slot)) return null;
     if (slot.state === 'delayed' && !this.isDue(slot)) return null;
     slot.state = 'active';
-    slot.envelope.activationId = randomUUID();
+    slot.envelope.activationId = activationId ?? randomUUID();
     slot.envelope.attempts += 1;
     slot.startedAt = this.now();
     slot.nextAttemptAt = undefined;
@@ -271,7 +289,7 @@ export class InMemoryBackend implements JobsBackend {
   }
 
   async getJobHistory(jobId: string): Promise<JobHistoryEntry[]> {
-    return [...(this.history.get(jobId) ?? [])];
+    return snapshotLifecycleValue(this.history.get(jobId) ?? []);
   }
 
   async listDeadLetters(filter: DeadLetterFilter = {}): Promise<JobRecord[]> {
@@ -304,6 +322,7 @@ export class InMemoryBackend implements JobsBackend {
     if (replayIdentityJobId) {
       this.rebindReplayIdentities(slot, jobId, replayIdentityJobId);
       slot.state = 'cancelled';
+      slot.terminalAt ??= this.now();
       this.recordHistory(
         jobId,
         'cancelled',
@@ -348,6 +367,7 @@ export class InMemoryBackend implements JobsBackend {
     this.recordHistory(newJobId, 'queued', replayAttempt);
     if (newJobId !== jobId) {
       slot.state = 'cancelled';
+      slot.terminalAt ??= this.now();
       this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, `replayed as ${newJobId}`);
     }
     return newJobId;
@@ -364,6 +384,42 @@ export class InMemoryBackend implements JobsBackend {
       : undefined;
     this.recordHistory(jobId, 'cancelled', slot.envelope.attempts, reason);
     return this.toRecord(slot);
+  }
+
+  /** Run during a quiescent maintenance window. Young terminal identities are never evicted. */
+  async pruneTerminal(options: RetentionCleanupOptions): Promise<number> {
+    assertRetentionMaintenance(options);
+    const policy = this.retention;
+    if (!policy)
+      throw new JobsError(JobsErrorCode.CapabilityUnsupported, 'retention is not configured');
+    if (
+      [...this.store.values()].some((bucket) =>
+        [...bucket.values()].some((slot) => slot.state === 'active'),
+      )
+    ) {
+      throw new JobsError(JobsErrorCode.InvalidInput, 'retention requires idle workers');
+    }
+    const terminal = [...this.store.values()]
+      .flatMap((bucket) => [...bucket.values()])
+      .filter((slot) => ['succeeded', 'failed', 'dead_letter', 'cancelled'].includes(slot.state))
+      .sort(
+        (a, b) => (a.terminalAt?.getTime() ?? Infinity) - (b.terminalAt?.getTime() ?? Infinity),
+      );
+    let removed = 0;
+    for (const slot of terminal) {
+      const age = this.now().getTime() - (slot.terminalAt?.getTime() ?? Infinity);
+      if (age < policy.terminalAgeMs) continue;
+      // Expired records are removed regardless of count; count never shortens the horizon.
+      const id = slot.envelope.id;
+      this.store.get(slot.envelope.jobType)?.delete(id);
+      this.jobTypesById.delete(id);
+      this.history.delete(id);
+      for (const [key, mapped] of this.idempotency) if (mapped === id) this.idempotency.delete(key);
+      for (const [key, mapped] of this.dedupe) if (mapped.jobId === id) this.dedupe.delete(key);
+      removed++;
+      if (removed >= (policy.batchSize ?? 1000)) break;
+    }
+    return removed;
   }
 
   get lifecycleState(): 'open' | 'closing' | 'closed' {
@@ -668,7 +724,7 @@ export class InMemoryBackend implements JobsBackend {
     error?: JobErrorSummary,
   ): void {
     const entries = this.history.get(jobId) ?? [];
-    entries.push({ jobId, status, attempt, at: this.now(), reason, error });
+    entries.push(snapshotLifecycleValue({ jobId, status, attempt, at: this.now(), reason, error }));
     this.history.set(jobId, entries);
   }
 

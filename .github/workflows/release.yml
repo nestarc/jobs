@@ -6,51 +6,107 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   verify:
+    permissions:
+      contents: read
     uses: ./.github/workflows/verify.yml
     with:
       modern_outbox_package: '@nestarc/outbox@0.2.1'
 
-  publish:
+  artifact-policy:
     needs: verify
     runs-on: ubuntu-latest
-    environment: npm
+    outputs:
+      published: ${{ steps.registry.outputs.published }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - name: Verify tag matches package version
-        run: |
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
-      - name: Verify release commit belongs to main
+      - name: Verify repository release protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-repository-policy.js
+      - name: Verify immutable tag and main ancestry
         run: |
           git fetch origin main:refs/remotes/origin/main
-          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"
-      - uses: actions/download-artifact@v4
+          TAG_COMMIT="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+          test "${TAG_COMMIT}" = "${GITHUB_SHA}"
+          git merge-base --is-ancestor "${TAG_COMMIT}" origin/main
+          REMOTE_TAG="$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}" "refs/tags/${GITHUB_REF_NAME}^{}" | tail -1 | cut -f1)"
+          test "${REMOTE_TAG}" = "${TAG_COMMIT}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: package-tarball
           path: package-artifact
-      - name: Check whether the package version is already published
+      - name: Validate exact artifact and registry identity
         id: registry
-        run: |
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-          if npm view "@nestarc/jobs@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            echo "published=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "published=false" >> "${GITHUB_OUTPUT}"
-          fi
-      - name: Publish npm package
-        if: steps.registry.outputs.published != 'true'
-        run: npm publish ./package-artifact/nestarc-jobs-*.tgz --provenance --access public
-      - uses: softprops/action-gh-release@v2
+        run: node scripts/verify-release-artifact.js package-artifact
+
+  publish:
+    needs: artifact-policy
+    if: needs.artifact-policy.outputs.published != 'true'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          generate_release_notes: true
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
+      - name: Publish the verified tarball
+        run: npm publish ./package-artifact/nestarc-jobs-*.tgz --ignore-scripts --provenance --access public
+
+  release:
+    needs: [artifact-policy, publish]
+    if: >-
+      always() && needs.artifact-policy.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-tarball
+          path: package-artifact
+      - name: Verify published bytes and provenance signatures
+        run: |
+          node scripts/verify-release-artifact.js package-artifact --require-published
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          mkdir "${RUNNER_TEMP}/published-signatures"
+          cd "${RUNNER_TEMP}/published-signatures"
+          npm init -y
+          npm install --ignore-scripts --save-exact "@nestarc/jobs@${PACKAGE_VERSION}"
+          npm audit signatures
+      - name: Create GitHub Release after publication verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}"; then
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
+          fi

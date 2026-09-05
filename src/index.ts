@@ -40,3 +40,5 @@ export type {
   OutboxJobsPublisherOptions,
 } from './outbox/outbox-jobs-publisher';
 export { attachContext, detachContext, CONTEXT_KEY, INTERNAL_JOB_KEY } from './context-serializer';
+
+export type { RetentionOptions, RetentionCleanupOptions } from './retention';

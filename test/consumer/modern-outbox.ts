@@ -52,6 +52,7 @@ async function main(): Promise<void> {
     createdAt: new Date('2026-08-30T00:00:00.000Z'),
     updatedAt: new Date('2026-08-30T00:00:00.000Z'),
     processedAt: null,
+    ...{ nextAttemptAt: null },
     retryCount: 0,
     maxRetries: 5,
     lastError: null,
