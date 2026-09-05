@@ -61,12 +61,16 @@ export class FairWorker {
     this.invocations.add(picked.jobId);
     try {
       return await this.execute(picked);
+    } catch (error) {
+      // Backend failures must release capacity; host reports incomplete work.
+      this.opts.scheduler.onAck(picked.jobId);
+      throw error;
     } finally {
       this.invocations.delete(picked.jobId);
     }
   }
 
-  private async execute(picked: { jobId: string; tenantId: string }): Promise<boolean> {
+  private async execute(picked: { jobId: string; tenantId: string | undefined }): Promise<boolean> {
     const envelope = await this.opts.backend.moveToActive(this.opts.jobType, picked.jobId);
     if (!envelope) {
       this.opts.scheduler.onAck(picked.jobId);
@@ -94,7 +98,7 @@ export class FairWorker {
     const event: JobEvent = {
       jobId: picked.jobId,
       jobType: this.opts.jobType,
-      tenantId: picked.tenantId,
+      tenantId: envelope.context.tenantId,
       startedAt,
       attempt: envelope.attempts,
     };
@@ -105,7 +109,7 @@ export class FairWorker {
           type: 'job.started',
           jobId: picked.jobId,
           jobType: this.opts.jobType,
-          tenantId: picked.tenantId,
+          tenantId: envelope.context.tenantId,
           attempt: envelope.attempts,
           at: startedAt,
           metadata: envelope.metadata,
@@ -140,7 +144,7 @@ export class FairWorker {
             type: 'job.timed_out',
             jobId: picked.jobId,
             jobType: this.opts.jobType,
-            tenantId: picked.tenantId,
+            tenantId: envelope.context.tenantId,
             attempt: envelope.attempts,
             at: new Date(),
             error: { message: 'timeout', reason: 'timeout' },
@@ -186,7 +190,7 @@ export class FairWorker {
           type: 'job.succeeded',
           jobId: picked.jobId,
           jobType: this.opts.jobType,
-          tenantId: picked.tenantId,
+          tenantId: envelope.context.tenantId,
           attempt: envelope.attempts,
           at: finishedAt,
           durationMs: finishedAt.getTime() - startedAt.getTime(),
@@ -229,7 +233,7 @@ export class FairWorker {
           type: this.eventTypeForFailure(record?.status),
           jobId: picked.jobId,
           jobType: this.opts.jobType,
-          tenantId: picked.tenantId,
+          tenantId: envelope.context.tenantId,
           attempt: envelope.attempts,
           at: new Date(),
           error: snapshotLifecycleValue(record?.error ?? { message: reason }),

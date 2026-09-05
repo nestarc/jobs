@@ -24,6 +24,9 @@
 > [!NOTE]
 > 2026-09-05 후속 요청으로 `JOBS-M03`과 필수 선행 `JOBS-M04`의 로컬 구현·검증을 완료했다. 시작 checkout은 이전 M01/M02/M05 구현을 포함한 `main@1f4c486`이며 clean 상태였다. 이 문서는 이제 tracked이지만 fetched `origin/main@405e799`에는 여전히 없다. M03/M04의 `DONE`도 로컬 후보 기준이며, shared claim·PR·merge·release 완료를 뜻하지 않는다. 가장 최근 인계는 §9의 M04 → M03 기록을 따른다.
 
+> [!NOTE]
+> 2026-09-05 사용자 요청으로 `JOBS-M06–M09`를 같은 세션에서 구현·검증했다. 시작점은 M01–M05를 포함한 clean `main@f222389`이다. 아래 네 작업의 `DONE` 및 새로 열린 후속 작업의 `READY`는 **로컬 후보 기준**이다. fetched `origin/main@405e799`에는 이 계획 및 구현이 아직 없으며 shared claim·PR·merge·release 완료를 뜻하지 않는다. 가장 최근 인계는 §9의 M06–M09 기록을 따른다.
+
 ## 0. 문서 운영 계약
 
 ### 0.1 우선순위
@@ -197,25 +200,25 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 |    3 | `JOBS-M03`     | P0       | `DONE`     | M    | `JOBS-M04`                                                    | Outbox adapter tenant dedupe 격리                                   |
 |    4 | `JOBS-M04`     | P0       | `DONE`     | S    | 없음                                                          | Outbox source-owned lineage 봉인                                    |
 |    5 | `JOBS-M05`     | P0       | `DONE`  | M    | `JOBS-M02`                                                    | cooperative timeout 뒤 attempt 중첩 방지                            |
-|    6 | `JOBS-M06`     | P1       | `READY`  | L    | `JOBS-M01–02`, `JOBS-M05`                                     | 실제 in-memory pool과 cross-type cap                                |
-|    7 | `JOBS-M07`     | P1       | `READY`    | M    | 없음                                                          | enqueue/config fail-closed validation                               |
-|    8 | `JOBS-M08`     | P1       | `BLOCKED`  | S    | `JOBS-M07`                                                    | system shard와 real `__default__` tenant 분리                       |
-|    9 | `JOBS-M09`     | P1       | `BLOCKED`  | M    | `JOBS-M07` validator                                          | backend-portable recursive serialization                            |
+|    6 | `JOBS-M06`     | P1       | `DONE`  | L    | `JOBS-M01–02`, `JOBS-M05`                                     | 실제 in-memory pool과 cross-type cap                                |
+|    7 | `JOBS-M07`     | P1       | `DONE`    | M    | 없음                                                          | enqueue/config fail-closed validation                               |
+|    8 | `JOBS-M08`     | P1       | `DONE`  | S    | `JOBS-M07`                                                    | system shard와 real `__default__` tenant 분리                       |
+|    9 | `JOBS-M09`     | P1       | `DONE`  | M    | `JOBS-M07` validator                                          | backend-portable recursive serialization                            |
 |   10 | `JOBS-M10`     | P1       | `READY`    | M    | 없음                                                          | BullMQ producer/worker/both role                                    |
-|   11 | `JOBS-M11`     | P1       | `BLOCKED`  | M    | `JOBS-M03`, `JOBS-M07`                                        | terminal record/identity retention                                  |
+|   11 | `JOBS-M11`     | P1       | `DONE`  | M    | `JOBS-M03`, `JOBS-M07`                                        | terminal record/identity retention                                  |
 |   12 | `JOBS-M12`     | P1       | `READY`    | M    | 없음                                                          | release trust boundary/least privilege                              |
 |   13 | `JOBS-M13`     | P1       | `READY`    | M    | 없음                                                          | advisory-safe BullMQ v5 floor                                       |
 |   14 | `JOBS-M17`     | P1       | `BLOCKED`  | S    | `JOBS-M12`                                                    | published artifact identity 검증                                    |
 |   15 | `JOBS-M14`     | P2       | `BLOCKED`  | S    | `JOBS-M02`                                                    | immutable history reads                                             |
 |   16 | `JOBS-M15`     | P2       | `READY`    | S    | 없음                                                          | Fake drain limit 명시적 실패                                        |
-|   17 | `JOBS-M16`     | P2       | `BLOCKED`  | M    | `JOBS-M02`, `JOBS-M06`                                        | backend fault/worker-loop recovery                                  |
+|   17 | `JOBS-M16`     | P2       | `READY`  | M    | `JOBS-M02`, `JOBS-M06`                                        | backend fault/worker-loop recovery                                  |
 |   18 | `JOBS-M18`     | P2       | `DECISION` | M    | 없음                                                          | Node/Nest 현재 support policy                                       |
 |  19A | `JOBS-M19A`    | P2       | `READY`    | S    | 없음                                                          | low-risk lock/security refresh                                      |
 |  19B | `JOBS-M19B`    | P2       | `BLOCKED`  | M    | `JOBS-M19A`                                                   | Jest 30/ts-jest migration                                           |
 |  19C | `JOBS-M19C`    | P2       | `BLOCKED`  | M    | `JOBS-M19A`                                                   | ESLint/typescript-eslint migration                                  |
 |   20 | `JOBS-M20`     | P2       | `READY`    | S    | 없음                                                          | historical plan/README hygiene                                      |
 |   21 | `JOBS-M21`     | P2       | `BLOCKED`  | M    | Outbox `OUT-M01–04B` candidate/published exact ref            | modern Outbox gate generalization                                   |
-|   22 | `JOBS-M22`     | P2       | `BLOCKED`  | M    | `JOBS-M01`, `JOBS-M03–04`, `JOBS-M07`                         | integration state/admin/legacy bridge 계약                          |
+|   22 | `JOBS-M22`     | P2       | `READY`  | M    | `JOBS-M01`, `JOBS-M03–04`, `JOBS-M07`                         | integration state/admin/legacy bridge 계약                          |
 |   23 | `JOBS-M23`     | P2       | `BLOCKED`  | S    | `JOBS-M01–13`                                                 | Redis-backed coverage contract                                      |
 |   24 | `JOBS-M24`     | P2       | `BLOCKED`  | M    | `JOBS-M12`                                                    | SECURITY/CODEOWNERS/update automation                               |
 |   25 | `JOBS-M25`     | P3       | `BLOCKED`  | L    | `JOBS-M02–05`, `JOBS-M07`, `JOBS-M10–11`, `JOBS-M13`          | actual Redis lease/crash chaos                                      |
@@ -362,57 +365,57 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 
 ### `JOBS-M06` — 실제 in-memory pool과 cross-type concurrency cap
 
-- 상태: `P1 / READY`; 선행 `JOBS-M01`, `JOBS-M02`, `JOBS-M05` 로컬 완료
-- 문제: auto host가 job type별 worker tick을 순차 await하여 실제 total concurrency가 1이다. `tenantCap:10`이 처리 병렬도 계약처럼 보이지만 한 hung type이 모든 tenant/type을 막는다. 반면 BullMQ concurrency는 job type마다 적용되어 total이 types×concurrency다.
+- 상태: `P1 / DONE`; 선행 `JOBS-M01`, `JOBS-M02`, `JOBS-M05` 로컬 완료; 로컬 code/docs/test 완료, §9 M06–M09 인계 참조
+- 문제(수정 전): auto host가 job type별 worker tick을 순차 await하여 실제 total concurrency가 1이다. `tenantCap:10`이 처리 병렬도 계약처럼 보이지만 한 hung type이 모든 tenant/type을 막는다. 반면 BullMQ concurrency는 job type마다 적용되어 total이 types×concurrency다.
 
 완료 조건:
 
-- [ ] global pool size, per-tenant cap, per-type cap의 의미를 public contract로 고정한다.
-- [ ] bounded in-memory execution pool에서 다른 tenant/type은 cap 안에서 진행한다.
-- [ ] same tenant cap과 fairness weight가 실제 active invocation을 센다.
-- [ ] BullMQ의 per-worker/total concurrency 의미와 차이를 문서화하고 필요하면 global bound option을 추가한다.
-- [ ] shutdown drain, timeout ownership, worker-loop error가 pool slot을 누수하지 않는다.
+- [x] global pool size, per-tenant cap, per-type cap의 의미를 public contract로 고정한다.
+- [x] bounded in-memory execution pool에서 다른 tenant/type은 cap 안에서 진행한다.
+- [x] same tenant cap과 fairness weight가 실제 active invocation을 센다.
+- [x] BullMQ의 per-worker/total concurrency 의미와 차이를 문서화하고 필요하면 global bound option을 추가한다.
+- [x] shutdown drain, timeout ownership, worker-loop error가 pool slot을 누수하지 않는다.
 
 검증: 프로필 A/C. Public option 추가는 minor. 비범위: distributed BullMQ tenant fairness.
 
 ### `JOBS-M07` — centralized fail-closed enqueue/config validation
 
-- 상태: `P1 / READY`
+- 상태: `P1 / DONE`; 로컬 code/docs/test 완료, §9 M06–M09 인계 참조
 
 완료 조건:
 
-- [ ] attempts/concurrency는 positive safe integer다.
-- [ ] delay/timeout/TTL/backoff는 finite하고 허용 범위다; Invalid Date와 overflow를 거부한다.
-- [ ] job type/job types, job ID, idempotency/dedupe key는 exact non-empty/length contract를 갖는다.
-- [ ] dedupe scope/mode와 backoff type은 runtime exact enum이며 invalid 값이 global/other mode로 fall through하지 않는다.
-- [ ] direct backend와 JobsService/defaults 경로가 동일한 stable error를 사용한다.
-- [ ] side effect/identity reservation 전에 validation한다.
+- [x] attempts/concurrency는 positive safe integer다.
+- [x] delay/timeout/TTL/backoff는 finite하고 허용 범위다; Invalid Date와 overflow를 거부한다.
+- [x] job type/job types, job ID, idempotency/dedupe key는 exact non-empty/length contract를 갖는다.
+- [x] dedupe scope/mode와 backoff type은 runtime exact enum이며 invalid 값이 global/other mode로 fall through하지 않는다.
+- [x] direct backend와 JobsService/defaults 경로가 동일한 stable error를 사용한다.
+- [x] side effect/identity reservation 전에 validation한다.
 
 검증: 프로필 A/B/D. Previously accepted invalid input 거부는 `0.4.0`에 묶는 것을 기본으로 한다.
 
 ### `JOBS-M08` — system shard와 real tenant identity 분리
 
-- 상태: `P1 / BLOCKED`; 선행 `JOBS-M07`
+- 상태: `P1 / DONE`; 선행 `JOBS-M07`; 로컬 code/docs/test 완료, §9 M06–M09 인계 참조
 
 완료 조건:
 
-- [ ] missing tenant는 internal tagged system shard를 사용하고 user string `__default__`와 충돌하지 않는다.
-- [ ] public event/context에는 missing tenant가 계속 `undefined`로 보인다.
-- [ ] enqueue/retry/replay/setWeight/snapshot에서 동일 encoding을 쓴다.
-- [ ] real tenant ID validation과 reserved namespace 정책을 문서화한다.
+- [x] missing tenant는 internal tagged system shard를 사용하고 user string `__default__`와 충돌하지 않는다.
+- [x] public event/context에는 missing tenant가 계속 `undefined`로 보인다.
+- [x] enqueue/retry/replay/setWeight/snapshot에서 동일 encoding을 쓴다.
+- [x] real tenant ID validation과 reserved namespace 정책을 문서화한다.
 
 검증: 프로필 A/C.
 
 ### `JOBS-M09` — backend-portable recursive serialization
 
-- 상태: `P1 / BLOCKED`; 선행 `JOBS-M07` validator 구조
+- 상태: `P1 / DONE`; 선행 `JOBS-M07` validator 구조; 로컬 code/docs/test 완료, §9 M06–M09 인계 참조
 
 완료 조건:
 
-- [ ] payload/context/metadata의 JSON-safe 또는 명시적 structured contract를 선택한다.
-- [ ] nested BigInt/function/symbol/Map/Set/custom prototype/cycle/Invalid Date, depth/size를 enqueue side effect 전에 동일하게 처리한다.
-- [ ] InMemory와 BullMQ가 같은 valid value를 같은 semantic value로 전달하고 invalid value에 같은 error family를 낸다.
-- [ ] reserved envelope keys와 AbortSignal non-enumerable runtime field 계약을 보존한다.
+- [x] payload/context/metadata의 JSON-safe 또는 명시적 structured contract를 선택한다.
+- [x] nested BigInt/function/symbol/Map/Set/custom prototype/cycle/Invalid Date, depth/size를 enqueue side effect 전에 동일하게 처리한다.
+- [x] InMemory와 BullMQ가 같은 valid value를 같은 semantic value로 전달하고 invalid value에 같은 error family를 낸다.
+- [x] reserved envelope keys와 AbortSignal non-enumerable runtime field 계약을 보존한다.
 
 검증: 프로필 A/B/D. 비범위: business payload schema library 내장.
 
@@ -432,7 +435,7 @@ Node lifecycle 판단은 [Node.js 공식 release schedule](https://github.com/no
 
 ### `JOBS-M11` — terminal record와 identity retention
 
-- 상태: `P1 / BLOCKED`; 선행 `JOBS-M03`, `JOBS-M07`
+- 상태: `P1 / READY`; 선행 `JOBS-M03`, `JOBS-M07`
 
 완료 조건:
 
@@ -661,6 +664,11 @@ Outbox ── publisher record ──> Jobs Outbox adapter ──> Jobs backend/
 | 2026-09-05 | `JOBS-M01` | `DONE` (로컬) | `405e799` 기준 미커밋 후보 | backend close 4건 + module lifecycle 16건; 프로필 A/C PASS | 로컬 변경 review 및 main 반영; 이후 남은 P0 M04 → M03 |
 | 2026-09-05 | `JOBS-M04` | `DONE` (로컬) | `1f4c486` 기준 미커밋 후보 | reserved lineage·callback mutation 회귀; 프로필 A/D PASS | M03과 함께 로컬 후보 review 및 main 반영 |
 | 2026-09-05 | `JOBS-M03` | `DONE` (로컬) | `1f4c486` 기준 미커밋 후보 | unit 188 / Redis 44 / coverage 232 PASS; packed core·Outbox PASS | 계획 bootstrap 및 P0 후보 main 반영; M12 → M17, M13 release 선행 검토 |
+| 2026-09-05 | `JOBS-M06` | `DONE` (로컬) | `f222389` 기준 미커밋 후보 | bounded pool·cross-type tenant/type cap·timeout/fault/shutdown; Nest 10/11 전체 231 PASS | 네 작업 로컬 후보 review 및 main 반영 |
+| 2026-09-05 | `JOBS-M07` | `DONE` (로컬) | 동일 | 중앙 입력/default/config 검증, A/B/D PASS | M11/M16/M22 로컬 선행 충족; 공개 main 완료 여부 재확인 |
+| 2026-09-05 | `JOBS-M08` | `DONE` (로컬) | 동일 | Symbol system shard, retry/replay/weight/event 회귀; A/C PASS | 네 작업 로컬 후보 review 및 main 반영 |
+| 2026-09-05 | `JOBS-M09` | `DONE` (로컬) | 동일 | recursive normalization, Redis 46 / coverage 277 / packed core·Outbox PASS | release 선행 M12 → M17 및 M13은 여전히 별도 작업 |
+
 
 ### 2026-09-05 — JOBS-M01 시작 전 선행 조건 확인
 
@@ -762,3 +770,51 @@ Outbox ── publisher record ──> Jobs Outbox adapter ──> Jobs backend/
 - 변경 파일: `src/outbox/outbox-jobs-publisher.ts`, `test/integration/outbox-jobs-publisher.test.ts`, `test/redis/bullmq-backend.redis.test.ts`, `test/consumer/modern-outbox.ts`, `README.md`, `CHANGELOG.md`, 이 계획 문서.
 - Remaining risk: 이미 global dedupe로 축약되어 SENT가 된 이벤트는 자동 복구되지 않는다. 기존 global 예약이 남은 상태의 과거 이벤트 재전달/롤아웃은 별도 운영 판단이 필요하며, exactly-once side effects와 기존 유실의 자동 복구를 보장하지 않는다. arbitrary mapping option 입력 검증은 M07, 일반 serialization은 M09 범위다.
 - Next exact action: bootstrap 및 P0 로컬 후보를 review/PR 절차로 main에 반영한다. release 직접 선행 `JOBS-M12 → JOBS-M17` 및 `JOBS-M13`을 검토한 뒤 `JOBS-REL-01`을 진행한다. 위의 과거 인계에서 남아 있던 M04 → M03 재실행 지시는 이 기록으로 대체한다.
+
+### 2026-09-05 — JOBS-M06–M09 완료 인계
+
+- Task / State: `JOBS-M06`, `JOBS-M07`, `JOBS-M08`, `JOBS-M09` 모두 `DONE` (로컬 code/docs/test 완료).
+- 요청 범위: 사용자가 네 작업 모두 진행 및 완료 후 이 문서 업데이트를 지시했다. 문서의 한 세션/한 작업 제한 및 bootstrap 대기 대신 기존 M01–M05 로컬 후보를 이어 구현했다. public 완료나 shared claim을 주장하지 않는다.
+- Start ref: clean `main@f22238929fdda0da4c85142171667cfbfda44425` (M01–M05 포함).
+- End ref: 같은 commit 기준 `codex/jobs-m06-m09`의 미커밋 후보. 전용 worktree `/private/tmp/jobs-m06-m09`에서 검증한 파일을 원래 `/Users/ksy/Documents/GitHub/jobs`에 반영했다. 원래 branch/HEAD를 보존했다. stage, commit, push, shared claim, PR, merge, publish는 수행하지 않았다.
+- 외부 기준: fetch 성공, `origin/main@405e799367023bb5e868588c85e4ff1fca51d4c0`, `v0.3.1@7a173442caea6d7d50b09c9fe01a643cd1afb288` 유지. GitHub Release 게시 시각 `2026-08-23T15:09:01Z`, [main CI 33294387914](https://github.com/nestarc/jobs/actions/runs/33294387914) `completed/success`. npm latest `0.3.1`, integrity는 앞선 기준선과 동일하다.
+
+#### 확정 계약과 semver
+
+| Task | 구현 계약 | 검증 증거 |
+| --- | --- | --- |
+| M06 | 모듈 전체 `concurrency.poolSize=10`, cross-type `tenantCap=10`, 각 타입 `typeCap=poolSize`; 공유 budget을 scheduler pick 전에 예약하고 실제 invocation settlement 후 반환한다. 타입 간 순환 선택과 타입 내부 weighted/min-share dispatch를 유지한다. | 두 타입·다섯 job을 barrier로 묶어 global 3/tenant 1/type 2 상한 및 shutdown drain 확인. timeout 뒤 동일 tenant 차단·다른 tenant 진행·settle 후 retry 확인. backend move failure에서 inflight 0 및 remaining ID/worker_error 확인. 기존 fairness/activation/shutdown 회귀 유지. |
+| M07 | service raw/effective defaults, module registration 및 두 direct backend에서 동일 `jobs_invalid_input` 검증. attempts/concurrency positive safe integer, timer-safe finite durations, 유효 Date/horizon, identifier 길이, exact enum을 side effect 전에 확인한다. | invalid options/tenant/identifier/defaults/null config 거부, invalid enqueue 후 같은 identity를 정상 생성할 수 있음. Redis waiting/delayed/active 0 확인. backoff overflow가 0으로 돌아가지 않고 timer 최대값에서 포화. |
+| M08 | 내부 Symbol key로 system shard와 모든 real tenant string을 분리한다. public picked/snapshot/context/events는 missing tenant를 `undefined`로 표시하고 weight API도 undefined를 받는다. | real `__default__` weight 0 상태에서 system job retry/replay 진행, 별도 shard snapshot, weight 재활성화 및 terminal/start event tenant 확인. |
+| M09 | plain-record root의 재귀 JSON 정규화와 snapshot. nested Date→ISO, object undefined 생략, array holes/undefined→null, -0→0. 비JSON 값·custom prototype·accessor·cycle 거부, envelope/metadata 각각 1 MiB 보수적 traversal budget 및 depth 64. | payload/context/metadata nested invalid matrix, source mutation isolation, 예약 키·getter 미호출·non-enumerable signal, Redis instance 재생성 후 record 및 handler value parity, packed core/Outbox strict 타입·runtime 검증. |
+
+- **0.4.0 minor**에 포함한다. default pool이 기존 실질 serial 동작을 바꾸므로 호환 설정은 `poolSize: 1`이다. `ShardSnapshot`/`PickedJob.tenantId`의 undefined 허용과 invalid input/serialization 거부도 migration 대상이다. package.json/package-lock.json의 version은 `0.3.1`을 유지하며 bump/publish는 `JOBS-REL-01`이 소유한다.
+- BullMQ `workerConcurrency=10`은 각 job-type Worker별 값이며 한 process의 N개 type은 최대 N×concurrency다. shared Jobs global cap/tenant fairness/distributed bound를 추가하지 않고 차이를 명시했다.
+- Duration 계약: delay/TTL/backoff는 `[0, 2147483647]` ms, timeout은 `[1, 2147483647]` ms, shutdown timeout은 이 범위의 정수다. scheduledFor는 valid Date이며 미래 horizon이 같은 상한 이내여야 한다. Job type은 최대 256 UTF-16 code units/colon 금지, ID/key/tenant는 최대 1024, 모두 non-blank이며 원문을 trim/coerce하지 않는다. Dedupe/backoff의 기존 valid defaults와 schedule precedence는 보존한다.
+- Generic dedupe의 missing scope는 계속 global이며 Outbox adapter의 tenant-safe default는 보존한다. Missing tenant를 `__default__`로 바꾸는 compatibility alias는 두지 않는다.
+- Worker backend 오류는 capacity를 반환하고 automatic dispatch를 중단하며 shutdown에서 pending IDs와 worker_error를 보고한다. unknown commit reconciliation과 자동 loop 복구는 M16의 책임으로 남긴다. actual invocation이 settle하지 않으면 timeout 후에도 slot을 보유하고 shutdown deadline이 실패한다.
+- Payload/context/metadata의 nested Date를 쓰던 handler는 ISO 문자열로 타입·로직을 이전해야 한다. Buffer/class/Map/Set은 producer에서 명시적으로 portable record/string으로 바꾼다. Raw backend envelope의 context가 authoritative다. Replay metadata도 재귀 validation 후 적용한다.
+
+#### RED 및 최종 검증
+
+| 구분 | 명령 / 정확한 결과 |
+| --- | --- |
+| M07/M09 First RED | 시작 ref를 `/private/tmp/jobs-m06-baseline`에 export하고 신규 `maintenance-input.test.ts`를 적용: **28 FAIL / 0 PASS**. 잘못된 attempts/duration/enum/config 및 nested nonportable 값이 성공 접수되고 Date가 그대로 남음. 로그 `/private/tmp/jobs-m06-input-red.log`. 최초 fixture compile typo는 수정 후 이 behavioral RED를 확보했다. |
+| M06/M08 First RED | `npm test -- --runInBand test/integration/maintenance-pool.test.ts`: **3 FAIL**. 첫 type barrier가 나머지 type을 차단, system/real default shard 충돌, lifecycle missing tenant에 sentinel 노출. 로그 `/private/tmp/jobs-m06-pool-red.log`. |
+| 설치 | 전용 cache를 사용하는 `npm ci` PASS. 초기 restricted network 설치 오류 후 동일 lockfile로 설치 완료. Nest 11 검사 후 `npm ci --offline --cache /private/tmp/jobs-m06-install-cache`로 Nest 10 복원. |
+| 프로필 A / Nest 10.4.22 | `npm run --if-present clean` (script 없음), `npm run lint`, `npx --no-install tsc -p tsconfig.json --noEmit`, `npm run build` PASS. `npm test -- --runInBand`: **25 suites / 231 tests PASS**. 로그 `/private/tmp/jobs-m06-unit.log`. |
+| 프로필 C / Nest 11.2.1 | common/core/testing exact 11.2.1을 `--no-save --package-lock=false`로 설치. lint/typecheck/build 및 전체 unit **25 suites / 231 tests PASS**. 로그 `/private/tmp/jobs-m06-nest11-unit.log`. |
+| 프로필 B | 전용 Redis의 `npm run test:redis`: **1 suite / 46 tests PASS**, 신규 2건은 다중 invalid case/identity 미예약 및 normalized handler parity를 포함. 로그 `/private/tmp/jobs-m06-redis.log`. |
+| 최종 coverage | `REDIS_URL=redis://127.0.0.1:16379 npm run test:coverage`: **26 suites / 277 tests PASS**. global statements/branches/functions/lines **92.64/86.13/98.00/94.51%**, BullMQ **92.62/84.30/95.40/94.41%**, threshold PASS. 로그 `/private/tmp/jobs-m06-coverage.log`. |
+| Production audit / dry pack | `npm audit --omit=dev --json`: **total 0 PASS**. `npm pack --dry-run --json`: PASS. 실제 최종 candidate도 build/pack 및 strict 설치 검증. |
+| 프로필 D / modern | `OUTBOX_PACKAGE=@nestarc/outbox@0.2.1 npm run test:consumer:modern`: PASS. exact Outbox **0.2.1**, Nest **11.2.1**, Prisma **7.10.0**, strict peer graph/digest 및 strict tsc/runtime. 새 JSON/invalid input fixture 포함. 로그 `/private/tmp/jobs-m06-modern.log`. |
+| 프로필 D / core | `/private/tmp/jobs-m06-core-BASYXo`에서 최종 tarball + exact Nest **10.4.22**, strict peer install/`npm ls --all`, BullMQ·Outbox `MODULE_NOT_FOUND`, `tsc --strict --skipLibCheck false --noEmitOnError`, Nest 2-slot parallel/system shard/JSON/signal/shutdown smoke PASS. 설치 lock integrity와 artifact SRI 일치. |
+| 검토 / 파일 보존 | 시작 ref 대비 path-scoped diff, `git diff --check`, cached diff check PASS; 신규 TS도 Prettier 직접 검증. handler 계획·package.json·package-lock.json 미수정·미stage. |
+
+- Packed fixture에서 취소된 선두 job이 있으면 기존 fake drain이 뒤의 ready job 전에 종료하는 동작을 관찰했다. 신규 portability fixture를 별도 fake instance로 분리해 기존 Outbox gate와 독립시켰다. production fake drain을 이번 범위에서 변경하지 않았으며 이 관찰은 M15 후속 검토에 남긴다.
+- 환경: Node **24.11.1**, npm **11.6.2**, source/Redis Nest **10.4.22**, BullMQ **5.74.1**. Node 20/22 및 전체 Nest 11 Redis matrix는 이 세션에서 재실행하지 않았다. Nest 11은 전체 unit/lifecycle와 packed modern으로 검증했다.
+- Redis: 미사용 loopback port `16379` 확인 후 전용 compose project `jobs-m06-m09-20260905`의 `redis:7.2-alpine` 사용. UUID queue namespace만 정리하고 완료 후 자신이 생성한 compose project만 `down`했다. Redis process/server chaos는 실행하지 않았다.
+- 최종 artifact: `/private/tmp/jobs-m06-core-BASYXo/nestarc-jobs-0.3.1.tgz`. SHA-256 **`a6a099636f8e247d7219137fb15399c577a1523b5875064f23d320083920379c`**, SRI **`sha512-Dvn5Mtgr8cuoDMORGUOQP7QKxkzShJZjzqYZwhhbHiGowf3Wpf4Ylss4UU1jrqhZ2QFV0LSSd93TQ30aP9yv6Q==`**. modern gate에서 독립적으로 pack한 candidate와 digest 일치. 게시 Jobs 0.3.1 artifact와 동일 bytes가 아니다.
+- 변경 파일: source `src/{enqueue-validation,context-serializer,portable-value,execution-budget,errors,fair-worker,jobs.module,jobs.service,retry,scheduler,types}.ts`, 두 backend; source tests `src/{context-serializer,retry,scheduler}.test.ts`; 신규 integration `maintenance-input.test.ts`, `maintenance-pool.test.ts`; 기존 integration `idempotency-dlq`, `jobs.module.in-memory`, `jobs.service`; Redis fixture; consumer `modern-outbox.ts`, 신규 `maintenance-core.ts`; README, CHANGELOG, 이 계획 문서.
+- Remaining risk: in-memory crash durability 없음; hung invocation이 cap을 보유하며 pool 전체가 소진되면 진행할 수 없음; weight는 elapsed execution time이 아닌 dispatch 기회에 적용됨; BullMQ에는 cross-type/global tenant bound 없음. backend fault recovery는 M16, retention은 M11, fake drain limit은 M15에서 처리한다.
+- Next exact action: 계획 bootstrap 및 M01–M09 로컬 후보를 review/PR 절차로 공개 main에 반영한다. M11/M16/M22는 로컬 선행만 충족되어 `READY`로 바꿨으며 shared 완료를 재확인해야 한다. release 직접 선행 `M12 → M17` 및 `M13`은 여전히 미완료다. 이번 M06–M09를 재실행하지 않는다.

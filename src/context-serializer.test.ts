@@ -18,8 +18,8 @@ describe('attachContext', () => {
   });
 
   it('rejects primitive and array payloads at runtime', () => {
-    expect(() => attachContext('payload' as never, undefined)).toThrow(TypeError);
-    expect(() => attachContext([] as never, undefined)).toThrow(TypeError);
+    expect(() => attachContext('payload' as never, undefined)).toThrow(JobsError);
+    expect(() => attachContext([] as never, undefined)).toThrow(JobsError);
   });
 
   it('rejects non-plain payloads and contexts before data can be lost', () => {
@@ -28,13 +28,13 @@ describe('attachContext', () => {
     }
 
     expect(() => attachContext(new Date() as never, undefined)).toThrow(
-      'job payload must be a plain object',
+      'job payload: must be a plain object',
     );
     expect(() => attachContext(new Payload('x') as never, undefined)).toThrow(
-      'job payload must be a plain object',
+      'job payload: must be a plain object',
     );
     expect(() => attachContext({}, 'tenant' as never)).toThrow(
-      'job context must be a plain object',
+      'job context: must be a plain object',
     );
   });
 });

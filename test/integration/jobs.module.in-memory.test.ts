@@ -193,7 +193,11 @@ describe('M01 in-memory shutdown lifecycle', () => {
   async function setup(timeoutMs = 1_000) {
     const app = await Test.createTestingModule({
       imports: [
-        JobsModule.forInMemory({ jobTypes: ['shutdown'], shutdown: { timeoutMs } }),
+        JobsModule.forInMemory({
+          jobTypes: ['shutdown'],
+          shutdown: { timeoutMs },
+          concurrency: { poolSize: 1 },
+        }),
         ShutdownFeatureModule,
       ],
     }).compile();

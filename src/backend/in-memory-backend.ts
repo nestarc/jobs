@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { detachContext } from '../context-serializer';
+import { preparePortableEnqueue, detachContext } from '../context-serializer';
 import type { EnqueueCommitObserver, JobsBackend } from './jobs-backend.interface';
 import type { EnqueueOptions, JobEnvelope } from '../types';
 import type {
@@ -14,8 +14,9 @@ import type {
 } from '../lifecycle';
 import { computeBackoffDelayMs } from '../retry';
 import { JobsError, JobsErrorCode, JobsShutdownError } from '../errors';
+import { portableRecord } from '../portable-value';
 import { snapshotLifecycleValue } from '../lifecycle-observer';
-import { assertValidJobId } from '../enqueue-validation';
+import { assertEnqueueOptions, assertJobType } from '../enqueue-validation';
 
 interface Slot {
   envelope: JobEnvelope;
@@ -90,7 +91,9 @@ export class InMemoryBackend implements JobsBackend {
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
     this.assertOpen();
-    assertValidJobId(opts.jobId);
+    assertJobType(jobType);
+    assertEnqueueOptions(opts);
+    ({ envelope, opts } = preparePortableEnqueue(envelope, opts));
     const { payload, context } = detachContext(envelope);
     const idempotencyKey = opts.idempotencyKey;
     const idempotencyMapKey = idempotencyKey
@@ -288,6 +291,10 @@ export class InMemoryBackend implements JobsBackend {
 
   async replayDeadLetter(jobId: string, options: ReplayOptions = {}): Promise<string> {
     this.assertOpen();
+    const metadata = portableRecord(
+      options.metadata === undefined ? {} : options.metadata,
+      'replay metadata',
+    );
     const slot = this.slotById(jobId);
     if (!slot || slot.state !== 'dead_letter') {
       throw new Error(`dead-letter job not found: ${jobId}`);
@@ -327,7 +334,7 @@ export class InMemoryBackend implements JobsBackend {
         backoff: slot.envelope.backoff,
         metadata: {
           ...snapshotLifecycleValue(slot.envelope.metadata),
-          ...snapshotLifecycleValue(options.metadata),
+          ...metadata,
           replayOf: jobId,
         },
         idempotencyKey: slot.envelope.idempotencyKey,

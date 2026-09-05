@@ -1,4 +1,6 @@
 export const JobsErrorCode = {
+  InvalidInput: 'jobs_invalid_input',
+  SerializationInvalid: 'jobs_serialization_invalid',
   ReservedPayloadKey: 'jobs_reserved_payload_key',
   HandlerNotFound: 'jobs_handler_not_found',
   QueueNotFound: 'jobs_queue_not_found',

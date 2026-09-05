@@ -2,10 +2,15 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import type { ConnectionOptions, Job, JobsOptions, MinimalJob, Queue, Worker } from 'bullmq';
-import { detachContext, INTERNAL_JOB_KEY } from '../context-serializer';
+import { preparePortableEnqueue, detachContext, INTERNAL_JOB_KEY } from '../context-serializer';
 import { JobsError, JobsErrorCode } from '../errors';
 import { normalizeError } from '../error-utils';
-import { assertValidJobId } from '../enqueue-validation';
+import {
+  assertEnqueueOptions,
+  assertJobType,
+  assertJobConfiguration,
+  assertPositiveInteger,
+} from '../enqueue-validation';
 import { computeBackoffDelayMs, type BackoffPolicy } from '../retry';
 import {
   notifyLifecycleObserver,
@@ -149,6 +154,8 @@ export class BullMQBackend implements JobsBackend {
   private closed = false;
 
   constructor(private readonly opts: BullMQBackendOptions) {
+    if (opts.workerConcurrency !== undefined)
+      assertPositiveInteger(opts.workerConcurrency, 'workerConcurrency');
     const namespace = opts.namespace ?? 'nestarc';
     if (namespace.includes('.')) {
       throw new TypeError('BullMQ namespace must not contain "."');
@@ -173,7 +180,7 @@ export class BullMQBackend implements JobsBackend {
   }
 
   registerJobTypes(jobTypes: Iterable<string>): void {
-    for (const jobType of jobTypes) this.getOrCreateQueue(jobType);
+    for (const jobType of assertJobConfiguration(jobTypes)) this.getOrCreateQueue(jobType);
   }
 
   async enqueue(
@@ -190,7 +197,9 @@ export class BullMQBackend implements JobsBackend {
     opts: EnqueueOptions,
     onCommit?: EnqueueCommitObserver,
   ): Promise<EnqueueResult> {
-    assertValidJobId(opts.jobId);
+    assertJobType(jobType);
+    assertEnqueueOptions(opts);
+    ({ envelope, opts } = preparePortableEnqueue(envelope, opts));
     this.assertAcceptingWork();
     const operation = this.performEnqueueDetailed(jobType, envelope, opts, onCommit);
     this.inFlightEnqueues.add(operation);

@@ -177,7 +177,7 @@ class ReportHandler {
     JobsModule.forInMemory({
       jobTypes: ['sendReport'],
       fairness: { defaultWeight: 1, minSharePct: 0.1 },
-      concurrency: { tenantCap: 10 },
+      concurrency: { poolSize: 10, tenantCap: 10, typeCap: 10 },
     }),
   ],
   providers: [ReportHandler],
@@ -445,7 +445,37 @@ The in-memory backend uses a shard-based scheduler with:
 - per-tenant inflight caps
 - due-time promotion for delayed jobs and retries
 
-Future work stays outside weighted dispatch and starvation accounting until it is due, so it does not block ready work from the same or another tenant. Scheduler snapshots still include deferred work in each tenant's `waiting` count. `defaultWeight` and `tenantCap` must be positive safe integers, `minSharePct` must be finite and within `[0, 1]`, and runtime tenant weights must be non-negative safe integers (`0` is allowed); invalid values throw `jobs_fairness_misconfig`.
+In-memory automatic execution uses a bounded pool shared by every job type in one
+`JobsModule.forInMemory()` registration. `concurrency.poolSize` (default `10`) limits
+all outstanding invocations; `tenantCap` (default `10`) limits one tenant across
+all types; `typeCap` (default `poolSize`) limits each type. All three must be
+positive safe integers. Types take turns acquiring free slots; within a type,
+weighted tenant selection and minimum share apply only to eligible tenants.
+Weights govern dispatch opportunities, not elapsed CPU time, and cannot override
+any concurrency cap. Use `poolSize: 1` to preserve the earlier serial execution.
+These are local limits, independently applied by each module/process.
+
+A timed-out invocation retains every slot until its handler settles. Shutdown
+uses the same pool and limits while draining queued, delayed and retrying jobs.
+A backend worker-loop failure releases capacity after the invocation settles,
+stops automatic dispatch, and makes shutdown report `worker_error` with pending
+IDs. Backend state reconciliation/restart after that error remains an explicit
+recovery action. There is no automatic retry of an uncertain backend transition.
+
+BullMQ `workerConcurrency` (default `10`) is per job-type Worker in each backend
+instance: `N` registered types can execute up to `N × workerConcurrency` handlers
+per process. Multiple processes add their own workers. It has no shared Jobs
+pool, per-tenant fairness or cross-type global bound; the in-memory concurrency
+options do not apply to BullMQ. No distributed bound is implied.
+
+Missing tenant identity uses an internal Symbol shard, separate from every user
+string, including `__default__`. Contexts, lifecycle events, scheduler picks and
+snapshots expose the missing tenant as `undefined`. Enqueue, retry, replay and
+weight controls use this same identity. `setTenantWeight(type, undefined, weight)`
+controls the system shard; passing `'__default__'` controls that real tenant only.
+Tenant IDs follow the string contract below; no user string namespace is reserved.
+
+Future work stays outside weighted dispatch and starvation accounting until it is due, so it does not block ready work from the same or another tenant. Scheduler snapshots still include deferred work in each tenant's `waiting` count. `defaultWeight` and standalone scheduler `tenantCap` must be positive safe integers, `minSharePct` must be finite and within `[0, 1]`, and runtime tenant weights must be non-negative safe integers (`0` is allowed); invalid values throw `jobs_fairness_misconfig`.
 
 You can adjust weights at runtime:
 
@@ -459,6 +489,49 @@ For lower-level inspection:
 ```ts
 const snapshot = jobs.scheduler('sendReport').snapshot();
 ```
+
+### Enqueue validation and portable values (planned 0.4.0)
+
+`JobsService`, effective job defaults, and direct InMemory/BullMQ enqueue calls
+validate before storing jobs or reserving identities. Invalid options/configuration
+throw `JobsError` with `code: 'jobs_invalid_input'`; unsupported valid capabilities
+still throw `jobs_capability_unsupported`. Invalid recursive data uses
+`jobs_serialization_invalid`. Payload envelope keys `__nestarcCtx` and
+`__nestarcJob` remain reserved (`jobs_reserved_payload_key`). Direct backends take
+an envelope from `attachContext(payload, context)`; its context is authoritative.
+
+- Attempts and concurrency are positive safe integers. Delay (`delay`/`delayMs`),
+  dedupe TTL and backoff delay/maxDelay are finite milliseconds in `[0, 2147483647]`;
+  timeout is in `[1, 2147483647]`. Fractional durations are accepted; timers apply
+  their millisecond resolution. A valid `scheduledFor: Date` may be in the past,
+  or at most `2147483647` ms into the future. Precedence remains
+  `scheduledFor`, then `delayMs`, then `delay`.
+- Job types are non-blank strings of at most 256 UTF-16 code units, without `:`;
+  job IDs, idempotency/dedupe keys and tenant IDs are non-blank strings of at most
+  1024 code units. Values are preserved exactly, without trimming or coercion.
+  Registered job types must be unique; an empty registration remains valid.
+- Dedupe scope is exactly `global` or `tenant`, and mode is exactly `while_active`
+  or `until_completed`. Tenant scope requires a tenant. Generic omitted scope
+  remains global; the first-party Outbox adapter retains its tenant-safe default.
+  Backoff type is exactly `fixed` or `exponential`, with jitter in `[0, 1]`.
+  Exponential arithmetic saturates at the maximum timer delay instead of
+  overflowing into an immediate retry.
+- Payload, context and metadata roots are plain records. Nested plain records,
+  arrays, strings, booleans, null and finite numbers are supported. Valid Date
+  values normalize to ISO strings, object properties valued `undefined` are
+  omitted, array holes/undefined become null, and negative zero becomes zero.
+  Caller values are snapshotted before asynchronous admission.
+- Nested BigInt, functions, symbols/symbol keys, Map, Set, Buffer, custom class or
+  array prototypes, accessors, cycles, invalid Dates and nonfinite numbers are
+  rejected. Repeated references without cycles are allowed. Enumerable data is
+  traversed without calling getters or custom `toJSON`; non-enumerable properties
+  are excluded. Handler `context.signal` remains a non-enumerable runtime field.
+- The envelope and metadata each have a conservative 1 MiB UTF-8 traversal budget
+  (including keys/separators) and at most 64 nesting levels from their root.
+  Oversized or deeper inputs fail before admission. Convert binary/class values
+  explicitly and adapt handlers that previously expected nested Date instances
+  to receive ISO strings. The same normalized values reach both backends.
+
 
 ## First-party outbox publisher
 

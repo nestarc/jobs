@@ -15,6 +15,17 @@ This project is currently pre-release. The changelog below starts from the curre
 
 ### Changed (planned 0.4.0)
 
+- Run in-memory workers in a bounded pool (default 10), with module-wide pool and
+  tenant limits and per-type limits; preserve timeout ownership and shutdown drain.
+  Set `poolSize: 1` for prior serial behavior. Clarify BullMQ per-type worker limits.
+- Separate the internal system shard from all real tenant strings; expose absent
+  tenants as `undefined` in scheduler picks/snapshots and lifecycle events.
+- Reject invalid enqueue/default/configuration values before identity reservation
+  using `jobs_invalid_input`, and saturate exponential backoff at the timer maximum.
+- Normalize recursive payload/context/metadata to portable JSON semantics with
+  Date-to-ISO conversion, depth/size bounds and `jobs_serialization_invalid` for
+  unsupported values. Direct backends and service admission share the boundary.
+
 - Require opaque activation tokens for manual backend ack/fail/markFailed and an
   activation-fencing capability for FairWorker; reject stale and illegal completion
   with `jobs_activation_conflict`. Preserve lifetime attempt counts on same-ID replay.

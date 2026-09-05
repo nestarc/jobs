@@ -23,7 +23,7 @@ describe('v0.2 idempotency and DLQ APIs', () => {
 
     await expect(
       service.enqueueDetailed('report.generate', { generation: 'invalid' }, { jobId: '' }),
-    ).rejects.toThrow('jobId must be a non-empty string');
+    ).rejects.toThrow('jobs_invalid_input');
     await expect(backend.peekWaiting('report.generate')).resolves.toEqual([]);
   });
 
@@ -634,7 +634,7 @@ describe('v0.2 idempotency and DLQ APIs', () => {
     expect(replayedId).not.toBe(terminalTarget.jobId);
     await expect(service.getJob(replayedId)).resolves.toMatchObject({ status: 'queued' });
     expect(scheduler.snapshot()).toEqual([
-      expect.objectContaining({ tenantId: '__default__', waiting: 1 }),
+      expect.objectContaining({ tenantId: undefined, waiting: 1 }),
     ]);
     expect(events.filter((event) => event.type === 'job.replayed')).toEqual([
       expect.objectContaining({ jobId: replayedId }),

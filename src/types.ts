@@ -25,7 +25,7 @@ export interface JobEnvelope<T = unknown> {
 }
 
 export interface ShardSnapshot {
-  tenantId: string;
+  tenantId: string | undefined;
   waiting: number;
   inflight: number;
   weight: number;

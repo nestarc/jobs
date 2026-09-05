@@ -21,6 +21,25 @@ async function main(): Promise<void> {
     return null;
   });
 
+  const portableFake = new FakeJobsService({ jobTypes: ['invoice.process'] });
+  const date = new Date('2026-01-01T00:00:00Z');
+  const portableId = await portableFake.service.enqueue(
+    'invoice.process',
+    { nested: { date, list: [undefined, 1] } },
+    { metadata: { date } },
+  );
+  const portable = await portableFake.service.getJob(portableId);
+  assert.deepEqual(portable?.payload, { nested: { date: date.toISOString(), list: [null, 1] } });
+  assert.deepEqual(portable?.metadata, { date: date.toISOString() });
+  await assert.rejects(portableFake.service.enqueue('invoice.process', {}, { attempts: 0 }), {
+    code: 'jobs_invalid_input',
+  });
+  await assert.rejects(portableFake.service.enqueue('invoice.process', { nested: { value: 1n } }), {
+    code: 'jobs_serialization_invalid',
+  });
+  await portableFake.backend.markCancelled('invoice.process', portableId);
+  await portableFake.backend.close();
+
   const Publisher: Type<FirstPartyOutboxPublisher> = createOutboxJobsPublisher({
     map: { 'invoice.issued': 'invoice.process' },
   });

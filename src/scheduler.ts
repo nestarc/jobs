@@ -1,3 +1,5 @@
+import type { ExecutionBudget } from './execution-budget';
+import { assertIdentifier, assertPositiveInteger } from './enqueue-validation';
 import { JobsError, JobsErrorCode } from './errors';
 
 export interface SchedulerOptions {
@@ -5,6 +7,8 @@ export interface SchedulerOptions {
   minSharePct: number;
   tenantCap: number;
   clock?: () => Date;
+  typeCap?: number;
+  budget?: ExecutionBudget;
 }
 
 export interface SchedulerEnqueueTiming {
@@ -13,7 +17,7 @@ export interface SchedulerEnqueueTiming {
 }
 
 interface Shard {
-  tenantId: string;
+  tenantId: string | undefined;
   waiting: string[];
   deferred: number;
   inflight: number;
@@ -24,27 +28,29 @@ interface Shard {
 
 interface DeferredJob {
   jobId: string;
-  tenantId: string;
+  tenantId: string | undefined;
   dueAt: number;
   sequence: number;
 }
 
 export interface PickedJob {
   jobId: string;
-  tenantId: string;
+  tenantId: string | undefined;
 }
 
 export class Scheduler {
-  private readonly shards = new Map<string, Shard>();
-  private readonly activeJobs = new Map<string, string>();
+  private readonly shards = new Map<string | symbol, Shard>();
+  private readonly activeJobs = new Map<string, string | undefined>();
   private readonly waitingJobs = new Set<string>();
   private readonly deferredJobs = new Map<string, DeferredJob>();
   private readonly deferredHeap: DeferredJob[] = [];
-  private orderedTenants: string[] = [];
+  private orderedTenants: Array<string | undefined> = [];
+  private readonly system = Symbol('system shard');
   private cursor = 0;
   private deferredSequence = 0;
 
   constructor(private readonly opts: SchedulerOptions) {
+    if (opts.typeCap !== undefined) assertPositiveInteger(opts.typeCap, 'concurrency.typeCap');
     if (!Number.isSafeInteger(opts.defaultWeight) || opts.defaultWeight <= 0) {
       throw new JobsError(
         JobsErrorCode.FairnessMisconfig,
@@ -62,7 +68,7 @@ export class Scheduler {
     }
   }
 
-  setWeight(tenantId: string, weight: number): void {
+  setWeight(tenantId: string | undefined, weight: number): void {
     if (!Number.isSafeInteger(weight) || weight < 0) {
       throw new JobsError(
         JobsErrorCode.FairnessMisconfig,
@@ -75,7 +81,7 @@ export class Scheduler {
     shard.creditsLeftInCycle = Math.max(0, weight - creditsConsumed);
   }
 
-  onEnqueue(jobId: string, tenantId: string, timing?: SchedulerEnqueueTiming): void {
+  onEnqueue(jobId: string, tenantId: string | undefined, timing?: SchedulerEnqueueTiming): void {
     if (this.waitingJobs.has(jobId) || this.activeJobs.has(jobId)) return;
     const shard = this.ensureShard(tenantId);
     const now = this.nowMs();
@@ -98,16 +104,18 @@ export class Scheduler {
   }
 
   onAck(jobId: string): void {
+    if (!this.activeJobs.has(jobId)) return;
     const tenantId = this.activeJobs.get(jobId);
-    if (tenantId === undefined) return;
     this.activeJobs.delete(jobId);
+    this.opts.budget?.release(tenantId);
 
-    const shard = this.shards.get(tenantId);
+    const shard = this.shards.get(tenantId ?? this.system);
     if (!shard || shard.inflight === 0) return;
     shard.inflight -= 1;
   }
 
   pickNext(): PickedJob | null {
+    if (this.activeJobs.size >= (this.opts.typeCap ?? Infinity)) return null;
     this.promoteDueJobs();
     if (this.orderedTenants.length === 0) return null;
 
@@ -117,7 +125,7 @@ export class Scheduler {
       for (const lap of [1, 0]) {
         for (let i = 0; i < this.orderedTenants.length; i++) {
           const tenantId = this.orderedTenants[(this.cursor + i) % this.orderedTenants.length];
-          const shard = this.shards.get(tenantId)!;
+          const shard = this.shards.get(tenantId ?? this.system)!;
           if (!this.canPickFromShard(shard, lap)) continue;
           const picked = this.pickFromShard(shard, i);
           if (picked) return picked;
@@ -129,7 +137,7 @@ export class Scheduler {
     return this.pickFromIdleMinShare();
   }
 
-  private markPicked(tenantId: string): void {
+  private markPicked(tenantId: string | undefined): void {
     for (const shard of this.shards.values()) {
       if (shard.tenantId === tenantId) {
         shard.cyclesSincePick = 0;
@@ -140,7 +148,7 @@ export class Scheduler {
   }
 
   snapshot(): Array<{
-    tenantId: string;
+    tenantId: string | undefined;
     waiting: number;
     inflight: number;
     weight: number;
@@ -155,8 +163,14 @@ export class Scheduler {
     }));
   }
 
+  private hasCapacity(shard: Shard): boolean {
+    return (
+      shard.inflight < this.opts.tenantCap && (this.opts.budget?.canAcquire(shard.tenantId) ?? true)
+    );
+  }
+
   private canPickFromShard(shard: Shard, lap: number): boolean {
-    if (shard.inflight >= this.opts.tenantCap) return false;
+    if (!this.hasCapacity(shard)) return false;
     if (shard.waiting.length === 0) return false;
     if (lap === 0) return shard.creditsLeftInCycle > 0;
     const starved = shard.cyclesSincePick >= this.minShareStarvationThreshold();
@@ -168,6 +182,7 @@ export class Scheduler {
     if (jobId === undefined) return null;
     this.waitingJobs.delete(jobId);
     shard.inflight += 1;
+    this.opts.budget?.acquire(shard.tenantId);
     shard.creditsLeftInCycle = Math.max(0, shard.creditsLeftInCycle - 1);
     this.activeJobs.set(jobId, shard.tenantId);
     this.markPicked(shard.tenantId);
@@ -179,8 +194,8 @@ export class Scheduler {
     if (this.opts.minSharePct <= 0) return null;
     for (let i = 0; i < this.orderedTenants.length; i++) {
       const tenantId = this.orderedTenants[(this.cursor + i) % this.orderedTenants.length];
-      const shard = this.shards.get(tenantId)!;
-      if (shard.waiting.length === 0 || shard.inflight >= this.opts.tenantCap) continue;
+      const shard = this.shards.get(tenantId ?? this.system)!;
+      if (shard.waiting.length === 0 || !this.hasCapacity(shard)) continue;
       return this.pickFromShard(shard, i);
     }
     return null;
@@ -191,8 +206,9 @@ export class Scheduler {
     return Math.max(0, Math.floor(1 / this.opts.minSharePct) - 1);
   }
 
-  private ensureShard(tenantId: string): Shard {
-    const existing = this.shards.get(tenantId);
+  private ensureShard(tenantId: string | undefined): Shard {
+    if (tenantId !== undefined) assertIdentifier(tenantId, 'tenantId');
+    const existing = this.shards.get(tenantId ?? this.system);
     if (existing) return existing;
     const shard: Shard = {
       tenantId,
@@ -203,14 +219,14 @@ export class Scheduler {
       creditsLeftInCycle: this.opts.defaultWeight,
       cyclesSincePick: 0,
     };
-    this.shards.set(tenantId, shard);
+    this.shards.set(tenantId ?? this.system, shard);
     this.orderedTenants.push(tenantId);
     return shard;
   }
 
   private resetCreditsForSchedulableShards(): boolean {
     const schedulable = [...this.shards.values()].filter(
-      (s) => s.waiting.length > 0 && s.inflight < this.opts.tenantCap,
+      (s) => s.waiting.length > 0 && this.hasCapacity(s),
     );
     if (schedulable.length === 0) return false;
     if (schedulable.some((s) => s.creditsLeftInCycle > 0)) return false;
@@ -241,7 +257,7 @@ export class Scheduler {
       const deferred = this.popDeferred();
       if (this.deferredJobs.get(deferred.jobId) !== deferred) continue;
       this.deferredJobs.delete(deferred.jobId);
-      const shard = this.shards.get(deferred.tenantId);
+      const shard = this.shards.get(deferred.tenantId ?? this.system);
       if (!shard) continue;
       shard.deferred = Math.max(0, shard.deferred - 1);
       shard.waiting.push(deferred.jobId);

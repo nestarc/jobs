@@ -1,14 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import {
-  Injectable,
-  Module,
-  type OnModuleDestroy,
-  type OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, Module, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Backoffs, Job, Queue } from 'bullmq';
 import {
   BullMQBackend,
+  InMemoryBackend,
+  attachContext,
   createOutboxJobsPublisher,
   HandlerRegistry,
   JobHandler,
@@ -126,6 +123,102 @@ describe('BullMQBackend with Redis', () => {
       }),
     );
     queues.clear();
+  });
+
+  it('rejects invalid input before identity writes through direct and service paths', async () => {
+    const { namespace, jobType } = testIdentity('portable-invalid');
+    const instance = backend(namespace, jobType);
+    const jobs = service(instance, jobType);
+    const invalid = [
+      { attempts: 0 },
+      { attempts: 1.2 },
+      { delayMs: NaN },
+      { delay: -1 },
+      { timeoutMs: Infinity },
+      { scheduledFor: new Date(8640000000000000) },
+      { idempotencyKey: '' },
+      { dedupe: { key: 'k', scope: 'typo' } },
+      { dedupe: { key: 'k', mode: 'typo' } },
+      { dedupe: { key: 'k', ttlMs: Infinity } },
+      { backoff: { type: 'typo', delayMs: 0 } },
+    ];
+    for (const options of invalid) {
+      const opts = { jobId: 'reusable', idempotencyKey: 'reusable-key', ...options } as never;
+      await expect(jobs.enqueue(jobType, {}, opts)).rejects.toMatchObject({
+        code: 'jobs_invalid_input',
+      });
+      await expect(instance.enqueue(jobType, {}, opts)).rejects.toMatchObject({
+        code: 'jobs_invalid_input',
+      });
+    }
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    for (const value of [
+      1n,
+      Symbol('x'),
+      () => 1,
+      new Map(),
+      new Set(),
+      new Date(NaN),
+      cycle,
+      { text: 'x'.repeat(1048577) },
+    ]) {
+      for (const envelope of [{ nested: value }, { __nestarcCtx: { nested: value } }]) {
+        await expect(
+          instance.enqueue(jobType, envelope, {
+            jobId: 'reusable',
+            idempotencyKey: 'reusable-key',
+          }),
+        ).rejects.toMatchObject({ code: 'jobs_serialization_invalid' });
+      }
+      await expect(
+        jobs.enqueue(jobType, {}, { metadata: { nested: value } }),
+      ).rejects.toMatchObject({ code: 'jobs_serialization_invalid' });
+    }
+    expect(await instance.getRawQueue<Queue>(jobType).getJobCounts()).toMatchObject({
+      waiting: 0,
+      delayed: 0,
+      active: 0,
+    });
+    expect(
+      await jobs.enqueueDetailed(
+        jobType,
+        {},
+        { jobId: 'reusable', idempotencyKey: 'reusable-key' },
+      ),
+    ).toMatchObject({ status: 'created', jobId: 'reusable' });
+  });
+
+  it('delivers the same normalized recursive values as in-memory after backend restart', async () => {
+    const { namespace, jobType } = testIdentity('portable-valid');
+    const first = backend(namespace, jobType);
+    const memory = new InMemoryBackend();
+    const date = new Date('2026-01-01T00:00:00Z');
+    const payload = { nested: { date, list: [undefined, null, { value: 1 }], omitted: undefined } };
+    const context = { tenantId: '__default__', date };
+    const opts = { metadata: { date, nested: { value: 1 } } };
+    const memoryId = await memory.enqueue(jobType, attachContext(payload, context), opts);
+    const redisId = await first.enqueue(jobType, attachContext(payload, context), opts);
+    const expected = await memory.getJob(memoryId);
+    payload.nested.list[2] = { value: 99 };
+    opts.metadata.nested.value = 99;
+    await first.close();
+    const restarted = backend(namespace, jobType);
+    expect(await restarted.getJob(redisId)).toMatchObject({
+      payload: expected?.payload,
+      context: expected?.context,
+      metadata: expected?.metadata,
+    });
+    const registry = new HandlerRegistry();
+    const calls: unknown[] = [];
+    registry.register(jobType, async (value, ctx) => {
+      calls.push({ payload: value, context: ctx });
+    });
+    restarted.startConsumer([jobType], { registry, contextRunner: async (_ctx, fn) => fn() });
+    await waitFor(async () => (await restarted.getJob(redisId))?.status === 'succeeded');
+    expect(calls).toEqual([{ payload: expected?.payload, context: expected?.context }]);
+    await memory.markCancelled(jobType, memoryId);
+    await memory.close();
   });
 
   it('rejects dotted namespaces without changing dotted job-type queue names', () => {

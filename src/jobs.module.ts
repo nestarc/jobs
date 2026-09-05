@@ -1,3 +1,4 @@
+import { ExecutionBudget } from './execution-budget';
 import {
   DynamicModule,
   Inject,
@@ -10,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { createRequire } from 'node:module';
 import { DiscoveryModule, DiscoveryService, MetadataScanner } from '@nestjs/core';
+import { assertJobConfiguration, assertPositiveInteger, invalidInput } from './enqueue-validation';
 import { JobsService } from './jobs.service';
 import { HandlerRegistry } from './handler-registry';
 import { Scheduler, SchedulerOptions } from './scheduler';
@@ -28,6 +30,7 @@ import { JobsError, JobsErrorCode, JobsShutdownError } from './errors';
 export const JOBS_BACKEND = Symbol('JOBS_BACKEND');
 export const JOBS_WORKERS = Symbol('JOBS_WORKERS');
 const BULLMQ_CONSUMER_CONFIG = Symbol('BULLMQ_CONSUMER_CONFIG');
+const IN_MEMORY_POOL_SIZE = Symbol('IN_MEMORY_POOL_SIZE');
 const IN_MEMORY_SHUTDOWN_TIMEOUT = Symbol('IN_MEMORY_SHUTDOWN_TIMEOUT');
 
 const IN_MEMORY_WORKER_IDLE_MS = 10;
@@ -57,11 +60,13 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
   private running = false;
   private loop: Promise<void> | null = null;
   private draining: Promise<void> | null = null;
+  private cursor = 0;
   private loopFailure: { error: unknown } | null = null;
 
   constructor(
     @Inject(JOBS_WORKERS) private readonly workers: FairWorker[],
     @Inject(JOBS_BACKEND) private readonly backend: InMemoryBackend,
+    @Inject(IN_MEMORY_POOL_SIZE) private readonly poolSize: number,
     @Inject(IN_MEMORY_SHUTDOWN_TIMEOUT) private readonly shutdownTimeoutMs: number,
     private readonly handlerDiscovery: HandlerDiscovery,
     discovery: DiscoveryService,
@@ -116,18 +121,16 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
   private async drain(): Promise<void> {
     try {
       await this.loop;
-      if (this.loopFailure) throw this.loopFailure.error;
-      await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
-      while (this.backend.pendingJobIds().length) {
-        let anyPicked = false;
-        for (const worker of this.workers) {
-          if (await worker.tick()) anyPicked = true;
+      while (this.remainingJobIds().length) {
+        if (this.loopFailure) {
+          await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
+          throw this.loopFailure.error;
         }
-        // Let deadline timers run even when handlers settle and retry immediately.
-        if (this.backend.pendingJobIds().length) {
-          await sleep(anyPicked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
-        }
+        const picked = this.dispatch();
+        // Yield even under an immediate retry backlog so deadlines can run.
+        await sleep(picked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
       }
+      if (this.loopFailure) throw this.loopFailure.error;
       await Promise.all(this.workers.map((worker) => worker.waitForIdle()));
       await this.backend.close();
     } catch (error) {
@@ -135,16 +138,34 @@ class InMemoryWorkersHost implements OnApplicationBootstrap, OnModuleDestroy {
     }
   }
 
+  private dispatch(): boolean {
+    let picked = false;
+    // A synchronous tick reserves scheduler capacity before its first await.
+    // Rotate types per dispatch to avoid a busy type monopolizing newly free slots.
+    for (let slot = 0; slot < this.poolSize; slot++) {
+      let roundPicked = false;
+      for (let checked = 0; checked < this.workers.length; checked++) {
+        const worker = this.workers[this.cursor];
+        this.cursor = (this.cursor + 1) % this.workers.length;
+        const before = worker.outstandingJobIds().length;
+        void worker.tick().catch((error) => {
+          this.loopFailure ??= { error };
+          this.running = false;
+        });
+        if (worker.outstandingJobIds().length > before) {
+          roundPicked = picked = true;
+          break;
+        }
+      }
+      if (!roundPicked) break;
+    }
+    return picked;
+  }
+
   private async run(): Promise<void> {
     while (this.running) {
-      let anyPicked = false;
-      for (const worker of this.workers) {
-        if (!this.running) break;
-        if (await worker.tick()) anyPicked = true;
-      }
-      if (!anyPicked) {
-        await sleep(IN_MEMORY_WORKER_IDLE_MS);
-      }
+      const picked = this.dispatch();
+      await sleep(picked ? 0 : IN_MEMORY_WORKER_IDLE_MS);
     }
   }
 }
@@ -207,7 +228,8 @@ export interface InMemoryOptions {
   global?: boolean;
   strictCapabilities?: boolean;
   events?: JobEventsOptions;
-  concurrency?: { tenantCap?: number };
+  /** Local module-wide invocation limits. Defaults: pool 10, tenant 10, type = pool. */
+  concurrency?: { poolSize?: number; tenantCap?: number; typeCap?: number };
   fairness?: { minSharePct?: number; defaultWeight?: number };
   contextExtractor?: () => JobContext;
   contextRunner?: (ctx: JobContext, fn: () => Promise<unknown>) => Promise<unknown>;
@@ -337,18 +359,40 @@ function assertJobDefaultsSupported(
 @Module({})
 export class JobsModule {
   static forInMemory(options: InMemoryOptions): DynamicModule {
-    const shutdownTimeoutMs = options.shutdown?.timeoutMs ?? 30_000;
+    assertJobConfiguration(options.jobTypes, options.jobs);
+    for (const field of ['concurrency', 'shutdown', 'fairness'] as const) {
+      const value = options[field];
+      if (
+        value !== undefined &&
+        (typeof value !== 'object' || value === null || Array.isArray(value))
+      )
+        invalidInput(`${field} must be an object`);
+    }
+    const shutdownTimeoutMs =
+      options.shutdown?.timeoutMs === undefined ? 30_000 : options.shutdown.timeoutMs;
     if (
       !Number.isSafeInteger(shutdownTimeoutMs) ||
       shutdownTimeoutMs <= 0 ||
       shutdownTimeoutMs > 2_147_483_647
     ) {
-      throw new RangeError('shutdown.timeoutMs must be a positive timer-safe integer');
+      invalidInput('shutdown.timeoutMs must be a positive timer-safe integer');
     }
+    for (const field of ['poolSize', 'tenantCap', 'typeCap'] as const) {
+      if (options.concurrency?.[field] !== undefined)
+        assertPositiveInteger(options.concurrency[field], `concurrency.${field}`);
+    }
+    const poolSize = options.concurrency?.poolSize ?? 10;
+    const tenantCap = options.concurrency?.tenantCap ?? 10;
+    const typeCap = options.concurrency?.typeCap ?? poolSize;
+    const budget = new ExecutionBudget(poolSize, tenantCap);
+    assertPositiveInteger(typeCap, 'concurrency.typeCap');
     const schedOpts: SchedulerOptions = {
-      defaultWeight: options.fairness?.defaultWeight ?? 1,
-      minSharePct: options.fairness?.minSharePct ?? 0.1,
-      tenantCap: options.concurrency?.tenantCap ?? 10,
+      budget,
+      typeCap,
+      defaultWeight:
+        options.fairness?.defaultWeight === undefined ? 1 : options.fairness.defaultWeight,
+      minSharePct: options.fairness?.minSharePct === undefined ? 0.1 : options.fairness.minSharePct,
+      tenantCap,
     };
     const backend = new InMemoryBackend();
     if (options.strictCapabilities) {
@@ -357,6 +401,7 @@ export class JobsModule {
     const runner = options.contextRunner ?? defaultContextRunner;
 
     const providers: Provider[] = [
+      { provide: IN_MEMORY_POOL_SIZE, useValue: poolSize },
       { provide: IN_MEMORY_SHUTDOWN_TIMEOUT, useValue: shutdownTimeoutMs },
       { provide: JOBS_BACKEND, useValue: backend },
       HandlerRegistry,
@@ -414,6 +459,7 @@ export class JobsModule {
   }
 
   static forBullMQ(options: BullMQOptions): DynamicModule {
+    assertJobConfiguration(options.jobTypes, options.jobs);
     const runner = options.contextRunner ?? defaultContextRunner;
     if (options.strictCapabilities) {
       assertJobDefaultsSupported(options.backend, options.jobs, options.jobTypes);
