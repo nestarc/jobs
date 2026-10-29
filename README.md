@@ -15,7 +15,7 @@ This package provides:
 
 ## Status
 
-Published package version: `0.3.1`. This source checkout contains the unreleased `0.4.0` maintenance candidate; manifest versioning and publication are gated separately.
+Version **0.4.1 is published**. This patch corrects the packaged documentation for the worker, validation, and activation contracts introduced in 0.4.0. Check the installed artifact's `package.json` or run `npm ls @nestarc/jobs` to identify your version. Source changes listed under [Unreleased](CHANGELOG.md#unreleased) are not part of an existing npm release.
 
 ### Backend matrix
 
@@ -42,24 +42,26 @@ Published package version: `0.3.1`. This source checkout contains the unreleased
 Core package:
 
 ```bash
-npm install @nestarc/jobs
+npm install @nestarc/jobs@0.4.1
 ```
 
 If you use the BullMQ backend, install BullMQ too:
 
 ```bash
-npm install bullmq
+npm install bullmq@^5.76.2
 ```
 
 If you use the first-party outbox publisher, install the matching outbox package:
 
 ```bash
-npm install @nestarc/outbox
+npm install @nestarc/outbox@0.3.0
 ```
+
+Jobs 0.4.1 accepts Outbox `^0.2.1 || ^0.3.0`. Outbox 0.4.0 is outside that peer range; use the pinned bridge version rather than the unversioned latest package.
 
 Peer expectations:
 
-- Node.js `22` or `24` for the 0.4 candidate (Node 20 support ends with the 0.3 line)
+- Node.js `22` or `24` since 0.4.0 (Node 20 support ends with the 0.3 line)
 - NestJS `^10` or `^11`
 - BullMQ `^5.76.2` when using `forBullMQ()`
 - Optional `@nestarc/outbox ^0.2.1 || ^0.3.0` when using `createOutboxJobsPublisher()`; exact 0.2.1 and 0.3.0 consumer gates
@@ -83,9 +85,9 @@ OUTBOX_PACKAGE=/absolute/path/nestarc-outbox-0.2.1.tgz \
 The gate refuses npm force/legacy peer bypasses, installs exact NestJS `11.2.1` and Prisma
 `7.10.0`, compiles against the real Outbox transport types with `skipLibCheck` disabled, and runs
 an Outbox-to-Jobs enqueue smoke test. CI can run the same gate through the `modern_outbox_package`
-manual workflow input once the artifact is reachable from the runner. Normal CI detects and starts
-requiring exact `@nestarc/outbox@0.2.1` as soon as that release is published; Jobs releases require
-it unconditionally.
+manual workflow input once the artifact is reachable from the runner. Normal CI checks availability
+of the published `@nestarc/outbox@0.2.1` anchor and runs its exact consumer lane; Jobs releases require
+that lane unconditionally.
 
 ## Choose a backend
 
@@ -112,7 +114,7 @@ If drain exceeds its deadline, `app.close()` rejects with `JobsShutdownError`
 available while drain continues in the background. A later `app.close()` joins the
 same drain with a new deadline. Backend resources close exactly once after all
 accepted work and outstanding handler invocations finish. Successful close releases
-in-memory records and history. This is a pre-1.0 minor behavior change, planned for
+in-memory records and history. This pre-1.0 minor behavior change was introduced in
 0.4.0; it does not add crash durability.
 
 A handler that ignores `ctx.signal` retains its slot until its actual promise
@@ -490,7 +492,7 @@ For lower-level inspection:
 const snapshot = jobs.scheduler('sendReport').snapshot();
 ```
 
-### Enqueue validation and portable values (planned 0.4.0)
+### Enqueue validation and portable values (since 0.4.0)
 
 `JobsService`, effective job defaults, and direct InMemory/BullMQ enqueue calls
 validate before storing jobs or reserving identities. Invalid options/configuration
@@ -758,7 +760,7 @@ The npm trusted publisher is configured for:
 
 MIT
 
-### Custom backend activation contract (planned 0.4.0)
+### Custom backend activation contract (since 0.4.0)
 
 `FairWorker` requires `capabilities().activationFencing === true`. A custom backend
 must generate a fresh, opaque `activationId` on every successful `moveToActive`,
@@ -785,8 +787,8 @@ contract and does not use these manual completion APIs.
 Duplicate and opposite terminal completions both conflict. Only explicit dead-letter
 administration can leave a terminal state; a same-ID replay creates a new activation
 and preserves monotonic attempt history. The public backend signature, lifecycle
-event union, same-ID replay accounting, and shutdown defaults require a 0.4.0 minor
-release. The package version is advanced by the separate release task.
+event union, same-ID replay accounting, and shutdown defaults changed in 0.4.0.
+Update custom backends to this contract before upgrading from the 0.3 line.
 
 
 ## Additional 0.4 maintenance contracts
@@ -853,7 +855,7 @@ A mismatched or missing ID returns null. Never accept the caller's tenant string
 The 0.2.1 modern Outbox anchor is fixed. The separate candidate runner accepts a JSON manifest with `package`, exact `version` and expected SHA-512 `integrity`:
 
 ```sh
-JOBS_TARBALL=/absolute/path/nestarc-jobs-0.3.1.tgz \
+JOBS_TARBALL=/absolute/path/nestarc-jobs-0.4.1.tgz \
   node scripts/test-outbox-candidate-consumer.js /absolute/path/outbox-candidate.json
 ```
 
