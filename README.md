@@ -749,13 +749,6 @@ The npm trusted publisher is configured for:
 - Environment: `npm`
 - Allowed action: `npm publish`
 
-## Docs
-
-- [Historical v0.1 PRD](docs/prd.md)
-- [Historical v0.1 technical spec](docs/spec.md)
-- [Historical v0.2.0 draft proposal](docs/spec-v0.2.md)
-- [v0.3.0 stabilization contract](docs/spec-v0.3.md)
-
 ## License
 
 MIT
@@ -820,7 +813,7 @@ retention: {
 
 Choose the horizon from the longest Outbox retry plus manual recovery window. It is a safety floor; cleanup never shortens it to meet a count target. Stop all producer processes and administrative retry/replay writers, wait for workers to become idle, then call `await backend.pruneTerminal({ producersStopped: true })` until it returns zero. The boolean is the operator's assertion about other processes. BullMQ pauses registered queues and restores their previous pause states; register every relevant job type first. Cleanup removes expired terminal payload/context/metadata/history and matching identities, preserving mappings rebound to live replay jobs. If cleanup fails, keep writers stopped and retry. Never combine this with raw BullMQ auto-removal.
 
-Cleanup cadence and incoming traffic determine the retained volume; a burst can exceed available memory even with an age policy. Operators own backlog alerts, PII minimization, external audit archives, backups and old legacy reservation migration. Resubmission after expiration can execute again. See [security policy](SECURITY.md) and [retention decision](docs/adr/2026-09-05-maintenance-decisions.md).
+Cleanup cadence and incoming traffic determine the retained volume; a burst can exceed available memory even with an age policy. Operators own backlog alerts, PII minimization, external audit archives, backups and old legacy reservation migration. Resubmission after expiration can execute again. See [security policy](SECURITY.md).
 
 ### Outbox state and shutdown ownership
 

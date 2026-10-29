@@ -12,4 +12,4 @@ Payload/context/metadata have recursive validation and size/depth budgets. These
 
 Records and identities persist by default. Opt-in retention requires a recovery horizon covering Outbox retries plus operator recovery. Run cleanup only after stopping all producers and administrative writers; the backend pauses its registered BullMQ queues and refuses active workers. Continue batch cleanup until it returns zero, and restore producers only after successful completion. Configure cadence and monitor backlog/PII age. Native BullMQ auto-removal or manual key deletion bypasses identity safety and must not be enabled alongside Jobs.
 
-The library's production audit and consumers' optional-peer audits are separate. The Nest 10 compatibility fixture currently has dev-only advisory exposure; use patched Nest 11 for new deployments. See [maintenance decisions](docs/adr/2026-09-05-maintenance-decisions.md) for the exact tested tuple and temporary exceptions.
+The library's production audit and consumers' optional-peer audits are separate. The Nest 10 compatibility fixture currently has dev-only advisory exposure; use patched Nest 11 for new deployments.

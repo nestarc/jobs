@@ -291,13 +291,10 @@ jobs:
             'CHANGELOG.md',
             'SECURITY.md',
             'LICENSE',
-            'docs/prd.md',
-            'docs/spec.md',
-            'docs/spec-v0.2.md',
-            'docs/spec-v0.3.md',
           ]) {
             assert.equal(fs.existsSync(path.join(packageDir, relativePath)), true, relativePath);
           }
+          assert.equal(fs.existsSync(path.join(packageDir, 'docs')), false, 'internal docs must not be published');
 
           const api = require('@nestarc/jobs');
           assert.equal(typeof api.JobsModule?.forInMemory, 'function');
