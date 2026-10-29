@@ -21,11 +21,11 @@ function validateArtifact(file, sourceManifest, changelog, tag) {
   const bytes = fs.readFileSync(file);
   assert(bytes.length > 0 && bytes.length <= 1024 * 1024, 'tarball exceeds 1 MiB package budget');
   const entries = execFileSync('tar', ['-tf', file], { encoding: 'utf8' }).trim().split(/\r?\n/);
-  const allowed = /^(package\/(package\.json|README\.md|CHANGELOG\.md|SECURITY\.md|LICENSE|docs\/(prd|spec|spec-v0\.[23])\.md)|package\/dist\/[a-zA-Z0-9_./-]+\.(js|d\.ts))$/;
+  const allowed = /^(package\/(package\.json|README\.md|CHANGELOG\.md|SECURITY\.md|LICENSE)|package\/dist\/[a-zA-Z0-9_./-]+\.(js|d\.ts))$/;
   for (const entry of entries) assert(allowed.test(entry) && !entry.includes('..'), `unexpected packed path: ${entry}`);
   const details = execFileSync('tar', ['-tvf', file], { encoding: 'utf8' }).trim().split(/\r?\n/);
   assert(details.every((entry) => entry.startsWith('-')), 'only regular files are allowed in the artifact');
-  for (const required of ['README.md', 'CHANGELOG.md', 'SECURITY.md', 'LICENSE', 'docs/prd.md', 'docs/spec.md', 'docs/spec-v0.2.md', 'docs/spec-v0.3.md']) assert(entries.includes(`package/${required}`), `missing packed file: ${required}`);
+  for (const required of ['README.md', 'CHANGELOG.md', 'SECURITY.md', 'LICENSE']) assert(entries.includes(`package/${required}`), `missing packed file: ${required}`);
   const manifest = JSON.parse(execFileSync('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' }));
   assert.equal(manifest.name, '@nestarc/jobs');
   assert.deepEqual(manifest, sourceManifest, 'packed/source manifest mismatch');

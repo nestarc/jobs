@@ -6,13 +6,14 @@ const tags = { id: 2, target: 'tag', enforcement: 'active', conditions: { ref_na
 const main = { id: 1, target: 'branch', enforcement: 'active', bypass_actors: [] };
 const environment = { deployment_branch_policy: { custom_branch_policies: true } };
 const rules = [
-  { type: 'pull_request' }, { type: 'non_fast_forward' }, { type: 'deletion' },
+  { type: 'non_fast_forward' }, { type: 'deletion' },
   { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: requiredChecks.map(context => ({ context, integration_id: 15368 })) } },
 ].map(rule => ({ ...rule, ruleset_id: main.id }));
 const verify = (effective = rules, details = [main, tags]) => verifyRepositoryPolicy({ protected: true }, details, environment, effective);
 
-test('complete effective main rules permit a release without requiring a second reviewer', () => {
+test('complete effective main rules permit a release with or without a pull request rule', () => {
   assert.doesNotThrow(() => verify());
+  assert.doesNotThrow(() => verify([...rules, { type: 'pull_request', ruleset_id: main.id }]));
 });
 test('original partial protection and a protected flag alone do not authorize release', () => {
   for (const branch of [{ protected: true }, { protected: true, protection: { required_pull_request_reviews: null, required_status_checks: null, allow_force_pushes: { enabled: true }, allow_deletions: { enabled: true } } }]) {
@@ -20,17 +21,18 @@ test('original partial protection and a protected flag alone do not authorize re
   }
 });
 test('every mandatory main rule and exact required CI check must be enforced', () => {
-  for (const type of ['pull_request', 'non_fast_forward', 'deletion', 'required_status_checks']) assert.throws(() => verify(rules.filter(rule => rule.type !== type)));
+  for (const type of ['non_fast_forward', 'deletion', 'required_status_checks']) assert.throws(() => verify(rules.filter(rule => rule.type !== type)));
   for (const context of requiredChecks) {
     const incomplete = structuredClone(rules);
-    incomplete[3].parameters.required_status_checks = incomplete[3].parameters.required_status_checks.filter(check => check.context !== context);
+    const checks = incomplete.find(rule => rule.type === 'required_status_checks');
+    checks.parameters.required_status_checks = checks.parameters.required_status_checks.filter(check => check.context !== context);
     assert.throws(() => verify(incomplete), /required CI check/);
   }
   for (const change of [
     rule => { rule.parameters.strict_required_status_checks_policy = false; },
     rule => { rule.parameters.required_status_checks[0].integration_id = null; },
   ]) {
-    const incomplete = structuredClone(rules); change(incomplete[3]); assert.throws(() => verify(incomplete));
+    const incomplete = structuredClone(rules); change(incomplete.find(rule => rule.type === 'required_status_checks')); assert.throws(() => verify(incomplete));
   }
 });
 test('disabled, unrelated, bypassable and hidden main rules cannot supply protection', () => {
@@ -47,6 +49,11 @@ test('immutable tag protection must include explicit no-bypass evidence', () => 
     { enforcement: 'evaluate' }, { rules: [{ type: 'update' }] },
     { conditions: { ref_name: { include: ['refs/tags/v*'], exclude: ['refs/tags/v0.*'] } } },
   ]) assert.throws(() => verify(rules, [main, { ...tags, ...change }]), /immutable/);
+});
+
+test('branch protection and npm environment restrictions remain mandatory without a pull request rule', () => {
+  assert.throws(() => verifyRepositoryPolicy({ protected: false }, [main, tags], environment, rules), /main must be protected/);
+  assert.throws(() => verifyRepositoryPolicy({ protected: true }, [main, tags], { deployment_branch_policy: { custom_branch_policies: false } }, rules), /npm environment must restrict/);
 });
 
 test('read-only REST omissions require complete GraphQL evidence, never an assumed empty list', () => {
