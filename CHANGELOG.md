@@ -2,9 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-This project is currently pre-release. The changelog below starts from the current documented package state and does not attempt to reconstruct every earlier intermediate commit.
+This project is currently pre-1.0. The changelog below starts from the current documented package state and does not attempt to reconstruct every earlier intermediate commit.
 
 ## [Unreleased]
+
+## [0.4.1] - 2026-10-29
+
+### Fixed
+
+- Correct the packaged README's stale 0.3.1 publication status and planned-0.4.0 wording; document the runtime contracts introduced in 0.4.0 and compatible BullMQ/Outbox installation examples. No runtime behavior or peer dependency ranges change in this patch.
+- Update the packaged security policy to identify the maintained 0.4 line and GitHub private vulnerability reporting channel.
 
 ## [0.4.0] - 2026-09-05
 

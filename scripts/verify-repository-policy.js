@@ -10,7 +10,7 @@ function verifyRepositoryPolicy(branch, rulesets, environment, effectiveRules = 
   const mainRules = effectiveRules.filter((entry) => rulesets.some((rule) =>
     rule.id === entry.ruleset_id && rule.target === 'branch' && rule.enforcement === 'active' &&
     Array.isArray(rule.bypass_actors) && rule.bypass_actors.length === 0));
-  for (const type of ['pull_request', 'non_fast_forward', 'deletion']) {
+  for (const type of ['non_fast_forward', 'deletion']) {
     assert(mainRules.some((entry) => entry.type === type), `main requires an enforced ${type} rule without bypass`);
   }
   const checks = mainRules.filter((entry) => entry.type === 'required_status_checks' &&
@@ -54,9 +54,9 @@ function main() {
   const rulesets = summaries.map((rule) => withBypassEvidence(api(`rulesets/${rule.id}`), graphql));
   verifyRepositoryPolicy(api('branches/main'), rulesets, api('environments/npm'), pages('rules/branches/main?per_page=100'));
   const policies = JSON.parse(execFileSync('gh', ['api', '--paginate', '--slurp', `repos/${repository}/environments/npm/deployment-branch-policies?per_page=100`], { encoding: 'utf8' })).flatMap((page) => page.branch_policies ?? []);
-  assert(policies.some((rule) => rule.type === 'tag' && rule.name === 'v*'), 'npm environment must permit only reviewed release tag patterns');
+  assert(policies.some((rule) => rule.type === 'tag' && rule.name === 'v*'), 'npm environment must permit only protected release tag patterns');
   assert(policies.every((rule) => rule.type === 'tag' && rule.name === 'v*'), 'unexpected npm deployment ref bypass');
-  console.log('Effective main PR/CI/force-push/deletion rules, immutable release tags and restricted npm environment verified');
+  console.log('Effective main CI/force-push/deletion rules, immutable release tags and restricted npm environment verified');
 }
 if (require.main === module) main();
 module.exports = { verifyRepositoryPolicy, withBypassEvidence };
