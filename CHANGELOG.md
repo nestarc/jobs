@@ -6,6 +6,13 @@ This project is currently pre-1.0. The changelog below starts from the current d
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-31
+
+- Wait for npm metadata and tarball visibility before post-publish verification, with bounded retries for missing versions and unchanged integrity/provenance requirements. Authentication and network failures remain fatal.
+- Add optional Outbox `^0.4.0` compatibility while retaining `^0.2.1 || ^0.3.0`.
+- Verify packed consumers against exact Outbox 0.2.1, 0.3.0 and 0.4.1, with 0.4.0 delivery/recovery also verified locally. Add PostgreSQL/Redis consumer tests for transactional rollback, process loss after enqueue, retry deduplication, tenant isolation and correlation/causation.
+- Document the coordinated Outbox stop-before-Jobs-close sequence. The PostgreSQL/Redis gate requires the published Outbox 0.4.1 `OutboxPoller.stop()` API and verifies active drain, timeout/retry and restart without consuming retry budget.
+
 ## [0.4.1] - 2026-10-29
 
 ### Fixed

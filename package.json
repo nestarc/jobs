@@ -1,6 +1,6 @@
 {
   "name": "@nestarc/jobs",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Typed, tenant-aware NestJS jobs with deterministic in-memory fairness, BullMQ durability, and outbox integration.",
   "license": "MIT",
   "author": "nestarc",
@@ -29,6 +29,7 @@
     "test:redis": "jest --config jest.redis.config.ts --runInBand --detectOpenHandles",
     "test:coverage": "jest --config jest.coverage.config.ts --runInBand",
     "test:consumer:modern": "node scripts/test-modern-outbox-consumer.js",
+    "test:integration:outbox": "node scripts/test-outbox-integration.js",
     "test:watch": "jest --watch",
     "bench": "ts-node bench/jobs.bench.ts",
     "lint": "eslint src test --ext .ts",
@@ -41,7 +42,7 @@
     "test:chaos": "npm run build && node scripts/test-redis-chaos.js"
   },
   "peerDependencies": {
-    "@nestarc/outbox": "^0.2.1 || ^0.3.0",
+    "@nestarc/outbox": "^0.2.1 || ^0.3.0 || ^0.4.0",
     "@nestjs/common": "^10.0.0 || ^11.0.0",
     "@nestjs/core": "^10.0.0 || ^11.0.0",
     "bullmq": "^5.76.2",

@@ -13,13 +13,16 @@ if (process.env.JOBS_TARBALL_DIR) {
   process.env.JOBS_TARBALL = path.join(process.env.JOBS_TARBALL_DIR, files[0]);
 }
 const fixturePath = path.join(projectRoot, 'test', 'consumer', 'modern-outbox.ts');
+const integration = process.env.OUTBOX_INTEGRATION === 'true';
+const nestVersion = process.env.CONSUMER_NEST_VERSION ?? '11.2.1';
+if (!['10.4.22', '11.2.1'].includes(nestVersion)) throw new Error('unsupported exact Nest consumer tuple');
 const expectedOutboxVersion = process.env.OUTBOX_EXPECTED_VERSION ?? '0.2.1';
 if (!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(expectedOutboxVersion)) throw new Error('exact expected Outbox version required');
 const exactVersions = Object.freeze({
-  '@nestjs/common': '11.2.1',
-  '@nestjs/core': '11.2.1',
-  '@nestjs/schedule': '5.0.1',
-  '@nestjs/testing': '11.2.1',
+  '@nestjs/common': nestVersion,
+  '@nestjs/core': nestVersion,
+  '@nestjs/schedule': nestVersion.startsWith('10.') ? '4.1.2' : '5.0.1',
+  '@nestjs/testing': nestVersion,
   '@prisma/adapter-pg': '7.10.0',
   '@prisma/client': '7.10.0',
   '@types/node': '20.19.39',
@@ -28,6 +31,7 @@ const exactVersions = Object.freeze({
   'reflect-metadata': '0.2.2',
   rxjs: '7.8.2',
   typescript: '5.9.3',
+  ...(integration ? { bullmq: '5.81.5', '@types/pg': '8.20.0' } : {}),
 });
 
 function run(command, args, options = {}) {
@@ -184,6 +188,19 @@ function main() {
       )}\n`,
     );
     fs.copyFileSync(fixturePath, path.join(consumerDir, 'index.ts'));
+    if (integration) {
+      fs.copyFileSync(path.join(projectRoot, 'test/consumer/outbox-runtime.ts'), path.join(consumerDir, 'runtime.ts'));
+      fs.mkdirSync(path.join(consumerDir, 'prisma'));
+      fs.writeFileSync(path.join(consumerDir, 'prisma/schema.prisma'), `
+generator client {
+  provider = "prisma-client-js"
+  output = "../generated/client"
+}
+datasource db {
+  provider = "postgresql"
+}
+`);
+    }
 
     run(
       'npm',
@@ -245,8 +262,8 @@ function main() {
     if (jobsManifest.name !== '@nestarc/jobs') {
       throw new Error(`Packed Jobs artifact has unexpected name ${jobsManifest.name}`);
     }
-    if (jobsManifest.peerDependencies?.['@nestarc/outbox'] !== '^0.2.1 || ^0.3.0') {
-      throw new Error('Packed Jobs artifact no longer declares the verified Outbox ^0.2.1 || ^0.3.0 range');
+    if (jobsManifest.peerDependencies?.['@nestarc/outbox'] !== '^0.2.1 || ^0.3.0 || ^0.4.0') {
+      throw new Error('Packed Jobs artifact no longer declares the verified Outbox ^0.2.1 || ^0.3.0 || ^0.4.0 range');
     }
     if (outboxManifest.name !== '@nestarc/outbox') {
       throw new Error(`Outbox artifact has unexpected name ${outboxManifest.name}`);
@@ -294,6 +311,7 @@ function main() {
       throw new Error('Outbox artifact is missing lockfile integrity');
     }
 
+    if (integration) run('npx', ['--no-install', 'prisma', 'generate', '--schema', 'prisma/schema.prisma'], { cwd: consumerDir });
     run(
       'npx',
       [
@@ -313,10 +331,15 @@ function main() {
         '--outDir',
         'dist',
         'index.ts',
+        ...(integration ? ['runtime.ts'] : []),
       ],
       { cwd: consumerDir },
     );
     run(process.execPath, [path.join('dist', 'index.js')], { cwd: consumerDir });
+    if (integration) {
+      fs.cpSync(path.join(consumerDir, 'generated'), path.join(consumerDir, 'dist/generated'), { recursive: true });
+      run(process.execPath, [path.join('dist', 'runtime.js')], { cwd: consumerDir });
+    }
 
     console.log(
       JSON.stringify(

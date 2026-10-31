@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const yaml = require('js-yaml');
-const { digest, verifyIntegrity, registryManifest, verifyProvenance } = require('../lib/release-artifact');
+const { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, publishedTarballAvailable, verifyProvenance } = require('../lib/release-artifact');
 test('registry rerun requires identical bytes and rejects transport/auth failures', () => {
   const candidate = Buffer.from('candidate');
   assert.doesNotThrow(() => verifyIntegrity(candidate, { dist: { integrity: digest(candidate) } }));
@@ -38,4 +38,75 @@ test('coverage builds the separate Redis producer fixture before running it', ()
   const steps = verify.jobs.coverage.steps.map((step) => step.run);
   assert(steps.indexOf('npm run build') >= 0);
   assert(steps.indexOf('npm run build') < steps.indexOf('npm run test:coverage'));
+});
+
+
+test('post-publish verification waits for registry visibility then enforces the same bytes', async () => {
+  const bytes = Buffer.from('published candidate');
+  const published = { dist: { integrity: digest(bytes) } };
+  let calls = 0;
+  const waits = [];
+  const result = await waitForRegistryManifest('@nestarc/jobs@0.4.2', {
+    lookup: (spec) => {
+      assert.equal(spec, '@nestarc/jobs@0.4.2');
+      return ++calls === 3 ? published : null;
+    },
+    sleep: async (ms) => { waits.push(ms); }, attempts: 4, intervalMs: 10,
+  });
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [10, 10]);
+  verifyIntegrity(bytes, result);
+  assert.throws(() => verifyIntegrity(Buffer.from('different candidate'), result));
+});
+
+test('a permanently absent publication fails after the bounded polling window', async () => {
+  let calls = 0;
+  let waits = 0;
+  await assert.rejects(waitForRegistryManifest('missing', {
+    lookup: () => { calls++; return null; },
+    sleep: async () => { waits++; }, attempts: 3,
+  }), /published artifact missing after 3 registry checks/);
+  assert.equal(calls, 3);
+  assert.equal(waits, 2);
+});
+
+test('post-publish polling never retries authentication or network failures', async () => {
+  for (const code of ['E401', 'E403', 'ETIMEDOUT']) {
+    let waits = 0;
+    await assert.rejects(waitForRegistryManifest('failed', {
+      lookup: (spec) => registryManifest(spec, () => ({
+        status: 1, stdout: JSON.stringify({ error: { code } }),
+      })),
+      sleep: async () => { waits++; }, attempts: 3,
+    }), /registry lookup failed/);
+    assert.equal(waits, 0);
+  }
+});
+
+
+test('publication waits for tarball visibility even when metadata is already visible', async () => {
+  const bytes = Buffer.from('candidate');
+  const published = { dist: { integrity: digest(bytes), tarball: 'https://registry.npmjs.org/@nestarc/jobs/-/jobs-0.4.2.tgz' } };
+  let requests = 0;
+  let waits = 0;
+  const result = await waitForRegistryManifest('published', {
+    lookup: () => published,
+    sleep: async () => { waits++; }, attempts: 3,
+    isAvailable: (manifest) => publishedTarballAvailable(manifest, bytes, async () => (
+      ++requests === 1 ? new Response(null, { status: 404 }) : new Response(bytes)
+    )),
+  });
+  assert.equal(result, published);
+  assert.equal(requests, 2);
+  assert.equal(waits, 1);
+});
+
+test('published tarball checks reject other failures, changed bytes and external endpoints', async () => {
+  const bytes = Buffer.from('candidate');
+  const published = { dist: { integrity: digest(bytes), tarball: 'https://registry.npmjs.org/@nestarc/jobs/-/jobs-0.4.2.tgz' } };
+  for (const status of [401, 403, 500]) {
+    await assert.rejects(publishedTarballAvailable(published, bytes, async () => new Response(null, { status })), /published tarball fetch failed/);
+  }
+  await assert.rejects(publishedTarballAvailable(published, bytes, async () => new Response('other')), /published tarball differs/);
+  await assert.rejects(publishedTarballAvailable({ dist: { ...published.dist, tarball: 'https://example.com/package.tgz' } }, bytes), /unexpected tarball endpoint/);
 });
