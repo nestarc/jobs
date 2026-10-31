@@ -12,6 +12,7 @@ export interface OutboxRecord {
   createdAt?: Date;
   updatedAt?: Date;
   processedAt?: Date | null;
+  nextAttemptAt?: Date | null;
   retryCount?: number;
   maxRetries?: number;
   lastError?: string | null;

@@ -15,7 +15,61 @@ This package provides:
 
 ## Status
 
-Version **0.4.1 is published**. This patch corrects the packaged documentation for the worker, validation, and activation contracts introduced in 0.4.0. Check the installed artifact's `package.json` or run `npm ls @nestarc/jobs` to identify your version. Source changes listed under [Unreleased](CHANGELOG.md#unreleased) are not part of an existing npm release.
+Version **0.4.2** supports Outbox `^0.2.1 || ^0.3.0 || ^0.4.0`. Use Outbox
+**0.4.1** for the coordinated shutdown API described below. Check the installed
+artifact's `package.json` or run `npm ls @nestarc/jobs` to identify your version.
+Source changes listed under [Unreleased](CHANGELOG.md#unreleased) are not part of
+an existing npm release.
+
+### Outbox 0.4 compatibility and shutdown
+
+Outbox 0.4 requires periodic polling even when LISTEN/NOTIFY is enabled. Every
+process registering `OutboxModule` must provide its publisher dependencies and
+keep `polling.enabled: true`. An API-only process can use the exported
+`OutboxEmitter` with its own transaction and configured tenant policy without
+registering an Outbox worker, or run a Jobs **producer** alongside its Outbox
+poller. Do not carry `polling.enabled: false` over from a 0.3 recipe.
+
+Outbox 0.4.1 exposes `OutboxPoller.stop()` to fence
+new claims and await the current publisher, heartbeat and fenced DB completion.
+For a co-located process, call it **before** `app.close()`:
+
+```ts
+import { OutboxPoller } from '@nestarc/outbox'; // Requires Outbox >= 0.4.1
+
+async function closeDeliveryApplication() {
+  await app.get(OutboxPoller).stop({ timeoutMs: 30_000 });
+  await app.close(); // Jobs closes only after Outbox has settled.
+}
+```
+
+Use one application-owned signal handler invoking this sequence; do not also
+enable Nest's automatic signal-close path. On `OUTBOX_SHUTDOWN_INCOMPLETE`, keep
+Jobs and Prisma open while the callback settles and retry `stop()`. A timeout
+does not cancel external work or authorize closing its dependencies. The process
+supervisor may terminate a stuck process so its expired lease can recover.
+Standalone application shutdown still needs this explicit order: Nest lifecycle
+phases alone cannot establish the producer-before-transport relationship.
+
+The packed Jobs tarball can be tested against a disposable loopback PostgreSQL
+database named `jobs_outbox_test` and Redis:
+
+```sh
+JOBS_TARBALL=/absolute/path/jobs-candidate.tgz \
+JOBS_OUTBOX_DATABASE_URL=postgresql://test:test@127.0.0.1:5432/jobs_outbox_test \
+JOBS_OUTBOX_REDIS_URL=redis://127.0.0.1:6379 \
+npm run test:integration:outbox
+```
+
+The default lane uses exact published Outbox 0.4.1 and requires delivery,
+crash recovery, active drain and timeout tests. To test another artifact, supply
+`OUTBOX_PACKAGE` and its exact `OUTBOX_EXPECTED_VERSION`. For the older 0.4.0
+release, set `OUTBOX_REQUIRE_STOP=false` to exercise delivery/recovery without the
+unavailable stop API. Use `CONSUMER_NEST_VERSION=10.4.22` or `11.2.1`.
+Tests create and remove their own PostgreSQL schema, use a unique Redis namespace,
+and kill only a relay child they started. They never truncate shared tables or
+flush Redis. The manifest versions of local candidates do not identify npm bytes;
+the test reports each installed artifact's integrity.
 
 ### Backend matrix
 
@@ -42,7 +96,7 @@ Version **0.4.1 is published**. This patch corrects the packaged documentation f
 Core package:
 
 ```bash
-npm install @nestarc/jobs@0.4.1
+npm install @nestarc/jobs@0.4.2
 ```
 
 If you use the BullMQ backend, install BullMQ too:
@@ -54,17 +108,17 @@ npm install bullmq@^5.76.2
 If you use the first-party outbox publisher, install the matching outbox package:
 
 ```bash
-npm install @nestarc/outbox@0.3.0
+npm install @nestarc/outbox@0.4.1
 ```
 
-Jobs 0.4.1 accepts Outbox `^0.2.1 || ^0.3.0`. Outbox 0.4.0 is outside that peer range; use the pinned bridge version rather than the unversioned latest package.
+Jobs 0.4.2 accepts Outbox `^0.2.1 || ^0.3.0 || ^0.4.0`. Outbox 0.4.1 adds the explicit stop-before-close API; older Outbox releases require their version-specific shutdown handling.
 
 Peer expectations:
 
 - Node.js `22` or `24` since 0.4.0 (Node 20 support ends with the 0.3 line)
 - NestJS `^10` or `^11`
 - BullMQ `^5.76.2` when using `forBullMQ()`
-- Optional `@nestarc/outbox ^0.2.1 || ^0.3.0` when using `createOutboxJobsPublisher()`; exact 0.2.1 and 0.3.0 consumer gates
+- Optional `@nestarc/outbox ^0.2.1 || ^0.3.0 || ^0.4.0` when using `createOutboxJobsPublisher()`; exact 0.2.1 and 0.3.0 consumer gates plus PostgreSQL/Redis verification with 0.4.1
 - `reflect-metadata`
 - `rxjs`
 
@@ -72,8 +126,10 @@ Peer expectations:
 
 Jobs does not have a direct Prisma peer. Prisma compatibility for the first-party publisher is
 therefore verified against the actual `@nestarc/outbox` package artifact. The existing
-`@nestarc/outbox ^0.2.1 || ^0.3.0` peer retains the Prisma 7-ready `0.2.1` anchor; the separate candidate lane validates `0.3.0`. The anchor does not require a Jobs
-release.
+`@nestarc/outbox ^0.2.1 || ^0.3.0 || ^0.4.0` peer retains the Prisma 7-ready
+`0.2.1` anchor; the separate candidate lane validates `0.3.0`, and the PostgreSQL/Redis
+lane validates exact `0.4.1` on Node 22/24 with Nest 10/11. The anchor does not
+require a Jobs release.
 
 Run the strict tarball consumer with an explicit candidate or published artifact:
 
@@ -848,7 +904,7 @@ A mismatched or missing ID returns null. Never accept the caller's tenant string
 The 0.2.1 modern Outbox anchor is fixed. The separate candidate runner accepts a JSON manifest with `package`, exact `version` and expected SHA-512 `integrity`:
 
 ```sh
-JOBS_TARBALL=/absolute/path/nestarc-jobs-0.4.1.tgz \
+JOBS_TARBALL=/absolute/path/nestarc-jobs-0.4.2.tgz \
   node scripts/test-outbox-candidate-consumer.js /absolute/path/outbox-candidate.json
 ```
 

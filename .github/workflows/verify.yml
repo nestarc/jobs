@@ -185,6 +185,48 @@ jobs:
           OUTBOX_PACKAGE: '@nestarc/outbox@0.2.1'
           JOBS_TARBALL_DIR: package-artifact
 
+  outbox-04-integration:
+    name: Outbox 0.4 PostgreSQL/Redis (Node ${{ matrix.node }}, Nest ${{ matrix.nest }})
+    needs: package-smoke
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+        nest: ['10.4.22', '11.2.1']
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: jobs_outbox_test
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U test -d jobs_outbox_test" --health-interval 1s --health-retries 20
+      redis:
+        image: redis:7.2-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 1s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-tarball
+          path: package-artifact
+      - run: node scripts/test-outbox-integration.js
+        env:
+          OUTBOX_PACKAGE: '@nestarc/outbox@0.4.1'
+          OUTBOX_EXPECTED_VERSION: '0.4.1'
+          OUTBOX_EXPECTED_INTEGRITY: 'sha512-+hUsFdmvPSIkw2OwpWJlJ08uHYnx8Mha5MBb/fv1+PZN8+kNrOEOLuFvbq/bw6Z4OkLGwGCtyHWpo5LEjBSO4w=='
+          OUTBOX_REQUIRE_STOP: 'true'
+          JOBS_TARBALL_DIR: package-artifact
+          CONSUMER_NEST_VERSION: ${{ matrix.nest }}
+          JOBS_OUTBOX_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/jobs_outbox_test
+          JOBS_OUTBOX_REDIS_URL: redis://127.0.0.1:6379
+
   coverage:
     runs-on: ubuntu-latest
     services:
@@ -277,7 +319,7 @@ jobs:
           assert.equal(manifest.version, sourceManifest.version);
           assert.equal(manifest.main, 'dist/index.js');
           assert.equal(manifest.types, 'dist/index.d.ts');
-          assert.equal(manifest.peerDependencies?.['@nestarc/outbox'], '^0.2.1 || ^0.3.0');
+          assert.equal(manifest.peerDependencies?.['@nestarc/outbox'], '^0.2.1 || ^0.3.0 || ^0.4.0');
           assert.equal(manifest.peerDependencies?.['@nestjs/common'], '^10.0.0 || ^11.0.0');
           assert.equal(manifest.peerDependencies?.['@nestjs/core'], '^10.0.0 || ^11.0.0');
           assert.equal(manifest.peerDependencies?.bullmq, '^5.76.2');
