@@ -3,19 +3,32 @@ const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
+const { setTimeout: delay } = require('node:timers/promises');
 
 function digest(bytes) { return `sha512-${createHash('sha512').update(bytes).digest('base64')}`; }
 function verifyIntegrity(bytes, published) {
   assert.equal(published.dist?.integrity, digest(bytes), 'same version has different artifact bytes');
 }
 function registryManifest(spec, run = spawnSync) {
-  const result = run('npm', ['view', spec, '--json', '--registry=https://registry.npmjs.org'], { encoding: 'utf8' });
+  const result = run('npm', ['view', spec, '--json', '--prefer-online', '--registry=https://registry.npmjs.org'], { encoding: 'utf8' });
   if (result.error) throw result.error;
   if (result.status === 0) return JSON.parse(result.stdout);
   let response;
   try { response = JSON.parse(result.stdout); } catch { /* Fail closed below. */ }
   if (response?.error?.code === 'E404') return null;
   throw new Error(`registry lookup failed: ${result.stderr || result.stdout}`);
+}
+// npm can accept a publication before exposing its version to registry readers.
+// Retry only confirmed absence; authentication/network failures still fail closed.
+async function waitForRegistryManifest(spec, {
+  lookup = registryManifest, sleep = delay, attempts = 61, intervalMs = 10000,
+} = {}) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const published = lookup(spec);
+    if (published) return published;
+    if (attempt + 1 < attempts) await sleep(intervalMs);
+  }
+  throw new Error(`published artifact missing after ${attempts} registry checks: ${spec}`);
 }
 function validateArtifact(file, sourceManifest, changelog, tag) {
   const bytes = fs.readFileSync(file);
@@ -45,4 +58,4 @@ function verifyProvenance(bytes, attestations, version, commit) {
   assert(build?.resolvedDependencies?.some((dependency) => dependency.uri === `git+https://github.com/nestarc/jobs@refs/tags/v${version}` && dependency.digest?.gitCommit === commit), 'attested source commit differs from release commit');
   // Cryptographic signature and transparency verification is a separate npm audit signatures gate.
 }
-module.exports = { digest, verifyIntegrity, registryManifest, validateArtifact, verifyProvenance };
+module.exports = { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, validateArtifact, verifyProvenance };

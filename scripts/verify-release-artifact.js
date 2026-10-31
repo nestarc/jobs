@@ -1,14 +1,17 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { validateArtifact, registryManifest, verifyIntegrity, verifyProvenance } = require('./lib/release-artifact');
+const { validateArtifact, registryManifest, waitForRegistryManifest, verifyIntegrity, verifyProvenance } = require('./lib/release-artifact');
 async function main() {
 const directory = process.argv[2];
 const tarballs = fs.readdirSync(directory).filter((name) => name.endsWith('.tgz'));
 if (tarballs.length !== 1) throw new Error('exactly one verified tarball is required');
 const source = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 const result = validateArtifact(path.join(directory, tarballs[0]), source, fs.readFileSync('CHANGELOG.md', 'utf8'), process.env.GITHUB_REF_NAME);
-const published = registryManifest(`${source.name}@${result.version}`);
+const requirePublished = process.argv.includes('--require-published');
+const spec = `${source.name}@${result.version}`;
+if (requirePublished) console.log(`Waiting up to 10 minutes for npm publication visibility: ${spec}`);
+const published = requirePublished ? await waitForRegistryManifest(spec) : registryManifest(spec);
 if (published) {
   verifyIntegrity(result.bytes, published);
   const url = new URL(published.dist?.attestations?.url);
@@ -17,7 +20,6 @@ if (published) {
   if (!response.ok) throw new Error(`attestation fetch failed: ${response.status}`);
   verifyProvenance(result.bytes, await response.json(), result.version, process.env.GITHUB_SHA);
 }
-if (process.argv.includes('--require-published') && !published) throw new Error('published artifact missing');
 const summary = { version: result.version, integrity: result.integrity, published: !!published, ref: process.env.GITHUB_SHA };
 console.log(JSON.stringify(summary, null, 2));
 if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `published=${!!published}\nintegrity=${result.integrity}\n`);

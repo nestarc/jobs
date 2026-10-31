@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const yaml = require('js-yaml');
-const { digest, verifyIntegrity, registryManifest, verifyProvenance } = require('../lib/release-artifact');
+const { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, verifyProvenance } = require('../lib/release-artifact');
 test('registry rerun requires identical bytes and rejects transport/auth failures', () => {
   const candidate = Buffer.from('candidate');
   assert.doesNotThrow(() => verifyIntegrity(candidate, { dist: { integrity: digest(candidate) } }));
@@ -38,4 +38,47 @@ test('coverage builds the separate Redis producer fixture before running it', ()
   const steps = verify.jobs.coverage.steps.map((step) => step.run);
   assert(steps.indexOf('npm run build') >= 0);
   assert(steps.indexOf('npm run build') < steps.indexOf('npm run test:coverage'));
+});
+
+
+test('post-publish verification waits for registry visibility then enforces the same bytes', async () => {
+  const bytes = Buffer.from('published candidate');
+  const published = { dist: { integrity: digest(bytes) } };
+  let calls = 0;
+  const waits = [];
+  const result = await waitForRegistryManifest('@nestarc/jobs@0.4.2', {
+    lookup: (spec) => {
+      assert.equal(spec, '@nestarc/jobs@0.4.2');
+      return ++calls === 3 ? published : null;
+    },
+    sleep: async (ms) => { waits.push(ms); }, attempts: 4, intervalMs: 10,
+  });
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [10, 10]);
+  verifyIntegrity(bytes, result);
+  assert.throws(() => verifyIntegrity(Buffer.from('different candidate'), result));
+});
+
+test('a permanently absent publication fails after the bounded polling window', async () => {
+  let calls = 0;
+  let waits = 0;
+  await assert.rejects(waitForRegistryManifest('missing', {
+    lookup: () => { calls++; return null; },
+    sleep: async () => { waits++; }, attempts: 3,
+  }), /published artifact missing after 3 registry checks/);
+  assert.equal(calls, 3);
+  assert.equal(waits, 2);
+});
+
+test('post-publish polling never retries authentication or network failures', async () => {
+  for (const code of ['E401', 'E403', 'ETIMEDOUT']) {
+    let waits = 0;
+    await assert.rejects(waitForRegistryManifest('failed', {
+      lookup: (spec) => registryManifest(spec, () => ({
+        status: 1, stdout: JSON.stringify({ error: { code } }),
+      })),
+      sleep: async () => { waits++; }, attempts: 3,
+    }), /registry lookup failed/);
+    assert.equal(waits, 0);
+  }
 });
