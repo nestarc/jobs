@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const yaml = require('js-yaml');
-const { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, verifyProvenance } = require('../lib/release-artifact');
+const { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, publishedTarballAvailable, verifyProvenance } = require('../lib/release-artifact');
 test('registry rerun requires identical bytes and rejects transport/auth failures', () => {
   const candidate = Buffer.from('candidate');
   assert.doesNotThrow(() => verifyIntegrity(candidate, { dist: { integrity: digest(candidate) } }));
@@ -81,4 +81,32 @@ test('post-publish polling never retries authentication or network failures', as
     }), /registry lookup failed/);
     assert.equal(waits, 0);
   }
+});
+
+
+test('publication waits for tarball visibility even when metadata is already visible', async () => {
+  const bytes = Buffer.from('candidate');
+  const published = { dist: { integrity: digest(bytes), tarball: 'https://registry.npmjs.org/@nestarc/jobs/-/jobs-0.4.2.tgz' } };
+  let requests = 0;
+  let waits = 0;
+  const result = await waitForRegistryManifest('published', {
+    lookup: () => published,
+    sleep: async () => { waits++; }, attempts: 3,
+    isAvailable: (manifest) => publishedTarballAvailable(manifest, bytes, async () => (
+      ++requests === 1 ? new Response(null, { status: 404 }) : new Response(bytes)
+    )),
+  });
+  assert.equal(result, published);
+  assert.equal(requests, 2);
+  assert.equal(waits, 1);
+});
+
+test('published tarball checks reject other failures, changed bytes and external endpoints', async () => {
+  const bytes = Buffer.from('candidate');
+  const published = { dist: { integrity: digest(bytes), tarball: 'https://registry.npmjs.org/@nestarc/jobs/-/jobs-0.4.2.tgz' } };
+  for (const status of [401, 403, 500]) {
+    await assert.rejects(publishedTarballAvailable(published, bytes, async () => new Response(null, { status })), /published tarball fetch failed/);
+  }
+  await assert.rejects(publishedTarballAvailable(published, bytes, async () => new Response('other')), /published tarball differs/);
+  await assert.rejects(publishedTarballAvailable({ dist: { ...published.dist, tarball: 'https://example.com/package.tgz' } }, bytes), /unexpected tarball endpoint/);
 });

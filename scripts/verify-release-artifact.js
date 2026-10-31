@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { validateArtifact, registryManifest, waitForRegistryManifest, verifyIntegrity, verifyProvenance } = require('./lib/release-artifact');
+const { validateArtifact, registryManifest, waitForRegistryManifest, publishedTarballAvailable, verifyIntegrity, verifyProvenance } = require('./lib/release-artifact');
 async function main() {
 const directory = process.argv[2];
 const tarballs = fs.readdirSync(directory).filter((name) => name.endsWith('.tgz'));
@@ -11,7 +11,9 @@ const result = validateArtifact(path.join(directory, tarballs[0]), source, fs.re
 const requirePublished = process.argv.includes('--require-published');
 const spec = `${source.name}@${result.version}`;
 if (requirePublished) console.log(`Waiting up to 10 minutes for npm publication visibility: ${spec}`);
-const published = requirePublished ? await waitForRegistryManifest(spec) : registryManifest(spec);
+const published = requirePublished ? await waitForRegistryManifest(spec, {
+  isAvailable: (manifest) => publishedTarballAvailable(manifest, result.bytes),
+}) : registryManifest(spec);
 if (published) {
   verifyIntegrity(result.bytes, published);
   const url = new URL(published.dist?.attestations?.url);

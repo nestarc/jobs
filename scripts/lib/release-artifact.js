@@ -22,13 +22,25 @@ function registryManifest(spec, run = spawnSync) {
 // Retry only confirmed absence; authentication/network failures still fail closed.
 async function waitForRegistryManifest(spec, {
   lookup = registryManifest, sleep = delay, attempts = 61, intervalMs = 10000,
+  isAvailable = async () => true,
 } = {}) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     const published = lookup(spec);
-    if (published) return published;
+    if (published && await isAvailable(published)) return published;
     if (attempt + 1 < attempts) await sleep(intervalMs);
   }
   throw new Error(`published artifact missing after ${attempts} registry checks: ${spec}`);
+}
+async function publishedTarballAvailable(published, candidateBytes, request = fetch) {
+  verifyIntegrity(candidateBytes, published);
+  const url = new URL(published.dist?.tarball);
+  if (url.origin !== 'https://registry.npmjs.org') throw new Error('unexpected tarball endpoint');
+  const response = await request(url, { redirect: 'error', signal: AbortSignal.timeout(30000) });
+  if (response.status === 404) return false;
+  if (!response.ok) throw new Error(`published tarball fetch failed: ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  assert.equal(digest(bytes), digest(candidateBytes), 'published tarball differs from candidate');
+  return true;
 }
 function validateArtifact(file, sourceManifest, changelog, tag) {
   const bytes = fs.readFileSync(file);
@@ -58,4 +70,4 @@ function verifyProvenance(bytes, attestations, version, commit) {
   assert(build?.resolvedDependencies?.some((dependency) => dependency.uri === `git+https://github.com/nestarc/jobs@refs/tags/v${version}` && dependency.digest?.gitCommit === commit), 'attested source commit differs from release commit');
   // Cryptographic signature and transparency verification is a separate npm audit signatures gate.
 }
-module.exports = { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, validateArtifact, verifyProvenance };
+module.exports = { digest, verifyIntegrity, registryManifest, waitForRegistryManifest, publishedTarballAvailable, validateArtifact, verifyProvenance };
